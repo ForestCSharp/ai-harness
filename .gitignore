@@ -7,5 +7,7 @@
 *.key
 secrets/
 
+tmp/
+
 # macOS
 .DS_Store
