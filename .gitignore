@@ -6,3 +6,6 @@
 !.env.example
 *.key
 secrets/
+
+# macOS
+.DS_Store
