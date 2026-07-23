@@ -1,0 +1,243 @@
+//! Kernel-enforced confinement for model-authored shell commands.
+//!
+//! Commands run under macOS Seatbelt via `sandbox-exec`. Confinement is done by
+//! the kernel rather than by inspecting the command string: a shell command is
+//! an arbitrary program, so no amount of parsing can make `rm -rf ..` safe.
+//! Seatbelt checks the *resolved* path on every filesystem operation, which also
+//! closes symlink escapes that a Rust-side path check would miss.
+//!
+//! The policy is:
+//!
+//! - writes confined to the working-directory subtree,
+//! - reads open, minus an explicit denylist of secret locations,
+//! - network allowed (the approval prompt is the control point).
+//!
+//! `(allow default)` with targeted denies is deliberate. A `(deny default)`
+//! profile aborts processes during dyld startup with no usable diagnostic, so
+//! the strict-looking option is in practice the broken one.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Paths denied for both read and write, relative to the user's home directory.
+/// Not exhaustive — it covers well-known credential stores.
+const SECRET_HOME_SUBPATHS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".config/gh",
+    ".config/gcloud",
+    ".kube",
+    ".docker/config.json",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "Library/Keychains",
+];
+
+/// Files inside the working directory that stay unreadable even though the rest
+/// of the tree is open. The harness's own key lives here.
+const SECRET_ROOT_FILES: &[&str] = &[".env", ".env.local"];
+
+#[derive(Debug, Clone)]
+pub struct Sandbox {
+    /// Canonical working directory. Writes are confined to this subtree.
+    root: PathBuf,
+    home: Option<PathBuf>,
+}
+
+impl Sandbox {
+    /// Build a sandbox rooted at `root`.
+    ///
+    /// The path is canonicalised because Seatbelt matches resolved paths: on
+    /// macOS `/tmp` is a symlink to `/private/tmp`, so an uncanonicalised root
+    /// would silently never match and confine nothing.
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        if !cfg!(target_os = "macos") {
+            bail!(
+                "command execution is only sandboxed on macOS; refusing to run \
+                 commands rather than run them unconfined"
+            );
+        }
+        if !Path::new(SANDBOX_EXEC).exists() {
+            bail!("{SANDBOX_EXEC} not found; refusing to run commands unsandboxed");
+        }
+
+        let root = root.as_ref();
+        let root = std::fs::canonicalize(root)
+            .with_context(|| format!("resolving sandbox root {}", root.display()))?;
+        if !root.is_dir() {
+            bail!("sandbox root {} is not a directory", root.display());
+        }
+        check_profile_safe(&root)?;
+
+        // A missing or odd home directory is not fatal; it only means there are
+        // no home-relative denies to add.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|h| std::fs::canonicalize(h).ok())
+            .filter(|h| check_profile_safe(h).is_ok());
+
+        Ok(Self { root, home })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Render the Seatbelt (SBPL) profile.
+    ///
+    /// Deny rules come last so they take precedence over the broad `allow`.
+    pub fn profile(&self) -> String {
+        let root = escape(&self.root.to_string_lossy());
+
+        let mut denies = String::new();
+        if let Some(home) = &self.home {
+            for entry in SECRET_HOME_SUBPATHS {
+                let path = home.join(entry);
+                denies.push_str(&format!(
+                    "\n  (subpath \"{}\")",
+                    escape(&path.to_string_lossy())
+                ));
+            }
+        }
+        for file in SECRET_ROOT_FILES {
+            let path = self.root.join(file);
+            denies.push_str(&format!(
+                "\n  (literal \"{}\")",
+                escape(&path.to_string_lossy())
+            ));
+        }
+
+        format!(
+            r#"(version 1)
+(allow default)
+
+;; Writes are confined to the working-directory subtree.
+(deny file-write*)
+(allow file-write* (subpath "{root}"))
+
+;; Terminal and null sinks, so ordinary commands can still emit output.
+(allow file-write-data
+  (literal "/dev/null")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper"))
+
+;; Credential stores stay unreadable even though reads are otherwise open.
+;; Listed last so these denies win over the (allow default) above.
+(deny file-read* file-write*{denies})
+"#
+        )
+    }
+
+    /// Build the sandboxed command. `script` is passed to `sh -c` inside the
+    /// sandbox, so the confinement applies to it and every process it spawns.
+    pub fn command(&self, script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+        command
+            .arg("-p")
+            .arg(self.profile())
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&self.root);
+        command
+    }
+}
+
+/// Escape a path for an SBPL string literal.
+fn escape(path: &str) -> String {
+    path.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Reject paths that cannot be represented safely in a profile.
+///
+/// Quotes and backslashes are escaped, but control characters would corrupt the
+/// profile in ways that are hard to reason about, so those are refused outright
+/// rather than emitting a policy we cannot vouch for.
+fn check_profile_safe(path: &Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    if text.chars().any(|c| c.is_control()) {
+        bail!(
+            "path {} contains a control character and cannot be sandboxed safely",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-harness-sbtest-{name}"));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn escapes_quotes_and_backslashes() {
+        assert_eq!(escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape(r"a\b"), r"a\\b");
+        assert_eq!(escape("/plain/path"), "/plain/path");
+    }
+
+    #[test]
+    fn rejects_control_characters_in_paths() {
+        assert!(check_profile_safe(Path::new("/tmp/ok")).is_ok());
+        assert!(check_profile_safe(Path::new("/tmp/ba\nd")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_is_canonicalised() {
+        // /tmp is a symlink to /private/tmp; an unresolved root would confine nothing.
+        let sandbox = Sandbox::new("/tmp").unwrap();
+        assert_eq!(sandbox.root(), Path::new("/private/tmp"));
+        assert!(sandbox.profile().contains("/private/tmp"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_confines_writes_to_the_root() {
+        let root = temp_root("profile");
+        let profile = Sandbox::new(&root).unwrap().profile();
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            root.to_string_lossy()
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_denies_secret_locations() {
+        let root = temp_root("secrets");
+        let profile = Sandbox::new(&root).unwrap().profile();
+        assert!(profile.contains(".ssh"), "ssh keys must be denied");
+        assert!(profile.contains("Keychains"), "keychains must be denied");
+        assert!(
+            profile.contains(&format!("{}/.env", root.to_string_lossy())),
+            "the harness's own key file must be denied"
+        );
+        // The deny block must come after the broad allow, or it never applies.
+        let allow_at = profile.find("(allow default)").unwrap();
+        let deny_at = profile.find("(deny file-read* file-write*").unwrap();
+        assert!(
+            deny_at > allow_at,
+            "deny rules must come last to take effect"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejects_a_nonexistent_root() {
+        assert!(Sandbox::new("/tmp/definitely-does-not-exist-ai-harness").is_err());
+    }
+}
