@@ -95,6 +95,16 @@ the journey ends**: the answer sits in the transcript, the prompt is live again.
 change something. Status → `AwaitingApproval`, which raises the modal. Nothing
 runs yet.
 
+**(c′) `<ai-harness-edit>`** — a targeted change to an existing file. Before the
+modal, `files::plan_edit` resolves the path, reads the *whole* file, and requires
+`<old>` to match **exactly once**. Zero or many matches is not a modal — it is a
+failure fed straight back to the model (via the same write-result path), so you
+are only ever asked about an edit that will actually apply. On a unique match the
+prepared full rewrite is stashed in `Pending.edit_plan` and the modal shows a
+`-`/`+` diff. `approve` then turns that plan into an ordinary `Action::Write`, so
+execution reuses the write path entirely — the file is not re-read after you
+approve, so the bytes that land are exactly the ones the diff showed.
+
 **(d) `<ai-harness-read>`** — the model wants to see a file. This one never
 reaches the modal. `perform_read` runs `files::read` **synchronously, right
 here**, pushes an `Entry::ReadResult`, appends `<ai-harness-read-result>` to
@@ -113,7 +123,7 @@ Doing file I/O on the event loop is a deliberate trade: a read is capped at
 64 KB from local disk, which is far cheaper than the task spawning, channel
 plumbing, and generation tagging a background job would need.
 
-## 4. If it's a command or a write: approval → execution → back to the model
+## 4. If it's a command, write, or edit: approval → execution → back to the model
 
 With the modal up, the keyboard is rerouted ([src/main.rs:210](../src/main.rs),
 the `app.pending().is_some()` branch) — arrows/Tab move the highlight, Enter/y/n

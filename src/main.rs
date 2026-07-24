@@ -305,9 +305,9 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
                     .await
                     .map_err(|e| format!("{e:#}")),
             ),
-            // A Response is never approvable and a Read was handled above, so
-            // neither arm is reachable.
-            Action::Read { .. } | Action::Response(_) => return,
+            // A Response is never approvable, a Read was handled above, and an
+            // Edit is converted to a Write by `approve`, so none are reachable.
+            Action::Read { .. } | Action::Edit { .. } | Action::Response(_) => return,
         };
         let _ = tx.send(Tagged { generation, update }).await;
     });

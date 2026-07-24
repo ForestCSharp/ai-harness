@@ -229,6 +229,18 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
             .chain(preview_lines(contents, inner_width))
             .collect(),
         ),
+        Action::Edit { path, old, new } => (
+            "The model wants to edit:",
+            " apply this edit? ",
+            std::iter::once(Line::from(Span::styled(
+                path.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .chain(diff_lines(old, new, inner_width))
+            .collect(),
+        ),
         action => (
             "The model wants to run:",
             " run this command? ",
@@ -419,14 +431,15 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                 Action::Shell(_) => ("shell", Color::Magenta),
                 Action::Read { .. } => ("read", Color::Blue),
                 Action::Write { .. } => ("write", Color::Cyan),
+                Action::Edit { .. } => ("edit", Color::Cyan),
                 Action::Response(_) => ("response", Color::Green),
             };
             let mut header = vec![Span::styled(
                 label,
                 Style::default().fg(colour).add_modifier(Modifier::BOLD),
             )];
-            // For a write, the path is the headline; the contents preview below.
-            if let Action::Write { path, .. } = action {
+            // For a write or edit, the path is the headline; the body is below.
+            if let Action::Write { path, .. } | Action::Edit { path, .. } = action {
                 header.push(Span::styled(
                     format!("  {path}"),
                     Style::default().fg(Color::Cyan),
@@ -457,6 +470,10 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                 // A file could be huge; show a bounded preview, not the whole thing.
                 Action::Write { contents, .. } => {
                     lines.extend(preview_lines(contents, width));
+                }
+                // An edit reads as a diff: what goes, what comes.
+                Action::Edit { old, new, .. } => {
+                    lines.extend(diff_lines(old, new, width));
                 }
             }
         }
@@ -636,6 +653,55 @@ fn preview_body(contents: &str, width: usize) -> Vec<Line<'static>> {
             format!("… {} more line(s)", total - MAX),
             dim.add_modifier(Modifier::ITALIC),
         )));
+    }
+    lines
+}
+
+/// A unified diff of an edit: removed lines in red with `-`, added lines in
+/// green with `+`. Each side is capped like a preview so a large edit never
+/// blows up the modal or the transcript.
+fn diff_lines(old: &str, new: &str, width: usize) -> Vec<Line<'static>> {
+    const MAX: usize = 6;
+
+    fn side(text: &str, marker: char, colour: Color, width: usize, lines: &mut Vec<Line<'static>>) {
+        // Line up wrapped continuations under the text, not the marker.
+        let cont = "  ";
+        let inner = width.saturating_sub(2).max(1);
+        let total = text.lines().count();
+        for line in text.lines().take(MAX) {
+            let wrapped = wrap::text(line, inner);
+            for (i, row) in wrapped.into_iter().enumerate() {
+                let prefix = if i == 0 {
+                    format!("{marker} ")
+                } else {
+                    cont.to_string()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{row}"),
+                    Style::default().fg(colour),
+                )));
+            }
+        }
+        if total > MAX {
+            lines.push(Line::from(Span::styled(
+                format!("{marker} … {} more line(s)", total - MAX),
+                Style::default().fg(colour).add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+
+    let mut lines = Vec::new();
+    side(old, '-', Color::Red, width, &mut lines);
+    // An empty replacement is a deletion; say so rather than showing nothing.
+    if new.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "+ (deleted)",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        side(new, '+', Color::Green, width, &mut lines);
     }
     lines
 }
@@ -990,6 +1056,92 @@ mod tests {
             "missing title:\n{screen}"
         );
         assert!(screen.contains("src/app.rs"), "missing path:\n{screen}");
+    }
+
+    #[test]
+    fn edit_action_renders_as_a_diff() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Edit {
+                path: "src/app.rs".into(),
+                old: "let x = 1;".into(),
+                new: "let x = 2;".into(),
+            },
+            usage: None,
+        });
+
+        let (rows, _) = render(&mut app, 70, 16);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("edit"), "missing edit label:\n{screen}");
+        assert!(screen.contains("src/app.rs"), "missing path:\n{screen}");
+        assert!(
+            screen.contains("- let x = 1;"),
+            "missing removed line:\n{screen}"
+        );
+        assert!(
+            screen.contains("+ let x = 2;"),
+            "missing added line:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn edit_approval_modal_shows_a_bounded_diff() {
+        // Drive an app to a pending edit against a seeded file.
+        let dir = std::env::temp_dir().join(format!("ai-harness-ui-edit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join("m.rs"), "let x = 1;\n").unwrap();
+
+        let mut app = App::new("test/model".into(), None, 10, dir.join("sessions"));
+        app.sandbox = Some(crate::sandbox::Sandbox::new(&dir).unwrap());
+        app.input.insert_str("bump it");
+        app.submit().unwrap();
+        app.push_response(
+            "<ai-harness-edit file=m.rs><ai-harness-old>let x = 1;</ai-harness-old>\
+             <ai-harness-new>let x = 2;</ai-harness-new></ai-harness-edit>"
+                .into(),
+            None,
+        );
+        assert!(app.pending().is_some(), "should be awaiting edit approval");
+
+        let (rows, _) = render(&mut app, 70, 18);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("apply this edit?"),
+            "missing title:\n{screen}"
+        );
+        assert!(screen.contains("m.rs"), "missing path:\n{screen}");
+        assert!(
+            screen.contains("- let x = 1;"),
+            "missing removed line:\n{screen}"
+        );
+        assert!(
+            screen.contains("+ let x = 2;"),
+            "missing added line:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_deletion_edit_says_deleted_in_the_diff() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Edit {
+                path: "x".into(),
+                old: "remove me\n".into(),
+                new: String::new(),
+            },
+            usage: None,
+        });
+        let (rows, _) = render(&mut app, 60, 12);
+        let screen = transcript_only(&rows);
+        assert!(
+            screen.contains("- remove me"),
+            "missing removed line:\n{screen}"
+        );
+        assert!(
+            screen.contains("(deleted)"),
+            "missing deletion marker:\n{screen}"
+        );
     }
 
     #[test]

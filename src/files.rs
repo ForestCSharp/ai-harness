@@ -22,6 +22,12 @@ use crate::sandbox::Sandbox;
 /// enough that one read cannot dominate the context window.
 pub const MAX_READ_BYTES: usize = 64 * 1024;
 
+/// Cap on a file an edit may rewrite. An edit rebuilds and rewrites the *whole*
+/// file, so — unlike a read — it must load every byte; refusing past this bound
+/// keeps a huge file from being pulled into memory and, worse, written back
+/// truncated. Well above any hand-edited source file.
+pub const MAX_EDIT_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The outcome of a file read. Mirrors [`crate::exec::WriteOutcome`]: a failure
 /// is data to hand back to the model, not an error that ends the turn.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -92,7 +98,7 @@ pub fn resolve(sandbox: &Sandbox, path: &str) -> Result<PathBuf, String> {
     // count as being inside `/root`.
     if !resolved.starts_with(root) {
         return Err(format!(
-            "{path} is outside the working directory; reads are confined to {}",
+            "{path} is outside the working directory; access is confined to {}",
             root.display()
         ));
     }
@@ -146,6 +152,61 @@ pub fn read(sandbox: &Sandbox, path: &str) -> ReadOutcome {
         contents,
         truncated,
         error: None,
+    }
+}
+
+/// A prepared edit: the whole file with one span replaced, ready to be written.
+///
+/// Built before the approval modal so a hopeless edit (no match, or ambiguous)
+/// never reaches the user — it goes straight back to the model to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditPlan {
+    pub path: String,
+    /// The full new file contents, with the one match replaced.
+    pub updated: String,
+    pub old_len: usize,
+    pub new_len: usize,
+}
+
+/// Resolve an edit against the file on disk, replacing the single occurrence of
+/// `old` with `new`.
+///
+/// Reads the *whole* file (not the truncating [`read`]) because the result is
+/// written back in full — a truncated read would silently drop the tail. Every
+/// failure is a message the model can act on: the match must exist and be
+/// unique, and the fix for each case is spelled out.
+pub fn plan_edit(sandbox: &Sandbox, path: &str, old: &str, new: &str) -> Result<EditPlan, String> {
+    let resolved = resolve(sandbox, path)?;
+    if resolved.is_dir() {
+        return Err(format!("{path} is a directory, not a file"));
+    }
+    // Guard on size before reading, so a giant file is refused rather than slurped.
+    let len = std::fs::metadata(&resolved)
+        .map_err(|e| format!("{path}: {e}"))?
+        .len();
+    if len > MAX_EDIT_BYTES {
+        return Err(format!(
+            "{path} is too large to edit in place; change it with a shell command instead"
+        ));
+    }
+    let contents = std::fs::read_to_string(&resolved)
+        .map_err(|_| format!("{path} is not UTF-8 text and cannot be edited this way"))?;
+
+    match contents.matches(old).count() {
+        0 => Err(format!(
+            "the text to replace was not found in {path}; re-read the file and copy \
+             the text exactly, including whitespace"
+        )),
+        1 => Ok(EditPlan {
+            path: path.to_string(),
+            updated: contents.replacen(old, new, 1),
+            old_len: old.len(),
+            new_len: new.len(),
+        }),
+        n => Err(format!(
+            "the text to replace appears {n} times in {path}; include more \
+             surrounding lines so it matches exactly one place"
+        )),
     }
 }
 
@@ -298,5 +359,95 @@ mod tests {
         let out = read(&sandbox, "b.txt");
         assert_eq!(out.contents, "no trailing newline");
         assert_eq!(out.lines, 1);
+    }
+
+    #[test]
+    fn plan_edit_replaces_a_unique_span_and_leaves_the_rest() {
+        let (sandbox, dir) = sandbox_in("edit-unique");
+        let before = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
+        std::fs::write(dir.join("m.rs"), before).unwrap();
+
+        let plan = plan_edit(&sandbox, "m.rs", "let x = 1;", "let x = 2;").unwrap();
+        assert_eq!(
+            plan.updated,
+            "fn main() {\n    let x = 2;\n    println!(\"{x}\");\n}\n"
+        );
+        // Pre-flight does not touch disk; only the later write does.
+        assert_eq!(std::fs::read_to_string(dir.join("m.rs")).unwrap(), before);
+    }
+
+    #[test]
+    fn plan_edit_reports_a_missing_span() {
+        let (sandbox, dir) = sandbox_in("edit-nomatch");
+        std::fs::write(dir.join("m.rs"), "let x = 1;\n").unwrap();
+        let err = plan_edit(&sandbox, "m.rs", "let y = 9;", "z").unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn plan_edit_refuses_an_ambiguous_span() {
+        let (sandbox, dir) = sandbox_in("edit-ambiguous");
+        std::fs::write(dir.join("m.rs"), "a\na\na\n").unwrap();
+        let err = plan_edit(&sandbox, "m.rs", "a", "b").unwrap_err();
+        assert!(err.contains("3 times"), "{err}");
+    }
+
+    #[test]
+    fn plan_edit_can_delete_by_replacing_with_nothing() {
+        let (sandbox, dir) = sandbox_in("edit-delete");
+        std::fs::write(dir.join("m.rs"), "keep\nDROP ME\nkeep\n").unwrap();
+        let plan = plan_edit(&sandbox, "m.rs", "DROP ME\n", "").unwrap();
+        assert_eq!(plan.updated, "keep\nkeep\n");
+    }
+
+    #[test]
+    fn plan_edit_matches_a_multi_line_span_exactly() {
+        let (sandbox, dir) = sandbox_in("edit-multiline");
+        let before = "one\ntwo\nthree\n";
+        std::fs::write(dir.join("m.txt"), before).unwrap();
+        let plan = plan_edit(&sandbox, "m.txt", "two\nthree\n", "two\nTHREE\nfour\n").unwrap();
+        assert_eq!(plan.updated, "one\ntwo\nTHREE\nfour\n");
+    }
+
+    #[test]
+    fn plan_edit_honours_crlf_in_the_span() {
+        let (sandbox, dir) = sandbox_in("edit-crlf");
+        // A CRLF file: the span must include the \r or it will not match.
+        std::fs::write(dir.join("m.txt"), "a\r\nb\r\n").unwrap();
+        assert!(plan_edit(&sandbox, "m.txt", "b\n", "c\n").is_err());
+        let plan = plan_edit(&sandbox, "m.txt", "b\r\n", "c\r\n").unwrap();
+        assert_eq!(plan.updated, "a\r\nc\r\n");
+    }
+
+    #[test]
+    fn plan_edit_refuses_a_path_outside_the_root() {
+        let (sandbox, dir) = sandbox_in("edit-escape");
+        let outside = dir.parent().unwrap().join("ai-harness-edit-escape.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let err =
+            plan_edit(&sandbox, "../ai-harness-edit-escape.txt", "secret", "pwned").unwrap_err();
+        assert!(err.contains("outside the working directory"), "{err}");
+        // The file on disk is untouched.
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn plan_edit_refuses_a_non_utf8_file() {
+        let (sandbox, dir) = sandbox_in("edit-binary");
+        // 0xFF/0xFE never appear in valid UTF-8, so this cannot be edited as text
+        // — and must fail rather than write back a mangled, lossy rewrite.
+        std::fs::write(dir.join("b.bin"), [0xFF, 0xFE, 0x00]).unwrap();
+        let err = plan_edit(&sandbox, "b.bin", "x", "y").unwrap_err();
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn plan_edit_refuses_a_file_too_large_to_rewrite() {
+        let (sandbox, dir) = sandbox_in("edit-toobig");
+        let big = "x".repeat(MAX_EDIT_BYTES as usize + 1);
+        std::fs::write(dir.join("big.txt"), &big).unwrap();
+        let err = plan_edit(&sandbox, "big.txt", "x", "y").unwrap_err();
+        assert!(err.contains("too large"), "{err}");
     }
 }

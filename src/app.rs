@@ -80,12 +80,17 @@ impl Choice {
     }
 }
 
-/// An action awaiting the user's decision. Holds the approvable action itself
-/// (a shell command or a file write — never a terminal `Response`).
+/// An action awaiting the user's decision. Holds the approvable action for
+/// display (shell, write, edit, or — under `--confirm-reads` — read; never a
+/// terminal `Response`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     pub action: Action,
     pub selected: Choice,
+    /// For an edit, the full rewrite prepared during pre-flight. On approval it
+    /// becomes the write that actually runs, so the diff the user saw is exactly
+    /// what lands. `None` for every other action.
+    pub edit_plan: Option<crate::files::EditPlan>,
 }
 
 /// The `/load` session picker overlay. A UI overlay, not a conversation status:
@@ -698,31 +703,62 @@ impl App {
         match action {
             // A final answer ends the turn.
             Action::Response(_) => self.status = Status::Idle,
-            other => {
-                if self.iterations >= self.max_iterations {
-                    self.push_notice(format!(
-                        "Stopped after {} model round-trips. Send another prompt to continue.",
-                        self.iterations
-                    ));
-                    self.status = Status::Idle;
-                } else if !self.confirm_reads
-                    && let Action::Read { path } = &other
-                {
-                    // A read mutates nothing and cannot leave the working
-                    // directory, so it runs now and the loop continues without
-                    // interrupting the user.
-                    let path = path.clone();
-                    return Some(self.perform_read(&path));
-                } else {
-                    // Everything else waits for the user.
-                    self.status = Status::AwaitingApproval(Pending {
-                        action: other,
-                        selected: Choice::Allow,
-                    });
+            // Any action past the loop budget stops rather than running, even the
+            // auto-approved ones — "free" is not "unbounded".
+            _ if self.iterations >= self.max_iterations => {
+                self.push_notice(format!(
+                    "Stopped after {} model round-trips. Send another prompt to continue.",
+                    self.iterations
+                ));
+                self.status = Status::Idle;
+            }
+            // A read mutates nothing and cannot leave the working directory, so it
+            // runs now and the loop continues without interrupting the user.
+            Action::Read { path } if !self.confirm_reads => {
+                return Some(self.perform_read(&path));
+            }
+            // An edit is resolved against the file *before* the modal, so a
+            // hopeless one (no match, ambiguous) never bothers the user — it goes
+            // straight back to the model to fix.
+            Action::Edit { path, old, new } => {
+                let planned = match &self.sandbox {
+                    Some(sandbox) => crate::files::plan_edit(sandbox, &path, &old, &new),
+                    None => Err("file access is not configured".to_string()),
+                };
+                match planned {
+                    Ok(plan) => {
+                        self.status = Status::AwaitingApproval(Pending {
+                            action: Action::Edit { path, old, new },
+                            selected: Choice::Allow,
+                            edit_plan: Some(plan),
+                        });
+                    }
+                    Err(message) => return Some(self.push_edit_failure(&path, message)),
                 }
+            }
+            // Shell, write, and (under --confirm-reads) read wait for the user.
+            other => {
+                self.status = Status::AwaitingApproval(Pending {
+                    action: other,
+                    selected: Choice::Allow,
+                    edit_plan: None,
+                });
             }
         }
         None
+    }
+
+    /// Report a pre-flight edit failure to the model. An edit runs as a write, so
+    /// its failure is a write result too — reusing [`App::push_write_result`]
+    /// keeps one path for framing, history, and the transcript entry.
+    fn push_edit_failure(&mut self, path: &str, message: String) -> Vec<Message> {
+        self.push_write_result(WriteOutcome {
+            path: path.to_string(),
+            bytes: 0,
+            error: Some(message),
+            timed_out: false,
+            cancelled: false,
+        })
     }
 
     /// Read a file and hand the contents straight back to the model.
@@ -817,12 +853,22 @@ impl App {
         }
     }
 
-    /// Accept the pending action; the caller runs it. Returns the action.
+    /// Accept the pending action; the caller runs it. Returns the action to run.
+    ///
+    /// An edit runs as the write its pre-flight prepared, so the bytes that land
+    /// are exactly the ones the diff showed — the file is not re-read or
+    /// re-matched after approval, which would open a window for it to change.
     pub fn approve(&mut self) -> Option<Action> {
         let Status::AwaitingApproval(pending) = &self.status else {
             return None;
         };
-        let action = pending.action.clone();
+        let action = match &pending.edit_plan {
+            Some(plan) => Action::Write {
+                path: plan.path.clone(),
+                contents: plan.updated.clone(),
+            },
+            None => pending.action.clone(),
+        };
         self.status = Status::Running;
         self.follow = true;
         Some(action)
@@ -839,6 +885,7 @@ impl App {
             Action::Shell(command) => command.clone(),
             Action::Read { path } => format!("read {path}"),
             Action::Write { path, .. } => format!("write {path}"),
+            Action::Edit { path, .. } => format!("edit {path}"),
             Action::Response(_) => String::new(),
         };
         self.transcript.push(Entry::Denied(refused));
@@ -2375,9 +2422,9 @@ mod tests {
     }
 }
 
-/// Reads need a real `Sandbox`, which only exists on macOS.
+/// Reads and edits need a real `Sandbox`, which only exists on macOS.
 #[cfg(all(test, target_os = "macos"))]
-mod read_tests {
+mod file_tests {
     use super::tests::{last_visible, visible};
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2531,5 +2578,99 @@ mod read_tests {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
         let messages = app.perform_read("anything.txt");
         assert!(messages.last().unwrap().content.contains("not configured"));
+    }
+
+    fn edit_reply(path: &str, old: &str, new: &str) -> String {
+        format!(
+            "<ai-harness-edit file={path}><ai-harness-old>{old}</ai-harness-old>\
+             <ai-harness-new>{new}</ai-harness-new></ai-harness-edit>"
+        )
+    }
+
+    #[test]
+    fn a_valid_edit_waits_for_approval_and_prepares_the_write() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
+        assert!(
+            app.push_response(edit_reply("m.rs", "let x = 1;", "let x = 2;"), None)
+                .is_none(),
+            "a valid edit must stop at the modal, not run"
+        );
+
+        match app.pending() {
+            Some(pending) => {
+                assert!(
+                    matches!(&pending.action, Action::Edit { path, .. } if path == "m.rs"),
+                    "the modal should show the edit, not the write"
+                );
+                let plan = pending.edit_plan.as_ref().expect("a plan was prepared");
+                assert_eq!(plan.updated, "let x = 2;\n");
+            }
+            None => panic!("expected the approval modal"),
+        }
+    }
+
+    #[test]
+    fn approving_an_edit_runs_the_prepared_write() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
+        app.push_response(edit_reply("m.rs", "let x = 1;", "let x = 2;"), None);
+
+        // The edit is applied as the write its pre-flight built — full new file.
+        match app.approve() {
+            Some(Action::Write { path, contents }) => {
+                assert_eq!(path, "m.rs");
+                assert_eq!(contents, "let x = 2;\n");
+            }
+            other => panic!("edit should approve into a write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unmatched_edit_never_reaches_the_modal() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
+        let messages = app
+            .push_response(edit_reply("m.rs", "let y = 9;", "z"), None)
+            .expect("a hopeless edit feeds a failure straight back to the model");
+
+        assert!(
+            app.pending().is_none(),
+            "the user must not be asked to approve an edit that cannot apply"
+        );
+        assert!(app.is_waiting());
+        assert!(messages.last().unwrap().content.contains("not found"));
+    }
+
+    #[test]
+    fn an_ambiguous_edit_is_bounced_back_with_a_count() {
+        let (mut app, _dir) = app_with_files(&[("dup.txt", "a\na\na\n")]);
+        let messages = app
+            .push_response(edit_reply("dup.txt", "a", "b"), None)
+            .unwrap();
+        assert!(app.pending().is_none());
+        assert!(messages.last().unwrap().content.contains("3 times"));
+    }
+
+    #[test]
+    fn a_denied_edit_tells_the_model_what_was_refused() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
+        app.push_response(edit_reply("m.rs", "let x = 1;", "let x = 2;"), None);
+        assert!(app.deny().is_some());
+        assert!(
+            visible(&app)
+                .iter()
+                .any(|e| matches!(e, Entry::Denied(what) if what == "edit m.rs"))
+        );
+    }
+
+    #[test]
+    fn the_original_file_is_untouched_until_the_write_runs() {
+        let (mut app, dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
+        app.push_response(edit_reply("m.rs", "let x = 1;", "let x = 2;"), None);
+        // Pre-flight and approval prepare the write but do not perform it.
+        app.approve();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "let x = 1;\n",
+            "the edit must not hit disk until the sandboxed write runs"
+        );
     }
 }

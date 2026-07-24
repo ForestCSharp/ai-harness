@@ -38,8 +38,15 @@ pub const SHELL_TAG: &str = "ai-harness-shell";
 pub const RESPONSE_TAG: &str = "ai-harness-response";
 /// A file read. Non-mutating, so it runs without the approval modal.
 pub const READ_TAG: &str = "ai-harness-read";
-/// A file write. Unlike the others, its opening tag carries a `file=` attribute.
+/// A file write. Unlike shell/read/response, its opening tag carries a `file=`
+/// attribute.
 pub const WRITE_TAG: &str = "ai-harness-write";
+/// A targeted edit: replace one exact span of a file. Carries `file=` like write.
+pub const EDIT_TAG: &str = "ai-harness-edit";
+/// The span an edit replaces. A child of [`EDIT_TAG`], never valid on its own.
+pub const OLD_TAG: &str = "ai-harness-old";
+/// What an edit replaces the old span with. A child of [`EDIT_TAG`].
+pub const NEW_TAG: &str = "ai-harness-new";
 /// Harness → model only. Carries the outcome of a shell action; never parsed.
 pub const RESULT_TAG: &str = "ai-harness-shell-result";
 /// Harness → model only. Carries the outcome of a file write; never parsed.
@@ -47,8 +54,10 @@ pub const WRITE_RESULT_TAG: &str = "ai-harness-write-result";
 /// Harness → model only. Carries the contents of a file read; never parsed.
 pub const READ_RESULT_TAG: &str = "ai-harness-read-result";
 
-/// Tags the model is allowed to reply with.
-const REPLY_TAGS: [&str; 4] = [SHELL_TAG, READ_TAG, RESPONSE_TAG, WRITE_TAG];
+/// Tags the model is allowed to reply with at the top level. The edit children
+/// ([`OLD_TAG`], [`NEW_TAG`]) are not here: they are only valid nested inside an
+/// edit, so at the top level they are correctly rejected as unknown.
+const REPLY_TAGS: [&str; 5] = [READ_TAG, SHELL_TAG, WRITE_TAG, EDIT_TAG, RESPONSE_TAG];
 
 /// A validated model reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,18 +68,26 @@ pub enum Action {
     Read { path: String },
     /// A file the model wants written. Not written yet.
     Write { path: String, contents: String },
+    /// A targeted replacement of one exact span in a file. Not applied yet; the
+    /// span is resolved into a full rewrite during pre-flight.
+    Edit {
+        path: String,
+        old: String,
+        new: String,
+    },
     /// A terminating answer for the user.
     Response(String),
 }
 
 impl Action {
-    /// The primary text of the action (the command, the answer, the path, or —
-    /// for a write — the file contents).
+    /// The primary text of the action (the command, the answer, the path, the
+    /// file contents, or — for an edit — the span being replaced).
     pub fn body(&self) -> &str {
         match self {
             Self::Shell(s) | Self::Response(s) => s,
             Self::Read { path } => path,
             Self::Write { contents, .. } => contents,
+            Self::Edit { old, .. } => old,
         }
     }
 }
@@ -121,6 +138,23 @@ pub enum ProtocolError {
         tag: String,
         attr: String,
     },
+    /// A body contained its own closing tag, so the element could not be framed.
+    /// Distinguished from [`Self::TrailingContent`] to give an actionable hint.
+    DelimiterInBody {
+        tag: String,
+    },
+    /// An edit was missing one of its required `<old>`/`<new>` children.
+    MissingChildTag {
+        parent: String,
+        child: String,
+    },
+    /// Content sat between or after an edit's children where none is allowed.
+    UnexpectedChildContent {
+        parent: String,
+        found: String,
+    },
+    /// An edit gave `<new>` before `<old>`.
+    ChildOutOfOrder,
 }
 
 impl fmt::Display for ProtocolError {
@@ -161,6 +195,23 @@ impl fmt::Display for ProtocolError {
                 "<{tag}> does not take attributes, but had: {}",
                 snippet(attr)
             ),
+            Self::DelimiterInBody { tag } => write!(
+                f,
+                "the contents of <{tag}> contain the literal text </{tag}>, which \
+                 the parser reads as the end of the element. This element cannot \
+                 carry that text; write the file with a shell heredoc instead"
+            ),
+            Self::MissingChildTag { parent, child } => {
+                write!(f, "<{parent}> must contain a <{child}>…</{child}> element")
+            }
+            Self::UnexpectedChildContent { parent, found } => write!(
+                f,
+                "<{parent}> may contain only <{OLD_TAG}> then <{NEW_TAG}>, but also had: {}",
+                snippet(found)
+            ),
+            Self::ChildOutOfOrder => {
+                write!(f, "<{EDIT_TAG}> must give <{OLD_TAG}> before <{NEW_TAG}>")
+            }
         }
     }
 }
@@ -245,10 +296,11 @@ pub fn encode_correction(error: &ProtocolError) -> String {
         "Your last reply was rejected by the parser: {error}\n\n\
          Reply again with exactly one element and nothing else — no prose, no \
          markdown fences. The first character must be '<' and the last must be \
-         '>'. Use <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, \
-         <{READ_TAG}>path</{READ_TAG}> to read a file, \
-         <{WRITE_TAG} file=path>…</{WRITE_TAG}> to write a file, or \
-         <{RESPONSE_TAG}>…</{RESPONSE_TAG}> to answer."
+         '>'. Use <{READ_TAG}>path</{READ_TAG}> to read a file, \
+         <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, \
+         <{WRITE_TAG} file=path>…</{WRITE_TAG}> to write a whole file, \
+         <{EDIT_TAG} file=path><{OLD_TAG}>…</{OLD_TAG}><{NEW_TAG}>…</{NEW_TAG}></{EDIT_TAG}> \
+         to change part of one, or <{RESPONSE_TAG}>…</{RESPONSE_TAG}> to answer."
     )
 }
 
@@ -302,17 +354,15 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         });
     }
 
-    // Only the write tag takes an attribute.
-    if tag != WRITE_TAG && !attrs.is_empty() {
+    // Only write and edit take an attribute (their `file=` path).
+    if tag != WRITE_TAG && tag != EDIT_TAG && !attrs.is_empty() {
         return Err(ProtocolError::UnexpectedAttribute {
             tag: tag.to_string(),
             attr: attrs.to_string(),
         });
     }
 
-    // The body is everything up to the first matching closing tag. A file that
-    // literally contains the closing tag would truncate here; that is rare and
-    // matches the shell tag's behaviour.
+    // The body runs to the first matching closing tag.
     let closing = format!("</{tag}>");
     let after_open = &trimmed[close_bracket + 1..];
     let closing_at = after_open
@@ -324,6 +374,15 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
     let body = &after_open[..closing_at];
     let trailing = after_open[closing_at + closing.len()..].trim();
     if !trailing.is_empty() {
+        // A body that swallowed its own delimiter leaves the *real* closing tag
+        // dangling at the very end; a genuine second element instead opens with a
+        // fresh `<tag`. Distinguishing the two turns a baffling "trailing content"
+        // into an actionable "your text contains </tag>".
+        if trailing.ends_with(&closing) && !trailing.starts_with(&format!("<{tag}")) {
+            return Err(ProtocolError::DelimiterInBody {
+                tag: tag.to_string(),
+            });
+        }
         return Err(ProtocolError::TrailingContent {
             tag: tag.to_string(),
             trailing: trailing.to_string(),
@@ -334,7 +393,7 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         let path = parse_file_attribute(attrs).ok_or(ProtocolError::MissingFileAttribute)?;
         // File bytes are significant: preserve the body exactly, stripping only
         // the single formatting newline models put right after '>'.
-        let contents = body.strip_prefix('\n').unwrap_or(body);
+        let contents = strip_formatting_newline(body);
         if contents.is_empty() {
             return Err(ProtocolError::EmptyBody {
                 tag: tag.to_string(),
@@ -344,6 +403,12 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
             path,
             contents: contents.to_string(),
         });
+    }
+
+    if tag == EDIT_TAG {
+        let path = parse_file_attribute(attrs).ok_or(ProtocolError::MissingFileAttribute)?;
+        let (old, new) = parse_edit_children(body)?;
+        return Ok(Action::Edit { path, old, new });
     }
 
     let body = body.trim();
@@ -376,6 +441,88 @@ fn parse_file_attribute(attrs: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Strip the single formatting newline a model puts right after `>` when it
+/// lays a body out on its own line. Only the leading one — a trailing newline
+/// is real file content (and, for an edit span, makes the match more precise by
+/// anchoring to the end of a line).
+fn strip_formatting_newline(body: &str) -> &str {
+    body.strip_prefix('\n').unwrap_or(body)
+}
+
+/// Parse the `<old>…</old><new>…</new>` inside an edit's body.
+///
+/// `old` must be present and non-empty; `new` must be present but may be empty,
+/// which expresses a deletion. Anything before, between, or after the two
+/// children — other than whitespace — is rejected, so the grammar stays exact.
+fn parse_edit_children(body: &str) -> Result<(String, String), ProtocolError> {
+    let body = body.trim();
+
+    // A clearer message than "missing <old>" when the two are simply swapped.
+    if let (Some(old_at), Some(new_at)) = (
+        body.find(&format!("<{OLD_TAG}>")),
+        body.find(&format!("<{NEW_TAG}>")),
+    ) && new_at < old_at
+    {
+        return Err(ProtocolError::ChildOutOfOrder);
+    }
+
+    let (old_raw, rest) = expect_child(body, OLD_TAG)?;
+    let (new_raw, rest) = expect_child(rest, NEW_TAG)?;
+    if !rest.trim().is_empty() {
+        return Err(ProtocolError::UnexpectedChildContent {
+            parent: EDIT_TAG.to_string(),
+            found: rest.trim().to_string(),
+        });
+    }
+
+    let old = strip_formatting_newline(old_raw);
+    let new = strip_formatting_newline(new_raw);
+    if old.is_empty() {
+        // An empty search span would match everywhere; refuse it outright.
+        return Err(ProtocolError::EmptyBody {
+            tag: OLD_TAG.to_string(),
+        });
+    }
+    Ok((old.to_string(), new.to_string()))
+}
+
+/// Take the `<child>…</child>` expected at the front of `input` (after leading
+/// whitespace), returning its raw body and whatever follows the closing tag.
+///
+/// The error tells the model what actually went wrong: the child is genuinely
+/// absent ([`ProtocolError::MissingChildTag`]) versus present but with junk in
+/// front of it ([`ProtocolError::UnexpectedChildContent`]).
+fn expect_child<'a>(input: &'a str, child: &str) -> Result<(&'a str, &'a str), ProtocolError> {
+    let input = input.trim_start();
+    let open = format!("<{child}>");
+    match input.strip_prefix(&open) {
+        Some(after_open) => {
+            let closing = format!("</{child}>");
+            let closing_at =
+                after_open
+                    .find(&closing)
+                    .ok_or_else(|| ProtocolError::MissingClosingTag {
+                        tag: child.to_string(),
+                    })?;
+            Ok((
+                &after_open[..closing_at],
+                &after_open[closing_at + closing.len()..],
+            ))
+        }
+        // The tag appears, but something precedes it.
+        None => match input.find(&open) {
+            Some(at) => Err(ProtocolError::UnexpectedChildContent {
+                parent: EDIT_TAG.to_string(),
+                found: input[..at].trim().to_string(),
+            }),
+            None => Err(ProtocolError::MissingChildTag {
+                parent: EDIT_TAG.to_string(),
+                child: child.to_string(),
+            }),
+        },
+    }
+}
+
 /// The protocol contract sent as the system prompt. `extra` appends any
 /// operator-supplied guidance after the rules.
 pub fn system_prompt(extra: Option<&str>) -> String {
@@ -396,13 +543,26 @@ You MUST reply with exactly one of the following elements, and nothing else.
 
 <{SHELL_TAG}>the command to run</{SHELL_TAG}>
 
-3. Write a file. The whole file is replaced with the contents you give:
+3. Write a whole file. Use this only for a new file or a full rewrite:
 
 <{WRITE_TAG} file=path/to/file>
 the exact file contents
 </{WRITE_TAG}>
 
-4. Give the user a final answer. This ends the current task:
+4. Change part of an existing file. Prefer this over write for edits — it is far
+cheaper than repeating the whole file, and it cannot accidentally drop the parts
+you did not mean to touch:
+
+<{EDIT_TAG} file=path/to/file>
+<{OLD_TAG}>
+the exact text to replace, copied verbatim from the file
+</{OLD_TAG}>
+<{NEW_TAG}>
+the text to put in its place
+</{NEW_TAG}>
+</{EDIT_TAG}>
+
+5. Give the user a final answer. This ends the current task:
 
 <{RESPONSE_TAG}>your answer to the user</{RESPONSE_TAG}>
 
@@ -425,7 +585,7 @@ stderr:
 ...
 </{RESULT_TAG}>
 
-After a file write, it sends:
+After a file write — or an edit, which the harness applies as a write — it sends:
 
 <{WRITE_RESULT_TAG}>
 status: wrote 128 bytes to path/to/file
@@ -434,7 +594,7 @@ status: wrote 128 bytes to path/to/file
 Reply to a result with another action to keep going, or <{RESPONSE_TAG}> when you \
 have what you need. Never emit a result element yourself.
 
-The user approves every command and every write before it happens. If a result \
+The user approves every command, write, and edit before it happens. If a result \
 says it was denied, it did NOT run: propose a different approach or explain the \
 problem with <{RESPONSE_TAG}>. Do not simply repeat the same action.
 
@@ -454,7 +614,10 @@ Rules, all strictly enforced by a parser:
 - Reply with exactly ONE element. Never two, never zero.
 - Emit nothing outside the element: no prose, no explanation, no markdown code \
 fences, no leading or trailing text. The very first character of your reply must \
-be '<' and the very last must be '>'.
+be '<' and the very last must be '>'. This includes conversational pleasantries \
+like “Sure, I'll do that now” — even a single sentence before the element is a \
+protocol error. If you feel the urge to narrate, put it inside \
+<{RESPONSE_TAG}> instead.
 - Use only the tags listed above. Never emit <{QUERY_TAG}>; that tag belongs \
 to the harness.
 - The element must be non-empty.
@@ -462,7 +625,14 @@ to the harness.
 you need several. Prefer non-interactive commands that terminate on their own.
 - A <{READ_TAG}> contains one file path and nothing else. One file per element.
 - A <{WRITE_TAG}> must have a file=… path and contains the complete new file \
-contents (not a diff). Only <{WRITE_TAG}> takes an attribute; the others do not.
+contents (not a diff). <{WRITE_TAG}> and <{EDIT_TAG}> take the file= attribute; \
+no other tag does.
+- An <{EDIT_TAG}> must have a file=… path and contain a <{OLD_TAG}> then a \
+<{NEW_TAG}>, in that order and nothing else. The <{OLD_TAG}> text must appear \
+EXACTLY ONCE in the file, copied character-for-character — whitespace included — \
+from what you read. If it is not found, re-read the file and copy it again. If it \
+appears more than once, add surrounding lines to <{OLD_TAG}> (and matching lines \
+to <{NEW_TAG}>) until the span is unique. An empty <{NEW_TAG}> deletes the span.
 - If you can answer without running anything, reply with <{RESPONSE_TAG}> directly.
 
 A reply that breaks any of these rules is discarded and shown to the user as an \
@@ -614,6 +784,140 @@ mod tests {
             error: None,
         };
         assert!(encode_read_result(&outcome).ends_with("\n</ai-harness-read-result>"));
+    }
+
+    #[test]
+    fn parses_an_edit_with_both_children() {
+        let raw = "<ai-harness-edit file=src/app.rs>\n\
+                   <ai-harness-old>\nold line\n</ai-harness-old>\n\
+                   <ai-harness-new>\nnew line\n</ai-harness-new>\n\
+                   </ai-harness-edit>";
+        assert_eq!(
+            parse_reply(raw).unwrap(),
+            Action::Edit {
+                path: "src/app.rs".into(),
+                old: "old line\n".into(),
+                new: "new line\n".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_needs_a_file_attribute() {
+        let raw = "<ai-harness-edit><ai-harness-old>a</ai-harness-old>\
+                   <ai-harness-new>b</ai-harness-new></ai-harness-edit>";
+        assert_eq!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::MissingFileAttribute
+        );
+    }
+
+    #[test]
+    fn an_edit_with_an_empty_new_is_a_deletion() {
+        let raw = "<ai-harness-edit file=x>\
+                   <ai-harness-old>gone</ai-harness-old>\
+                   <ai-harness-new></ai-harness-new></ai-harness-edit>";
+        assert_eq!(
+            parse_reply(raw).unwrap(),
+            Action::Edit {
+                path: "x".into(),
+                old: "gone".into(),
+                new: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_with_an_empty_old_is_rejected() {
+        let raw = "<ai-harness-edit file=x>\
+                   <ai-harness-old></ai-harness-old>\
+                   <ai-harness-new>b</ai-harness-new></ai-harness-edit>";
+        assert!(matches!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::EmptyBody { tag } if tag == OLD_TAG
+        ));
+    }
+
+    #[test]
+    fn an_edit_missing_the_new_child_is_rejected() {
+        let raw = "<ai-harness-edit file=x><ai-harness-old>a</ai-harness-old></ai-harness-edit>";
+        assert!(matches!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::MissingChildTag { child, .. } if child == NEW_TAG
+        ));
+    }
+
+    #[test]
+    fn an_edit_missing_the_old_child_is_rejected() {
+        let raw = "<ai-harness-edit file=x><ai-harness-new>b</ai-harness-new></ai-harness-edit>";
+        assert!(matches!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::MissingChildTag { child, .. } if child == OLD_TAG
+        ));
+    }
+
+    #[test]
+    fn an_edit_with_reversed_children_is_named_as_such() {
+        let raw = "<ai-harness-edit file=x>\
+                   <ai-harness-new>b</ai-harness-new>\
+                   <ai-harness-old>a</ai-harness-old></ai-harness-edit>";
+        assert_eq!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::ChildOutOfOrder
+        );
+    }
+
+    #[test]
+    fn junk_between_the_edit_children_is_rejected() {
+        let raw = "<ai-harness-edit file=x>\
+                   <ai-harness-old>a</ai-harness-old>surprise\
+                   <ai-harness-new>b</ai-harness-new></ai-harness-edit>";
+        assert!(matches!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::UnexpectedChildContent { found, .. } if found.contains("surprise")
+        ));
+    }
+
+    #[test]
+    fn an_edit_body_may_contain_angle_brackets() {
+        // Editing real code means `<`, `>`, and `/` in the spans.
+        let raw = "<ai-harness-edit file=x>\
+                   <ai-harness-old>Vec<u8></ai-harness-old>\
+                   <ai-harness-new>Vec<u16></ai-harness-new></ai-harness-edit>";
+        assert_eq!(
+            parse_reply(raw).unwrap(),
+            Action::Edit {
+                path: "x".into(),
+                old: "Vec<u8>".into(),
+                new: "Vec<u16>".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_body_containing_its_own_closing_tag_is_named_clearly() {
+        // The classic self-reference: writing a file that mentions the very tag
+        // that frames it. Must be DelimiterInBody, not a baffling TrailingContent.
+        let raw = "<ai-harness-write file=doc.md>\
+                   see </ai-harness-write> for details</ai-harness-write>";
+        assert_eq!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::DelimiterInBody {
+                tag: WRITE_TAG.into()
+            }
+        );
+    }
+
+    #[test]
+    fn two_real_elements_are_still_trailing_content_not_delimiter() {
+        // Both end in the same closing tag, but the second is a fresh element —
+        // that must stay TrailingContent so the "one element only" rule holds.
+        let raw = "<ai-harness-write file=a>x</ai-harness-write>\
+                   <ai-harness-write file=b>y</ai-harness-write>";
+        assert!(matches!(
+            parse_reply(raw).unwrap_err(),
+            ProtocolError::TrailingContent { .. }
+        ));
     }
 
     #[test]
@@ -984,6 +1288,18 @@ mod tests {
                 format!("<{READ_TAG}>path/to/file</{READ_TAG}>"),
                 Action::Read {
                     path: "path/to/file".into(),
+                },
+            ),
+            (
+                format!(
+                    "<{EDIT_TAG} file=path/to/file>\n<{OLD_TAG}>\nthe exact text to replace, \
+                     copied verbatim from the file\n</{OLD_TAG}>\n<{NEW_TAG}>\nthe text to put \
+                     in its place\n</{NEW_TAG}>\n</{EDIT_TAG}>"
+                ),
+                Action::Edit {
+                    path: "path/to/file".into(),
+                    old: "the exact text to replace, copied verbatim from the file\n".into(),
+                    new: "the text to put in its place\n".into(),
                 },
             ),
         ] {

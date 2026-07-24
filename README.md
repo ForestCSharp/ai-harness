@@ -11,7 +11,7 @@ Input is not sent as free text. Each prompt goes out wrapped in a single element
 <ai-harness-query>count the rust files in src</ai-harness-query>
 ```
 
-The model must reply with exactly one of four elements, and nothing else:
+The model must reply with exactly one of five elements, and nothing else:
 
 ```xml
 <ai-harness-shell>ls -1 src/*.rs | wc -l</ai-harness-shell>
@@ -19,6 +19,13 @@ The model must reply with exactly one of four elements, and nothing else:
 
 ```xml
 <ai-harness-read>src/app.rs</ai-harness-read>
+```
+
+```xml
+<ai-harness-edit file=src/app.rs>
+<ai-harness-old>let x = 1;</ai-harness-old>
+<ai-harness-new>let x = 2;</ai-harness-new>
+</ai-harness-edit>
 ```
 
 ```xml
@@ -53,6 +60,19 @@ by being confined more tightly than the shell is: reads resolve to a real path
 inside the working directory or they fail. To read anything outside, the model
 has to use `<ai-harness-shell>`, which you approve as usual. Pass
 `--confirm-reads` to put reads behind the modal too.
+
+`<ai-harness-edit>` changes part of a file by exact search-and-replace: the
+`<ai-harness-old>` text must appear **exactly once** in the file, and it is
+swapped for `<ai-harness-new>` (an empty `<ai-harness-new>` deletes it). This is
+how the model should change an existing file — it costs tokens proportional to
+the change, not the whole file, and it cannot silently drop the parts it did not
+mean to touch, the way a full rewrite can. If the old text is missing or
+ambiguous, the edit is **rejected before you ever see a modal** and handed back
+to the model to fix; you are only asked to approve edits that will actually
+apply, and the approval shows a `-`/`+` diff. Under the hood an approved edit
+runs as an ordinary sandboxed write of the whole resolved file, so nothing about
+the confinement changes. `<ai-harness-write>` is still there for creating a new
+file or a deliberate full rewrite.
 
 If a reply fails validation, the harness tells the model exactly what was wrong
 and asks again, up to `--max-retries` (default 3). After that it gives up and
@@ -132,13 +152,15 @@ the sandbox with the path passed as an argv element (never shell text, so it
 cannot inject) and the contents piped on stdin. A write outside the root is denied
 by the kernel and reported as an error, never an escape.
 
-Every command and every write is shown in an approval modal before it runs (a
-write shows its path and a bounded preview, not the whole file). `←`/`→` move
-between Allow and Deny, `Enter` confirms, `y`/`n` are shortcuts, and the buttons
-are clickable. Denial is reported to the model so it can propose something else.
+Every command, write, and edit is shown in an approval modal before it runs (a
+write shows its path and a bounded preview; an edit shows its path and a `-`/`+`
+diff). `←`/`→` move between Allow and Deny, `Enter` confirms, `y`/`n` are
+shortcuts, and the buttons are clickable. Denial is reported to the model so it
+can propose something else. An edit is resolved against the file *before* the
+modal, so you are never asked to approve one that cannot apply.
 
-The agentic loop is bounded by `--max-iterations` (default 10) so a model that
-keeps proposing commands cannot spin forever.
+The agentic loop is bounded by `--max-iterations` so a model that keeps proposing
+actions cannot spin forever; reads and edits count against it like anything else.
 
 **This confines the filesystem; it is not a security boundary against a
 determined attacker.** Network is on, so any command you approve can send
