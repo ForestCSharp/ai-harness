@@ -2,10 +2,12 @@ mod app;
 mod command;
 mod config;
 mod exec;
+mod files;
 mod input;
 mod openrouter;
 mod protocol;
 mod sandbox;
+mod session;
 mod tui;
 mod ui;
 mod wrap;
@@ -18,12 +20,13 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use app::{App, Choice};
 use config::Args;
-use exec::CommandOutput;
+use exec::{CommandOutput, WriteOutcome};
 use openrouter::{Client, Completion, Message};
+use protocol::Action;
 use sandbox::Sandbox;
 
 /// Spinner animation rate; also bounds how long we go without redrawing.
@@ -37,6 +40,21 @@ enum Update {
     ReplyEnd(Result<Completion, String>),
     /// A sandboxed command finished, or failed to start.
     Command(Result<CommandOutput, String>),
+    /// A sandboxed file write finished, or failed to start.
+    Write(Result<WriteOutcome, String>),
+}
+
+/// An [`Update`] tagged with the generation of the task that produced it, so a
+/// cancelled task's still-queued updates can be recognised as stale and dropped.
+struct Tagged {
+    generation: u64,
+    update: Update,
+}
+
+/// A handle to the current in-flight task. Dropping or sending on `cancel`
+/// resolves the task's cancel future, stopping its work cleanly.
+struct InFlight {
+    cancel: oneshot::Sender<()>,
 }
 
 /// Shared context the event handlers need to start new background work.
@@ -44,7 +62,7 @@ struct Ctx {
     client: Client,
     sandbox: Sandbox,
     timeout: Duration,
-    tx: mpsc::Sender<Update>,
+    tx: mpsc::Sender<Tagged>,
 }
 
 #[tokio::main]
@@ -70,22 +88,29 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         client.model().to_string(),
         args.system.clone(),
         args.max_iterations.max(1),
+        args.sessions_dir.clone(),
     );
     app.debug = args.debug || cfg!(debug_assertions);
     app.max_retries = args.max_retries;
+    // Reads resolve paths in-process against the sandbox root, so the app needs
+    // the sandbox itself, not just its root.
+    app.sandbox = Some(sandbox.clone());
+    app.confirm_reads = args.confirm_reads;
     app.push_notice(format!(
         "Sandbox root: {}   Type /help for commands.",
         sandbox.root().display()
     ));
 
     let mut events = EventStream::new();
-    let (tx, mut rx) = mpsc::channel::<Update>(8);
+    let (tx, mut rx) = mpsc::channel::<Tagged>(8);
     let ctx = Ctx {
         client,
         sandbox,
         timeout: args.timeout(),
         tx,
     };
+    // The current in-flight task, if any, so `Esc` can cancel it.
+    let mut inflight: Option<InFlight> = None;
     let mut ticker = tokio::time::interval(TICK);
     let mut metrics = ui::Metrics::default();
 
@@ -96,7 +121,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             // Terminal input.
             Some(event) = events.next() => {
                 match event {
-                    Ok(event) => handle_event(event, &mut app, &ctx, metrics),
+                    Ok(event) => handle_event(event, &mut app, &ctx, &mut inflight, metrics),
                     // A read error means the terminal is gone; exit rather than spin.
                     Err(err) => {
                         app.push_error(format!("terminal input error: {err}"));
@@ -106,7 +131,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             }
 
             // Background work finished.
-            Some(update) = rx.recv() => handle_update(update, &mut app, &ctx),
+            Some(tagged) = rx.recv() => handle_update(tagged, &mut app, &ctx, &mut inflight),
 
             // Idle redraw, so the spinner animates while we wait.
             _ = ticker.tick() => {
@@ -119,50 +144,82 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             }
         }
 
+        // Persist a completed turn. A cheap no-op unless the conversation just
+        // changed and settled back to idle, so it runs after replies, cancels,
+        // errors, and loads alike.
+        app.maybe_autosave();
+
         if app.should_quit {
             return Ok(());
         }
     }
 }
 
-fn handle_update(update: Update, app: &mut App, ctx: &Ctx) {
-    match update {
+fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+    // Drop anything from a task the user has since cancelled or superseded.
+    if tagged.generation != app.generation() {
+        return;
+    }
+
+    match tagged.update {
         // Live tokens accumulate in the display-only streaming buffer.
         Update::Delta(delta) => app.push_delta(&delta),
         // The reply is complete. Drop the live view and commit the full text
         // through the normal path — a malformed reply earns a corrective retry,
         // which comes back as messages to resend.
         Update::ReplyEnd(Ok(completion)) => {
+            *inflight = None;
             app.finish_stream();
             if let Some(messages) = app.push_response(completion.content, completion.usage) {
-                spawn_request(ctx, messages);
+                spawn_request(app, ctx, inflight, messages);
             }
         }
         Update::ReplyEnd(Err(message)) => {
+            *inflight = None;
             app.finish_stream();
             app.push_error(message);
         }
         // A finished command goes straight back to the model, continuing the loop.
         Update::Command(Ok(output)) => {
+            *inflight = None;
             let messages = app.push_command_result(output);
-            spawn_request(ctx, messages);
+            spawn_request(app, ctx, inflight, messages);
         }
         Update::Command(Err(message)) => {
-            app.push_error(format!("could not run command: {message}"))
+            *inflight = None;
+            app.push_error(format!("could not run command: {message}"));
+        }
+        // A finished write does the same — its result feeds the loop.
+        Update::Write(Ok(outcome)) => {
+            *inflight = None;
+            let messages = app.push_write_result(outcome);
+            spawn_request(app, ctx, inflight, messages);
+        }
+        Update::Write(Err(message)) => {
+            *inflight = None;
+            app.push_error(format!("could not write file: {message}"));
         }
     }
 }
 
-fn handle_event(event: Event, app: &mut App, ctx: &Ctx, metrics: ui::Metrics) {
+fn handle_event(
+    event: Event,
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    metrics: ui::Metrics,
+) {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(key, app, ctx, metrics),
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            handle_key(key, app, ctx, inflight, metrics)
+        }
         Event::Mouse(mouse) => match mouse.kind {
             // Clicking a modal button is equivalent to confirming it.
             MouseEventKind::Down(MouseButton::Left) if app.pending().is_some() => {
                 if ui::hit(metrics.allow_button, mouse.column, mouse.row) {
-                    allow(app, ctx);
+                    allow(app, ctx, inflight);
                 } else if ui::hit(metrics.deny_button, mouse.column, mouse.row) {
-                    deny(app, ctx);
+                    deny(app, ctx, inflight);
                 }
             }
             // Hovering a button focuses it, so click and keyboard agree.
@@ -173,11 +230,25 @@ fn handle_event(event: Event, app: &mut App, ctx: &Ctx, metrics: ui::Metrics) {
                     app.set_choice(Choice::Deny);
                 }
             }
+            // Clicking a session row loads it; hovering focuses it.
+            MouseEventKind::Down(MouseButton::Left) if app.picker().is_some() => {
+                if let Some(i) = picker_row_at(metrics, mouse.column, mouse.row) {
+                    // Only load when the click lands on a real row.
+                    if app.picker_select(i) {
+                        app.picker_confirm();
+                    }
+                }
+            }
+            MouseEventKind::Moved if app.picker().is_some() => {
+                if let Some(i) = picker_row_at(metrics, mouse.column, mouse.row) {
+                    app.picker_select(i);
+                }
+            }
             MouseEventKind::ScrollUp => app.scroll_up(3),
             MouseEventKind::ScrollDown => app.scroll_down(3, metrics.max_scroll()),
             _ => {}
         },
-        Event::Paste(text) if !app.is_busy() => {
+        Event::Paste(text) if !app.is_busy() && app.picker().is_none() => {
             // Normalise line endings so pasted CRLF does not leave stray \r.
             app.input
                 .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
@@ -186,28 +257,77 @@ fn handle_event(event: Event, app: &mut App, ctx: &Ctx, metrics: ui::Metrics) {
     }
 }
 
-/// Approve the pending command and start running it.
-fn allow(app: &mut App, ctx: &Ctx) {
-    let Some(command) = app.approve() else { return };
+/// Which session row a mouse position falls on, using the picker geometry from
+/// the last rendered frame. `None` when the point is outside the list.
+fn picker_row_at(metrics: ui::Metrics, column: u16, row: u16) -> Option<usize> {
+    let list = metrics.picker_list?;
+    if !ui::hit(Some(list), column, row) {
+        return None;
+    }
+    Some(metrics.picker_offset + (row - list.y) as usize)
+}
+
+/// Approve the pending action and start running it — a shell command or a write.
+fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+    let Some(action) = app.approve() else { return };
+
+    // A read needs no subprocess, so it is done inline and the loop continues
+    // immediately. Only reachable under `--confirm-reads`; otherwise a read
+    // never becomes pending in the first place.
+    let action = match action {
+        Action::Read { path } => {
+            let messages = app.perform_read(&path);
+            spawn_request(app, ctx, inflight, messages);
+            return;
+        }
+        other => other,
+    };
+
+    let generation = app.next_generation();
     let sandbox = ctx.sandbox.clone();
     let timeout = ctx.timeout;
     let tx = ctx.tx.clone();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
-        let result = exec::run(&sandbox, &command, timeout)
-            .await
-            .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(Update::Command(result)).await;
+        // The receiver resolves when the sender is used or dropped, either way
+        // interrupting the work.
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+        let update = match action {
+            Action::Shell(command) => Update::Command(
+                exec::run_cancellable(&sandbox, &command, timeout, cancel)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+            ),
+            Action::Write { path, contents } => Update::Write(
+                exec::write_file(&sandbox, &path, &contents, timeout, cancel)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+            ),
+            // A Response is never approvable and a Read was handled above, so
+            // neither arm is reachable.
+            Action::Read { .. } | Action::Response(_) => return,
+        };
+        let _ = tx.send(Tagged { generation, update }).await;
     });
+    *inflight = Some(InFlight { cancel: cancel_tx });
 }
 
 /// Refuse the pending command and let the model know.
-fn deny(app: &mut App, ctx: &Ctx) {
+fn deny(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     if let Some(messages) = app.deny() {
-        spawn_request(ctx, messages);
+        spawn_request(app, ctx, inflight, messages);
     }
 }
 
-fn handle_key(key: KeyEvent, app: &mut App, ctx: &Ctx, metrics: ui::Metrics) {
+fn handle_key(
+    key: KeyEvent,
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    metrics: ui::Metrics,
+) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -221,21 +341,45 @@ fn handle_key(key: KeyEvent, app: &mut App, ctx: &Ctx, metrics: ui::Metrics) {
     }
 
     // The approval modal owns the keyboard while it is open, so stray typing
-    // cannot leak into the prompt hidden behind it.
+    // cannot leak into the prompt hidden behind it. Esc here means Deny (refuse
+    // this command, continue the loop), not cancel-the-turn.
     if app.pending().is_some() {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
-            KeyCode::Char('y') | KeyCode::Char('Y') => allow(app, ctx),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => deny(app, ctx),
+            KeyCode::Char('y') | KeyCode::Char('Y') => allow(app, ctx, inflight),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => deny(app, ctx, inflight),
             KeyCode::Enter => match app.pending().map(|p| p.selected) {
-                Some(Choice::Allow) => allow(app, ctx),
-                Some(Choice::Deny) => deny(app, ctx),
+                Some(Choice::Allow) => allow(app, ctx, inflight),
+                Some(Choice::Deny) => deny(app, ctx, inflight),
                 None => {}
             },
             KeyCode::PageUp => app.scroll_up(page),
             KeyCode::PageDown => app.scroll_down(page, max_scroll),
             _ => {}
         }
+        return;
+    }
+
+    // The session picker owns the keyboard while it is open.
+    if app.picker().is_some() {
+        match key.code {
+            KeyCode::Up => app.picker_move(-1),
+            KeyCode::Down => app.picker_move(1),
+            KeyCode::PageUp => app.picker_move(-(page as isize)),
+            KeyCode::PageDown => app.picker_move(page as isize),
+            KeyCode::Enter => app.picker_confirm(),
+            KeyCode::Esc => app.picker_cancel(),
+            _ => {}
+        }
+        return;
+    }
+
+    // While a stream or command is in flight (no modal), Esc interrupts it.
+    if app.is_busy() && key.code == KeyCode::Esc {
+        if let Some(handle) = inflight.take() {
+            let _ = handle.cancel.send(());
+        }
+        app.cancel();
         return;
     }
 
@@ -270,7 +414,7 @@ fn handle_key(key: KeyEvent, app: &mut App, ctx: &Ctx, metrics: ui::Metrics) {
             // does not need completing first.
             app.accept_completion();
             if let Some(messages) = app.submit() {
-                spawn_request(ctx, messages);
+                spawn_request(app, ctx, inflight, messages);
             }
         }
 
@@ -298,49 +442,88 @@ fn handle_key(key: KeyEvent, app: &mut App, ctx: &Ctx, metrics: ui::Metrics) {
         KeyCode::End if !app.follow => app.scroll_to_bottom(max_scroll),
         KeyCode::End => app.input.move_to_line_end(),
         KeyCode::Tab => app.input.insert_str("    "),
+        // Prompt history recall. Bare Up/Down reach here only when not busy
+        // (above guard), not scrolling (Ctrl/Alt arms above), and with no
+        // completion menu open (an empty prompt has none).
+        KeyCode::Up => app.recall_prev(),
+        KeyCode::Down => app.recall_next(),
         KeyCode::Char(c) if !ctrl => app.input.insert_char(c),
         _ => {}
     }
 }
 
-fn spawn_request(ctx: &Ctx, messages: Vec<Message>) {
+fn spawn_request(
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    messages: Vec<Message>,
+) {
+    let generation = app.next_generation();
     let client = ctx.client.clone();
     let tx = ctx.tx.clone();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
         // A send failure just means the UI shut down; stop forwarding if so.
         let end = match client.open_stream(&messages).await {
-            Ok(stream) => stream_reply(stream, &tx).await,
-            Err(e) => Err(format!("{e:#}")),
+            Ok(stream) => stream_reply(stream, &tx, generation, cancel).await,
+            Err(e) => Some(Err(format!("{e:#}"))),
         };
-        let _ = tx.send(Update::ReplyEnd(end)).await;
+        // On cancel `end` is None, so we send nothing — the app has already
+        // moved on and any late update would be dropped as stale anyway.
+        if let Some(end) = end {
+            let _ = tx
+                .send(Tagged {
+                    generation,
+                    update: Update::ReplyEnd(end),
+                })
+                .await;
+        }
     });
+    *inflight = Some(InFlight { cancel: cancel_tx });
 }
 
-/// Forward stream deltas to the UI, accumulating the full reply. Returns the
-/// completed reply, or the first error encountered.
+/// Forward stream deltas to the UI, accumulating the full reply.
+///
+/// Returns `Some(reply-or-error)` normally, or `None` if `cancel` fired — in
+/// which case the caller sends no terminal update.
 async fn stream_reply(
     stream: impl futures_util::Stream<Item = anyhow::Result<openrouter::StreamEvent>>,
-    tx: &mpsc::Sender<Update>,
-) -> Result<Completion, String> {
+    tx: &mpsc::Sender<Tagged>,
+    generation: u64,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Option<Result<Completion, String>> {
     use openrouter::StreamEvent;
     futures_util::pin_mut!(stream);
+    tokio::pin!(cancel);
 
     let mut content = String::new();
     let mut usage = None;
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(StreamEvent::Delta(delta)) => {
-                content.push_str(&delta);
-                // `send().await` back-pressures the HTTP read, so tokens are
-                // never dropped when the UI falls behind.
-                if tx.send(Update::Delta(delta)).await.is_err() {
-                    return Err("UI closed".to_string());
+    loop {
+        tokio::select! {
+            // Interrupt takes priority so a fast stream cannot starve it.
+            biased;
+            _ = &mut cancel => return None,
+            event = stream.next() => match event {
+                Some(Ok(StreamEvent::Delta(delta))) => {
+                    content.push_str(&delta);
+                    // `send().await` back-pressures the HTTP read, so tokens are
+                    // never dropped when the UI falls behind.
+                    if tx
+                        .send(Tagged { generation, update: Update::Delta(delta) })
+                        .await
+                        .is_err()
+                    {
+                        return Some(Err("UI closed".to_string()));
+                    }
                 }
-            }
-            Ok(StreamEvent::Done { usage: Some(u) }) => usage = Some(u),
-            Ok(StreamEvent::Done { usage: None }) => {}
-            Err(e) => return Err(format!("{e:#}")),
+                Some(Ok(StreamEvent::Done { usage: Some(u) })) => usage = Some(u),
+                Some(Ok(StreamEvent::Done { usage: None })) => {}
+                Some(Err(e)) => return Some(Err(format!("{e:#}"))),
+                None => return Some(Ok(Completion { content, usage })),
+            },
         }
     }
-    Ok(Completion { content, usage })
 }

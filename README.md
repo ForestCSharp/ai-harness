@@ -11,10 +11,20 @@ Input is not sent as free text. Each prompt goes out wrapped in a single element
 <ai-harness-query>count the rust files in src</ai-harness-query>
 ```
 
-The model must reply with exactly one of two elements, and nothing else:
+The model must reply with exactly one of four elements, and nothing else:
 
 ```xml
 <ai-harness-shell>ls -1 src/*.rs | wc -l</ai-harness-shell>
+```
+
+```xml
+<ai-harness-read>src/app.rs</ai-harness-read>
+```
+
+```xml
+<ai-harness-write file=src/hello.rs>
+fn main() { println!("hi"); }
+</ai-harness-write>
 ```
 
 ```xml
@@ -23,13 +33,26 @@ The model must reply with exactly one of two elements, and nothing else:
 
 The contract is sent as the system prompt on every request, and replies are
 validated strictly — prose around the tag, a markdown code fence, two elements,
-an unknown tag, or an empty body are all rejected rather than guessed at, so
-protocol drift surfaces immediately. A rejected reply is shown in the transcript
-as a `protocol error` alongside the raw text the model actually sent.
+an unknown tag, an attribute where none is allowed, or an empty body are all
+rejected rather than guessed at, so protocol drift surfaces immediately. A
+rejected reply is shown in the transcript as a `protocol error` alongside the raw
+text the model actually sent.
 
-A shell action is executed only after you approve it, and its result is fed back
-as `<ai-harness-shell-result>`, so the model can keep working until it returns a
-final response.
+A shell command or file write runs only after you approve it, and its result is
+fed back (`<ai-harness-shell-result>` / `<ai-harness-write-result>`), so the model
+can keep working until it returns a final response. `<ai-harness-write>` replaces
+the whole named file; its contents are preserved byte-for-byte (only the single
+formatting newline after `>` is stripped).
+
+`<ai-harness-read>` is the exception: it mutates nothing, so it runs immediately
+with **no approval prompt** and the contents come straight back as
+`<ai-harness-read-result>`. That is the point of having it as its own element
+rather than leaving reads to `cat` — an agent that wants to look at four files
+before doing anything should not interrupt you four times first. It earns that
+by being confined more tightly than the shell is: reads resolve to a real path
+inside the working directory or they fail. To read anything outside, the model
+has to use `<ai-harness-shell>`, which you approve as usual. Pass
+`--confirm-reads` to put reads behind the modal too.
 
 If a reply fails validation, the harness tells the model exactly what was wrong
 and asks again, up to `--max-retries` (default 3). After that it gives up and
@@ -44,6 +67,10 @@ Commands are handled locally and never sent to the model.
 | --- | --- |
 | `/debug` | Toggle showing the raw protocol sent and received |
 | `/clear` | Clear the conversation, keeping the system prompt |
+| `/save [name]` | Save the session now (auto-save is always on; this also names it) |
+| `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
+| `/rename <name>` | Rename the current session (the name it loads under) |
+| `/fork [name]` | Branch into a new session, freezing the original |
 | `/help` | List the commands |
 | `/quit` | Exit |
 
@@ -87,14 +114,28 @@ escapes are covered too.
 | | Policy |
 | --- | --- |
 | Writes | Confined to the working-directory subtree |
-| Reads | Open, minus `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, Keychains, `.env` |
+| Shell reads | Open, minus `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, Keychains, `.env` |
+| `<ai-harness-read>` | Working-directory subtree only, minus the same denylist |
 | Network | Allowed — the approval prompt is the control point |
 | Timeout | 30s by default, killing the whole process group |
-| Output | Capped at 32 KB per stream |
+| Output | Capped at 32 KB per stream; a read at 64 KB |
 
-Every command is shown in an approval modal before it runs. `←`/`→` move between
-Allow and Deny, `Enter` confirms, `y`/`n` are shortcuts, and the buttons are
-clickable. Denial is reported to the model so it can propose something else.
+The read element is deliberately stricter than the shell. It resolves the path
+in process and refuses anything that lands outside the root — including a
+symlink inside the root pointing out of it, because the check runs on the
+*resolved* path, the same rule the kernel applies. Being auto-approved, it must
+not be able to reach files you never agreed to send to OpenRouter; the denylist
+is shared with the Seatbelt profile so the two cannot drift apart.
+
+File writes go through the same Seatbelt confinement: the harness runs `tee` under
+the sandbox with the path passed as an argv element (never shell text, so it
+cannot inject) and the contents piped on stdin. A write outside the root is denied
+by the kernel and reported as an error, never an escape.
+
+Every command and every write is shown in an approval modal before it runs (a
+write shows its path and a bounded preview, not the whole file). `←`/`→` move
+between Allow and Deny, `Enter` confirms, `y`/`n` are shortcuts, and the buttons
+are clickable. Denial is reported to the model so it can propose something else.
 
 The agentic loop is bounded by `--max-iterations` (default 10) so a model that
 keeps proposing commands cannot spin forever.
@@ -143,7 +184,8 @@ cargo run -- --system "Prefer ripgrep over grep."
 
 Other flags: `--workdir` sets the sandbox root (default: cwd),
 `--command-timeout` the per-command limit in seconds, `--max-iterations` the
-agentic loop bound.
+agentic loop bound, `--confirm-reads` puts file reads behind the approval modal
+along with everything else.
 
 ## Keys
 
@@ -151,6 +193,8 @@ agentic loop bound.
 | --- | --- |
 | `Enter` | Send the prompt |
 | `Alt+Enter` | Insert a newline (also `Shift+Enter` on terminals supporting the kitty keyboard protocol) |
+| `Esc` | Interrupt the in-flight reply or running command (while busy) |
+| `↑` / `↓` | Recall previous / next prompt (on an empty prompt) |
 | `Ctrl+C` | Quit |
 | `Ctrl+D` | Quit when the prompt is empty |
 | `Ctrl+L` | Clear the conversation (keeps the system prompt) |
@@ -165,6 +209,11 @@ agentic loop bound.
 
 Mouse wheel scrolls the transcript. Scrolling up detaches the view; it re-attaches
 to the bottom once you scroll back down (or press `End`).
+
+On an empty prompt, `↑` recalls your previous prompts (most recent first) and `↓`
+walks back toward the newest, then to an empty line. Editing a recalled prompt
+ends the walk; clear the line and press `↑` to browse again. This history is your
+session's typed prompts and survives `/clear`.
 
 ## Layout
 
@@ -191,6 +240,8 @@ The prompt box grows downward from a fixed bottom edge as you add lines, up to
 | `src/command.rs` | Slash-command parsing, the command table, and completion |
 | `src/sandbox.rs` | Seatbelt profile generation and the sandboxed command |
 | `src/exec.rs` | Running commands: timeout, process-group kill, output caps |
+| `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
+| `src/session.rs` | Saving and loading sessions to disk (`/save`, `/load`) |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
 | `src/ui.rs` | Rendering and layout |
 | `src/app.rs` | Application state: transcript, history, request status |
@@ -226,6 +277,48 @@ is display-only — the approval modal and command execution still fire only onc
 the full reply has arrived and parsed. A brief `⠋ thinking…` spinner covers the
 gap before the first token.
 
-The streaming request lives in one `tokio` task (`spawn_request` in
-`src/main.rs`); an `Esc`-to-cancel feature would abort exactly that task, which
-is why streaming was built before cancellation.
+## Cancelling
+
+`Esc` interrupts an in-flight turn — a streaming reply or a running command —
+and returns to `Idle` without quitting. A cancelled command has its whole process
+group killed, reusing the same clean teardown as the timeout, so nothing is left
+running. The partial streamed text is discarded (it was display-only) and the
+transcript shows a `Cancelled.` notice.
+
+Inside the approval modal, `Esc` still means **Deny** — refuse this command and
+let the model try another. To abandon a turn entirely, deny, then `Esc` the reply
+that follows.
+
+Cancellation is cooperative: each in-flight `tokio` task carries a cancel signal
+it selects on, and every task is tagged with a generation so that updates already
+queued by a cancelled task are recognised as stale and dropped rather than
+corrupting the next turn.
+
+## Saving and loading sessions
+
+The session **auto-saves after every turn** to `<sessions-dir>/<name>.json`
+(default `sessions/`, set with `--sessions-dir`, gitignored). Until you name it,
+each run writes to a per-launch `session-<timestamp>.json`, so runs never
+overwrite each other.
+
+- `/rename <name>` — rename the current session's file (the name it loads under).
+- `/fork [name]` — branch: freeze the current file where it is and keep talking
+  under a new name. Both files start identical and diverge from the fork point;
+  the original is preserved to `/load` back.
+- `/save [name]` — save now and, with a name, adopt it going forward.
+- `/load <name>` — restore a session. `/load` with no name opens a picker: choose
+  with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to cancel.
+- `/clear` — wipe the conversation, **including its saved file** (it is
+  overwritten to the cleared state). Use `/fork` first if you want to keep it.
+
+All of these work only when idle.
+
+A session file is pretty-printed JSON holding the model conversation (`history`,
+so you can keep talking) and the rendered transcript (so the screen comes back
+exactly — labelled actions, command results, token counts). A `version` field
+guards the format. `/clear` never touches saved files, so `/save`, `/clear`,
+`/load` round-trips.
+
+The model is recorded but not switched on load — it is fixed at startup, so
+loading a session saved under a different model keeps the running one for new
+turns and notes the difference.

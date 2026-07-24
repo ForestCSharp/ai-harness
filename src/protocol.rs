@@ -29,31 +29,58 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::exec::CommandOutput;
 
 pub const QUERY_TAG: &str = "ai-harness-query";
 pub const SHELL_TAG: &str = "ai-harness-shell";
 pub const RESPONSE_TAG: &str = "ai-harness-response";
+/// A file read. Non-mutating, so it runs without the approval modal.
+pub const READ_TAG: &str = "ai-harness-read";
+/// A file write. Unlike the others, its opening tag carries a `file=` attribute.
+pub const WRITE_TAG: &str = "ai-harness-write";
 /// Harness → model only. Carries the outcome of a shell action; never parsed.
 pub const RESULT_TAG: &str = "ai-harness-shell-result";
+/// Harness → model only. Carries the outcome of a file write; never parsed.
+pub const WRITE_RESULT_TAG: &str = "ai-harness-write-result";
+/// Harness → model only. Carries the contents of a file read; never parsed.
+pub const READ_RESULT_TAG: &str = "ai-harness-read-result";
 
 /// Tags the model is allowed to reply with.
-const REPLY_TAGS: [&str; 2] = [SHELL_TAG, RESPONSE_TAG];
+const REPLY_TAGS: [&str; 4] = [SHELL_TAG, READ_TAG, RESPONSE_TAG, WRITE_TAG];
 
 /// A validated model reply.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     /// A shell command the model wants run. Not executed yet.
     Shell(String),
+    /// A file the model wants to see. Runs without approval; see [`crate::files`].
+    Read { path: String },
+    /// A file the model wants written. Not written yet.
+    Write { path: String, contents: String },
     /// A terminating answer for the user.
     Response(String),
 }
 
 impl Action {
+    /// The primary text of the action (the command, the answer, the path, or —
+    /// for a write — the file contents).
     pub fn body(&self) -> &str {
         match self {
             Self::Shell(s) | Self::Response(s) => s,
+            Self::Read { path } => path,
+            Self::Write { contents, .. } => contents,
         }
+    }
+}
+
+/// The reply tags, phrased for an error message: `<a>, <b>, or <c>`.
+fn expected_tags() -> String {
+    let names: Vec<String> = REPLY_TAGS.iter().map(|tag| format!("<{tag}>")).collect();
+    match names.split_last() {
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        None => String::new(),
     }
 }
 
@@ -87,6 +114,13 @@ pub enum ProtocolError {
     EmptyBody {
         tag: String,
     },
+    /// A `<ai-harness-write>` without a usable `file=` attribute.
+    MissingFileAttribute,
+    /// A shell/response tag carried an attribute it should not have.
+    UnexpectedAttribute {
+        tag: String,
+        attr: String,
+    },
 }
 
 impl fmt::Display for ProtocolError {
@@ -101,14 +135,13 @@ impl fmt::Display for ProtocolError {
             Self::UnterminatedOpenTag => {
                 write!(f, "the opening tag was never closed with '>'")
             }
-            Self::UnknownTag { tag } => write!(
-                f,
-                "unknown tag <{tag}>; expected <{SHELL_TAG}> or <{RESPONSE_TAG}>"
-            ),
+            Self::UnknownTag { tag } => {
+                write!(f, "unknown tag <{tag}>; expected {}", expected_tags())
+            }
             Self::QueryTagFromModel => write!(
                 f,
-                "<{QUERY_TAG}> is sent by the harness, not the model; \
-                 expected <{SHELL_TAG}> or <{RESPONSE_TAG}>"
+                "<{QUERY_TAG}> is sent by the harness, not the model; expected {}",
+                expected_tags()
             ),
             Self::MissingClosingTag { tag } => {
                 write!(f, "missing closing </{tag}>")
@@ -119,6 +152,15 @@ impl fmt::Display for ProtocolError {
                 snippet(trailing)
             ),
             Self::EmptyBody { tag } => write!(f, "<{tag}> was empty"),
+            Self::MissingFileAttribute => write!(
+                f,
+                "<{WRITE_TAG}> needs a file path, e.g. <{WRITE_TAG} file=path/to/file>…</{WRITE_TAG}>"
+            ),
+            Self::UnexpectedAttribute { tag, attr } => write!(
+                f,
+                "<{tag}> does not take attributes, but had: {}",
+                snippet(attr)
+            ),
         }
     }
 }
@@ -152,6 +194,48 @@ pub fn encode_shell_result(output: &CommandOutput) -> String {
     format!("<{RESULT_TAG}>\n{body}</{RESULT_TAG}>")
 }
 
+/// Report a completed (or failed) file write back to the model.
+pub fn encode_write_result(path: &str, outcome: Result<usize, &str>) -> String {
+    let body = match outcome {
+        Ok(bytes) => format!("status: wrote {bytes} bytes to {path}\n"),
+        Err(message) => format!("status: write to {path} failed: {message}\n"),
+    };
+    format!("<{WRITE_RESULT_TAG}>\n{body}</{WRITE_RESULT_TAG}>")
+}
+
+/// Hand the contents of a file back to the model.
+///
+/// The contents are sent with no line-number prefixes. That is deliberate:
+/// numbering invites the model to copy the prefix back into a later quotation
+/// of the text, and the line count in the header covers what numbering was for.
+pub fn encode_read_result(outcome: &crate::files::ReadOutcome) -> String {
+    let body = match &outcome.error {
+        Some(message) => format!("status: read of {} failed: {message}\n", outcome.path),
+        None => {
+            let mut body = format!(
+                "path: {}\nlines: {}, bytes: {}\n",
+                outcome.path,
+                outcome.lines,
+                outcome.contents.len()
+            );
+            if outcome.truncated {
+                body.push_str(
+                    "note: the file is longer than the read limit; only the start is shown\n",
+                );
+            }
+            body.push_str("contents:\n");
+            body.push_str(&outcome.contents);
+            // Keep the closing tag on its own line even for a file that does
+            // not end in a newline.
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body
+        }
+    };
+    format!("<{READ_RESULT_TAG}>\n{body}</{READ_RESULT_TAG}>")
+}
+
 /// Tell the model exactly how its last reply broke the contract, so it can try
 /// again. Quotes the specific failure rather than restating the rules in full —
 /// the system prompt already carries those, and a targeted correction is more
@@ -161,7 +245,9 @@ pub fn encode_correction(error: &ProtocolError) -> String {
         "Your last reply was rejected by the parser: {error}\n\n\
          Reply again with exactly one element and nothing else — no prose, no \
          markdown fences. The first character must be '<' and the last must be \
-         '>'. Use <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, or \
+         '>'. Use <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, \
+         <{READ_TAG}>path</{READ_TAG}> to read a file, \
+         <{WRITE_TAG} file=path>…</{WRITE_TAG}> to write a file, or \
          <{RESPONSE_TAG}>…</{RESPONSE_TAG}> to answer."
     )
 }
@@ -196,10 +282,16 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         });
     }
 
+    // The opening tag runs to the first '>'. Its head is the tag name plus, for
+    // a write, a `file=…` attribute; split on the first whitespace.
     let close_bracket = trimmed
         .find('>')
         .ok_or(ProtocolError::UnterminatedOpenTag)?;
-    let tag = &trimmed[1..close_bracket];
+    let head = &trimmed[1..close_bracket];
+    let (tag, attrs) = match head.find(char::is_whitespace) {
+        Some(i) => (&head[..i], head[i..].trim()),
+        None => (head, ""),
+    };
 
     if tag == QUERY_TAG {
         return Err(ProtocolError::QueryTagFromModel);
@@ -210,6 +302,17 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         });
     }
 
+    // Only the write tag takes an attribute.
+    if tag != WRITE_TAG && !attrs.is_empty() {
+        return Err(ProtocolError::UnexpectedAttribute {
+            tag: tag.to_string(),
+            attr: attrs.to_string(),
+        });
+    }
+
+    // The body is everything up to the first matching closing tag. A file that
+    // literally contains the closing tag would truncate here; that is rare and
+    // matches the shell tag's behaviour.
     let closing = format!("</{tag}>");
     let after_open = &trimmed[close_bracket + 1..];
     let closing_at = after_open
@@ -227,6 +330,22 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         });
     }
 
+    if tag == WRITE_TAG {
+        let path = parse_file_attribute(attrs).ok_or(ProtocolError::MissingFileAttribute)?;
+        // File bytes are significant: preserve the body exactly, stripping only
+        // the single formatting newline models put right after '>'.
+        let contents = body.strip_prefix('\n').unwrap_or(body);
+        if contents.is_empty() {
+            return Err(ProtocolError::EmptyBody {
+                tag: tag.to_string(),
+            });
+        }
+        return Ok(Action::Write {
+            path,
+            contents: contents.to_string(),
+        });
+    }
+
     let body = body.trim();
     if body.is_empty() {
         return Err(ProtocolError::EmptyBody {
@@ -236,8 +355,25 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
 
     Ok(match tag {
         SHELL_TAG => Action::Shell(body.to_string()),
+        READ_TAG => Action::Read {
+            path: body.to_string(),
+        },
         _ => Action::Response(body.to_string()),
     })
+}
+
+/// Extract the `file=` value from a write tag's attributes. The value may be
+/// quoted (`file="a b.txt"`) or run bare to the end of the attributes.
+fn parse_file_attribute(attrs: &str) -> Option<String> {
+    let rest = attrs.strip_prefix("file=")?;
+    let value = if let Some(inner) = rest.strip_prefix('"') {
+        inner.split_once('"').map(|(v, _)| v)?
+    } else {
+        // Bare value: up to whitespace, or the whole remainder.
+        rest.split_whitespace().next()?
+    };
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// The protocol contract sent as the system prompt. `extra` appends any
@@ -252,13 +388,32 @@ Every user message arrives wrapped in a single element:
 
 You MUST reply with exactly one of the following elements, and nothing else.
 
-1. Run a shell command. Use this to gather information or take action:
+1. Read a file. Prefer this over 'cat' whenever you just want to see a file:
+
+<{READ_TAG}>path/to/file</{READ_TAG}>
+
+2. Run a shell command. Use this to gather information or take action:
 
 <{SHELL_TAG}>the command to run</{SHELL_TAG}>
 
-2. Give the user a final answer. This ends the current task:
+3. Write a file. The whole file is replaced with the contents you give:
+
+<{WRITE_TAG} file=path/to/file>
+the exact file contents
+</{WRITE_TAG}>
+
+4. Give the user a final answer. This ends the current task:
 
 <{RESPONSE_TAG}>your answer to the user</{RESPONSE_TAG}>
+
+After a file read, the harness sends you:
+
+<{READ_RESULT_TAG}>
+path: path/to/file
+lines: 12, bytes: 340
+contents:
+...
+</{READ_RESULT_TAG}>
 
 After a shell command, the harness sends you the outcome as:
 
@@ -270,16 +425,29 @@ stderr:
 ...
 </{RESULT_TAG}>
 
-Reply to that with another <{SHELL_TAG}> to keep going, or <{RESPONSE_TAG}> when \
-you have what you need. Never emit <{RESULT_TAG}> yourself.
+After a file write, it sends:
 
-The user approves every command before it runs. If a result says the command was \
-denied, it did NOT run: propose a different approach or explain the problem with \
-<{RESPONSE_TAG}>. Do not simply repeat the same command.
+<{WRITE_RESULT_TAG}>
+status: wrote 128 bytes to path/to/file
+</{WRITE_RESULT_TAG}>
 
-Commands run in a sandbox rooted at the working directory. Writes outside that \
-directory fail, and credential files such as .env and ~/.ssh are unreadable. \
-Treat those failures as expected, not as something to work around.
+Reply to a result with another action to keep going, or <{RESPONSE_TAG}> when you \
+have what you need. Never emit a result element yourself.
+
+The user approves every command and every write before it happens. If a result \
+says it was denied, it did NOT run: propose a different approach or explain the \
+problem with <{RESPONSE_TAG}>. Do not simply repeat the same action.
+
+<{READ_TAG}> is the exception: it needs no approval and runs immediately, so \
+reading files costs the user nothing. Use it freely to gather context, and read \
+a file before changing it rather than guessing at its contents.
+
+Commands and writes run in a sandbox rooted at the working directory. Writing \
+outside that directory fails, and credential files such as .env and ~/.ssh are \
+unreadable. <{READ_TAG}> is confined more tightly still: it reads only files \
+inside the working directory. To read something outside it, use <{SHELL_TAG}>, \
+which the user will be asked to approve. Treat those failures as expected, not \
+as something to work around.
 
 Rules, all strictly enforced by a parser:
 
@@ -287,11 +455,14 @@ Rules, all strictly enforced by a parser:
 - Emit nothing outside the element: no prose, no explanation, no markdown code \
 fences, no leading or trailing text. The very first character of your reply must \
 be '<' and the very last must be '>'.
-- Use only the two tags listed above. Never emit <{QUERY_TAG}>; that tag belongs \
+- Use only the tags listed above. Never emit <{QUERY_TAG}>; that tag belongs \
 to the harness.
 - The element must be non-empty.
 - Put exactly one shell command in <{SHELL_TAG}>. Chain steps with '&&' or ';' if \
 you need several. Prefer non-interactive commands that terminate on their own.
+- A <{READ_TAG}> contains one file path and nothing else. One file per element.
+- A <{WRITE_TAG}> must have a file=… path and contains the complete new file \
+contents (not a diff). Only <{WRITE_TAG}> takes an attribute; the others do not.
 - If you can answer without running anything, reply with <{RESPONSE_TAG}> directly.
 
 A reply that breaks any of these rules is discarded and shown to the user as an \
@@ -353,6 +524,161 @@ mod tests {
             parse_reply("<ai-harness-shell>ls -la</ai-harness-shell>").unwrap(),
             Action::Shell("ls -la".into())
         );
+    }
+
+    #[test]
+    fn parses_a_read_action() {
+        assert_eq!(
+            parse_reply("<ai-harness-read>src/app.rs</ai-harness-read>").unwrap(),
+            Action::Read {
+                path: "src/app.rs".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_read_path_is_trimmed_of_formatting_whitespace() {
+        // Models like to put the body on its own line.
+        assert_eq!(
+            parse_reply("<ai-harness-read>\n  README.md\n</ai-harness-read>").unwrap(),
+            Action::Read {
+                path: "README.md".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_read_takes_no_attribute() {
+        assert!(matches!(
+            parse_reply("<ai-harness-read file=x>y</ai-harness-read>").unwrap_err(),
+            ProtocolError::UnexpectedAttribute { .. }
+        ));
+    }
+
+    #[test]
+    fn an_empty_read_body_is_rejected() {
+        assert!(matches!(
+            parse_reply("<ai-harness-read>  </ai-harness-read>").unwrap_err(),
+            ProtocolError::EmptyBody { .. }
+        ));
+    }
+
+    #[test]
+    fn a_read_result_carries_the_contents_and_the_counts() {
+        let outcome = crate::files::ReadOutcome {
+            path: "a.txt".into(),
+            contents: "one\ntwo\n".into(),
+            lines: 2,
+            truncated: false,
+            error: None,
+        };
+        let encoded = encode_read_result(&outcome);
+        assert!(encoded.starts_with("<ai-harness-read-result>"));
+        assert!(encoded.ends_with("</ai-harness-read-result>"));
+        assert!(encoded.contains("path: a.txt"));
+        assert!(encoded.contains("lines: 2, bytes: 8"));
+        assert!(encoded.contains("one\ntwo\n"));
+        // No line-number prefixes: they would contaminate any later quotation
+        // of the text back to us.
+        assert!(!encoded.contains("1\tone"));
+    }
+
+    #[test]
+    fn a_failed_read_result_says_why_and_carries_no_contents() {
+        let outcome = crate::files::ReadOutcome::failed("secret.txt", "no such file");
+        let encoded = encode_read_result(&outcome);
+        assert!(encoded.contains("status: read of secret.txt failed: no such file"));
+    }
+
+    #[test]
+    fn a_truncated_read_result_says_so() {
+        let outcome = crate::files::ReadOutcome {
+            path: "big.txt".into(),
+            contents: "x".repeat(10),
+            lines: 1,
+            truncated: true,
+            error: None,
+        };
+        assert!(encode_read_result(&outcome).contains("longer than the read limit"));
+    }
+
+    /// A file with no trailing newline must not leave the closing tag dangling
+    /// on the contents' last line.
+    #[test]
+    fn a_read_result_always_closes_on_its_own_line() {
+        let outcome = crate::files::ReadOutcome {
+            path: "a.txt".into(),
+            contents: "no trailing newline".into(),
+            lines: 1,
+            truncated: false,
+            error: None,
+        };
+        assert!(encode_read_result(&outcome).ends_with("\n</ai-harness-read-result>"));
+    }
+
+    #[test]
+    fn parses_a_write_with_a_bare_path() {
+        let raw = "<ai-harness-write file=src/foo.rs>fn main() {}\n</ai-harness-write>";
+        assert_eq!(
+            parse_reply(raw).unwrap(),
+            Action::Write {
+                path: "src/foo.rs".into(),
+                contents: "fn main() {}\n".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_write_with_a_quoted_path() {
+        let raw = "<ai-harness-write file=\"my dir/a b.txt\">hello</ai-harness-write>";
+        assert_eq!(
+            parse_reply(raw).unwrap(),
+            Action::Write {
+                path: "my dir/a b.txt".into(),
+                contents: "hello".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn write_body_is_preserved_byte_for_byte() {
+        // Only the single leading formatting newline is stripped; the trailing
+        // newline and interior angle brackets survive.
+        let raw = "<ai-harness-write file=x.html>\n<div>\n  <p>hi</p>\n</div>\n</ai-harness-write>";
+        match parse_reply(raw).unwrap() {
+            Action::Write { contents, .. } => {
+                assert_eq!(contents, "<div>\n  <p>hi</p>\n</div>\n");
+            }
+            other => panic!("expected a write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_write_without_a_file_attribute_is_rejected() {
+        assert_eq!(
+            parse_reply("<ai-harness-write>x</ai-harness-write>").unwrap_err(),
+            ProtocolError::MissingFileAttribute
+        );
+        assert_eq!(
+            parse_reply("<ai-harness-write file=>x</ai-harness-write>").unwrap_err(),
+            ProtocolError::MissingFileAttribute
+        );
+    }
+
+    #[test]
+    fn an_empty_write_body_is_rejected() {
+        assert!(matches!(
+            parse_reply("<ai-harness-write file=x>\n</ai-harness-write>").unwrap_err(),
+            ProtocolError::EmptyBody { .. }
+        ));
+    }
+
+    #[test]
+    fn an_attribute_on_shell_or_response_is_rejected() {
+        assert!(matches!(
+            parse_reply("<ai-harness-shell file=x>ls</ai-harness-shell>").unwrap_err(),
+            ProtocolError::UnexpectedAttribute { .. }
+        ));
     }
 
     #[test]
@@ -501,8 +827,19 @@ mod tests {
     #[test]
     fn error_messages_name_the_expected_tags() {
         let text = ProtocolError::UnknownTag { tag: "foo".into() }.to_string();
-        assert!(text.contains(SHELL_TAG), "got {text}");
-        assert!(text.contains(RESPONSE_TAG), "got {text}");
+        // Derived from REPLY_TAGS, so a new action cannot be added without the
+        // correction message learning about it.
+        for tag in REPLY_TAGS {
+            assert!(text.contains(tag), "{tag} missing from: {text}");
+        }
+    }
+
+    #[test]
+    fn the_correction_names_every_action() {
+        let text = encode_correction(&ProtocolError::Empty);
+        for tag in REPLY_TAGS {
+            assert!(text.contains(tag), "{tag} missing from: {text}");
+        }
     }
 
     #[test]
@@ -516,8 +853,20 @@ mod tests {
     fn system_prompt_documents_every_tag() {
         let prompt = system_prompt(None);
         assert!(prompt.contains(QUERY_TAG));
-        assert!(prompt.contains(SHELL_TAG));
-        assert!(prompt.contains(RESPONSE_TAG));
+        for tag in REPLY_TAGS {
+            assert!(prompt.contains(tag), "{tag} is not documented to the model");
+        }
+        for tag in [RESULT_TAG, WRITE_RESULT_TAG, READ_RESULT_TAG] {
+            assert!(prompt.contains(tag), "{tag} is not documented to the model");
+        }
+    }
+
+    #[test]
+    fn system_prompt_says_reads_need_no_approval() {
+        // The model has to know reads are free, or it will keep reaching for
+        // `cat` and making the user click Allow.
+        let prompt = system_prompt(None);
+        assert!(prompt.contains("needs no approval"), "{prompt}");
     }
 
     #[test]
@@ -548,10 +897,15 @@ mod tests {
             .unwrap_or_else(|_| crate::config::DEFAULT_MODEL.to_string());
         let client = Client::new(key, model).unwrap();
 
-        // A task needing the shell, and one answerable outright.
+        // One case per branch of the contract.
         let cases = [
             ("List the files in the current directory.", "shell-ish"),
             ("What is 2 + 2? Just answer.", "response-ish"),
+            (
+                "Create a file called hello.txt containing the text: Hello, world!",
+                "write-ish",
+            ),
+            ("Show me what is in README.md.", "read-ish"),
         ];
 
         for (query, kind) in cases {
@@ -625,6 +979,12 @@ mod tests {
             (
                 format!("<{RESPONSE_TAG}>All done.</{RESPONSE_TAG}>"),
                 Action::Response("All done.".into()),
+            ),
+            (
+                format!("<{READ_TAG}>path/to/file</{READ_TAG}>"),
+                Action::Read {
+                    path: "path/to/file".into(),
+                },
             ),
         ] {
             assert_eq!(parse_reply(&raw).unwrap(), expected);

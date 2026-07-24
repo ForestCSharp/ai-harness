@@ -78,7 +78,7 @@ receives.
 
 `push_response` ([src/app.rs:315](../src/app.rs)) is the single choke point. It
 records the `Direction::Received` debug frame, then runs `protocol::parse_reply`
-on the whole reply. Three outcomes:
+on the whole reply. Four outcomes:
 
 **(a) Malformed** — prose, a code fence, two elements, an empty body. It records
 an `Entry::Malformed`, and under the retry cap (default 3) appends a targeted
@@ -91,10 +91,29 @@ agentic `iterations` budget — only valid ones do.
 **(b) `<ai-harness-response>`** — a final answer. Status → `Idle`. **This is where
 the journey ends**: the answer sits in the transcript, the prompt is live again.
 
-**(c) `<ai-harness-shell>`** — the model wants to run a command. Status →
-`AwaitingApproval`, which raises the modal. Nothing runs yet.
+**(c) `<ai-harness-shell>`** or **`<ai-harness-write>`** — the model wants to
+change something. Status → `AwaitingApproval`, which raises the modal. Nothing
+runs yet.
 
-## 4. If it's a command: approval → execution → back to the model
+**(d) `<ai-harness-read>`** — the model wants to see a file. This one never
+reaches the modal. `perform_read` runs `files::read` **synchronously, right
+here**, pushes an `Entry::ReadResult`, appends `<ai-harness-read-result>` to
+history, and returns `Some(messages)` — the same "here are messages, send them
+now" shape `retry_after` uses. So a read is a round-trip with no user in the
+loop and no background task at all.
+
+That shortcut is only safe because a read is confined harder than a shell
+command: `files::resolve` canonicalises the path and refuses anything landing
+outside the working directory, including a symlink inside it that points out.
+A failed read is *not* an error that ends the turn — it comes back as a result
+the model can react to, exactly like a non-zero exit code. Reads still count
+against `iterations`, so "free" does not mean unbounded.
+
+Doing file I/O on the event loop is a deliberate trade: a read is capped at
+64 KB from local disk, which is far cheaper than the task spawning, channel
+plumbing, and generation tagging a background job would need.
+
+## 4. If it's a command or a write: approval → execution → back to the model
 
 With the modal up, the keyboard is rerouted ([src/main.rs:210](../src/main.rs),
 the `app.pending().is_some()` branch) — arrows/Tab move the highlight, Enter/y/n
@@ -115,10 +134,11 @@ model** (step 2 again).
 
 ## The loop closes
 
-A single prompt can bounce through **query → reply → command → result → reply →
-command → …**, each hop a full round-trip, until the model finally emits an
-`<ai-harness-response>` — or the `iterations` cap (default 10) stops it and
-returns control to you.
+A single prompt can bounce through **query → reply → read → result → reply →
+command → result → reply → …**, each hop a full round-trip, until the model
+finally emits an `<ai-harness-response>` — or the `iterations` cap stops it and
+returns control to you. Read hops pass through without pausing for you; command
+and write hops stop at the modal.
 
 The shape worth holding onto: **`push_response` is the hub.** Streaming, retries,
 the approval modal, and command results are all just different edges feeding back
@@ -137,6 +157,24 @@ into it, and it has exactly one terminal exit — `<ai-harness-response>` → `I
                                             └───── deny / command result ┘
 ```
 
+## Cancelling a turn
+
+`Esc` while busy (and not in the modal) interrupts the in-flight work. Two things
+happen: the event loop signals the current task's cancel channel — a streaming
+task breaks its `select!` loop and drops the connection; a command task kills its
+process group via the same `kill_group` the timeout uses — and `App::cancel`
+([src/app.rs](../src/app.rs)) bumps the **generation counter**, drops the live
+stream view, returns to `Idle`, and posts a `Cancelled.` notice.
+
+The generation counter is what makes this safe. A task may have already queued an
+`Update` on the channel at the instant of cancel; bumping the generation makes
+every such update stale, and `handle_update` drops anything whose tag no longer
+matches ([src/main.rs](../src/main.rs)). Without it, a late token would drag the
+UI back into `Streaming`, or a late reply would commit to an abandoned turn.
+
+Inside the approval modal, `Esc` keeps its existing meaning — **Deny** — which
+refuses the command and continues the loop rather than abandoning the turn.
+
 ## The one caveat that shapes everything
 
 Because `parse_reply` is strict and whole-reply, **streaming is display-only**.
@@ -153,4 +191,6 @@ cannot be run.
 | `src/protocol.rs` | `encode_query`, `parse_reply`, the correction and result payloads |
 | `src/openrouter.rs` | `open_stream` and SSE framing |
 | `src/exec.rs` / `src/sandbox.rs` | Sandboxed command execution |
+| `src/files.rs` | Path resolution and bounded reads for `<ai-harness-read>` |
+| `src/session.rs` | Saving and loading sessions (`/save`, `/load`) |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

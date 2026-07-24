@@ -9,5 +9,8 @@ secrets/
 
 tmp/
 
+# Saved sessions (default --sessions-dir).
+sessions/
+
 # macOS
 .DS_Store

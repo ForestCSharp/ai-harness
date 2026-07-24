@@ -19,7 +19,7 @@ use crate::sandbox::Sandbox;
 /// Cap on captured output per stream. Anything past this is dropped with a marker.
 pub const MAX_STREAM_BYTES: usize = 32 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandOutput {
     pub command: String,
     /// `None` when the process was killed by a signal or timed out.
@@ -28,6 +28,8 @@ pub struct CommandOutput {
     pub stderr: String,
     pub truncated: bool,
     pub timed_out: bool,
+    /// The user interrupted the command before it finished.
+    pub cancelled: bool,
 }
 
 impl CommandOutput {
@@ -37,6 +39,9 @@ impl CommandOutput {
 
     /// A short status line for the transcript header.
     pub fn summary(&self) -> String {
+        if self.cancelled {
+            return "cancelled".to_string();
+        }
         if self.timed_out {
             return "timed out".to_string();
         }
@@ -48,8 +53,68 @@ impl CommandOutput {
     }
 }
 
-/// Run `script` inside `sandbox`, giving up after `timeout`.
+/// The outcome of a sandboxed file write.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WriteOutcome {
+    pub path: String,
+    /// Bytes written on success.
+    pub bytes: usize,
+    /// Error message when the write failed (e.g. denied by the sandbox).
+    pub error: Option<String>,
+    pub timed_out: bool,
+    pub cancelled: bool,
+}
+
+impl WriteOutcome {
+    pub fn succeeded(&self) -> bool {
+        self.error.is_none() && !self.timed_out && !self.cancelled
+    }
+
+    /// Success/failure for the model-facing result.
+    pub fn as_result(&self) -> Result<usize, &str> {
+        if self.cancelled {
+            Err("cancelled")
+        } else if self.timed_out {
+            Err("timed out")
+        } else if let Some(error) = &self.error {
+            Err(error.as_str())
+        } else {
+            Ok(self.bytes)
+        }
+    }
+
+    /// A short status line for the transcript header.
+    pub fn summary(&self) -> String {
+        if self.cancelled {
+            "cancelled".to_string()
+        } else if self.timed_out {
+            "timed out".to_string()
+        } else if self.error.is_some() {
+            "failed".to_string()
+        } else {
+            format!("wrote {} bytes", self.bytes)
+        }
+    }
+}
+
+/// Run `script` inside `sandbox`, giving up after `timeout`, with no
+/// cancellation. The app uses [`run_cancellable`]; this convenience wrapper is
+/// exercised by the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn run(sandbox: &Sandbox, script: &str, timeout: Duration) -> Result<CommandOutput> {
+    // No cancellation: a future that never resolves.
+    run_cancellable(sandbox, script, timeout, std::future::pending()).await
+}
+
+/// Like [`run`], but `cancel` resolving interrupts the command. On cancel the
+/// process group is killed — reusing the same clean teardown as the timeout, so
+/// grandchildren are reaped rather than orphaned.
+pub async fn run_cancellable(
+    sandbox: &Sandbox,
+    script: &str,
+    timeout: Duration,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<CommandOutput> {
     let mut command = sandbox.command(script);
     command
         .stdin(Stdio::null())
@@ -57,8 +122,8 @@ pub async fn run(sandbox: &Sandbox, script: &str, timeout: Duration) -> Result<C
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    // Its own process group, so a timeout can take down grandchildren too.
-    // `Child::kill` would only reap the `sh` we spawned directly.
+    // Its own process group, so a timeout or cancel can take down grandchildren
+    // too. `Child::kill` would only reap the `sh` we spawned directly.
     #[cfg(unix)]
     command.process_group(0);
 
@@ -83,30 +148,149 @@ pub async fn run(sandbox: &Sandbox, script: &str, timeout: Duration) -> Result<C
         (out, err, a, b, status)
     };
 
-    match tokio::time::timeout(timeout, collect).await {
-        Ok((out, err, a, b, status)) => {
-            let truncated = a.context("reading stdout")? || b.context("reading stderr")?;
-            let status = status.context("waiting for sandboxed command")?;
-            Ok(CommandOutput {
-                command: script.to_string(),
-                exit_code: status.code(),
-                stdout: String::from_utf8_lossy(&out).into_owned(),
-                stderr: String::from_utf8_lossy(&err).into_owned(),
-                truncated,
-                timed_out: false,
-            })
-        }
-        Err(_) => {
+    tokio::pin!(cancel);
+    tokio::select! {
+        // The user interrupted before the command finished.
+        _ = &mut cancel => {
             kill_group(pid);
             Ok(CommandOutput {
                 command: script.to_string(),
                 exit_code: None,
                 stdout: String::new(),
-                stderr: format!("command exceeded the {}s timeout", timeout.as_secs()),
+                stderr: "command cancelled".to_string(),
                 truncated: false,
-                timed_out: true,
+                timed_out: false,
+                cancelled: true,
             })
         }
+        result = tokio::time::timeout(timeout, collect) => match result {
+            Ok((out, err, a, b, status)) => {
+                let truncated = a.context("reading stdout")? || b.context("reading stderr")?;
+                let status = status.context("waiting for sandboxed command")?;
+                Ok(CommandOutput {
+                    command: script.to_string(),
+                    exit_code: status.code(),
+                    stdout: String::from_utf8_lossy(&out).into_owned(),
+                    stderr: String::from_utf8_lossy(&err).into_owned(),
+                    truncated,
+                    timed_out: false,
+                    cancelled: false,
+                })
+            }
+            Err(_) => {
+                kill_group(pid);
+                Ok(CommandOutput {
+                    command: script.to_string(),
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: format!("command exceeded the {}s timeout", timeout.as_secs()),
+                    truncated: false,
+                    timed_out: true,
+                    cancelled: false,
+                })
+            }
+        }
+    }
+}
+
+/// Write `contents` to `path` under the sandbox.
+///
+/// The write is driven with `tee` via argv (no shell), so the path cannot inject,
+/// and Seatbelt confines it to the working directory regardless of the path — a
+/// write outside the root comes back as an error, never an escape. The parent
+/// directory is created first (also sandboxed).
+pub async fn write_file(
+    sandbox: &Sandbox,
+    path: &str,
+    contents: &str,
+    timeout: Duration,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<WriteOutcome> {
+    let outcome = |error: Option<String>| WriteOutcome {
+        path: path.to_string(),
+        bytes: if error.is_none() { contents.len() } else { 0 },
+        error,
+        timed_out: false,
+        cancelled: false,
+    };
+
+    // Create the parent directory if the path has one. `mkdir -p` is idempotent
+    // and, being sandboxed, cannot create anything outside the root.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let parent = parent.to_string_lossy();
+        if !parent.is_empty() && parent != "." {
+            let mkdir = sandbox.program("/bin/mkdir", &["-p", "--", &parent]);
+            if let Err(e) = run_program(mkdir, None).await? {
+                return Ok(outcome(Some(format!("could not create {parent}: {e}"))));
+            }
+        }
+    }
+
+    // `tee` writes stdin to the file; its stdout echo is discarded.
+    let tee = sandbox.program("/usr/bin/tee", &["--", path]);
+    tokio::pin!(cancel);
+    tokio::select! {
+        _ = &mut cancel => Ok(WriteOutcome { cancelled: true, ..outcome(None) }),
+        result = tokio::time::timeout(timeout, run_program(tee, Some(contents))) => match result {
+            Ok(run) => match run? {
+                Ok(()) => Ok(outcome(None)),
+                Err(stderr) => Ok(outcome(Some(stderr))),
+            },
+            Err(_) => Ok(WriteOutcome { timed_out: true, ..outcome(None) }),
+        },
+    }
+}
+
+/// Spawn a sandboxed program, optionally feeding `stdin`, and wait for it.
+/// Returns `Ok(())` on a clean exit, or `Err(stderr-or-status)` otherwise.
+async fn run_program(
+    mut command: tokio::process::Command,
+    stdin: Option<&str>,
+) -> Result<std::result::Result<(), String>> {
+    use tokio::io::AsyncWriteExt;
+
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn().context("spawning sandboxed program")?;
+
+    if let Some(bytes) = stdin {
+        // Write and close stdin so `tee` sees EOF. A dropped pipe (child already
+        // gone) is not fatal — the exit status below is what matters.
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(bytes.as_bytes()).await;
+            let _ = pipe.shutdown().await;
+        }
+    }
+
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr).await;
+    }
+    let status = child
+        .wait()
+        .await
+        .context("waiting for sandboxed program")?;
+
+    if status.success() {
+        Ok(Ok(()))
+    } else {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
+        let message = if message.is_empty() {
+            format!("exited with {status}")
+        } else {
+            message
+        };
+        Ok(Err(message))
     }
 }
 
@@ -185,6 +369,68 @@ mod tests {
         assert_eq!(out.stderr.trim(), "oops");
         assert!(!out.succeeded());
         assert_eq!(out.summary(), "exit 3");
+    }
+
+    async fn write(sandbox: &Sandbox, path: &str, contents: &str) -> WriteOutcome {
+        write_file(sandbox, path, contents, secs(10), std::future::pending())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_a_file_with_exact_contents() {
+        let (sandbox, dir) = sandbox_in("write-file");
+        let body = "line one\nline two\n"; // trailing newline must survive
+        let out = write(&sandbox, "out.txt", body).await;
+        assert!(out.succeeded(), "{out:?}");
+        assert_eq!(out.bytes, body.len());
+        assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), body);
+        let _ = std::fs::remove_file(dir.join("out.txt"));
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_missing_parent_directories() {
+        let (sandbox, dir) = sandbox_in("write-mkdir");
+        let out = write(&sandbox, "a/b/c/deep.txt", "hi").await;
+        assert!(out.succeeded(), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a/b/c/deep.txt")).unwrap(),
+            "hi"
+        );
+        let _ = std::fs::remove_dir_all(dir.join("a"));
+    }
+
+    #[tokio::test]
+    async fn write_file_handles_a_path_with_spaces() {
+        // The path is an argv element, so spaces are literal — no shell parsing.
+        let (sandbox, dir) = sandbox_in("write-spaces");
+        let out = write(&sandbox, "my notes.md", "# hi").await;
+        assert!(out.succeeded(), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("my notes.md")).unwrap(),
+            "# hi"
+        );
+        let _ = std::fs::remove_file(dir.join("my notes.md"));
+    }
+
+    #[tokio::test]
+    async fn write_outside_the_root_is_denied() {
+        let (sandbox, _dir) = sandbox_in("write-escape");
+        let target = std::env::temp_dir().join("ai-harness-WRITE-ESCAPE.txt");
+        let _ = std::fs::remove_file(&target);
+        let out = write(&sandbox, target.to_str().unwrap(), "pwned").await;
+        assert!(!out.succeeded(), "escape must fail: {out:?}");
+        assert!(!target.exists(), "the file escaped the sandbox");
+    }
+
+    #[tokio::test]
+    async fn a_path_that_looks_like_a_flag_is_not_treated_as_one() {
+        // `--` before the path means tee reads "-a" as a filename, not a flag.
+        let (sandbox, dir) = sandbox_in("write-dashflag");
+        let out = write(&sandbox, "-a.txt", "x").await;
+        assert!(out.succeeded(), "{out:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("-a.txt")).unwrap(), "x");
+        let _ = std::fs::remove_file(dir.join("-a.txt"));
     }
 
     #[tokio::test]
@@ -300,6 +546,76 @@ mod tests {
             "grandchild survived the timeout: {}",
             String::from_utf8_lossy(&survivors.stdout)
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_the_command_promptly() {
+        let (sandbox, _dir) = sandbox_in("cancel");
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        // Fire the cancel shortly after the command starts.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = cancel_tx.send(());
+        });
+
+        let started = std::time::Instant::now();
+        let out = run_cancellable(&sandbox, "sleep 60", secs(60), async {
+            let _ = cancel_rx.await;
+        })
+        .await
+        .unwrap();
+
+        assert!(out.cancelled, "{out:?}");
+        assert!(!out.timed_out);
+        assert_eq!(out.summary(), "cancelled");
+        assert!(
+            started.elapsed() < secs(5),
+            "cancel did not fire promptly (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_grandchildren_too() {
+        let (sandbox, _dir) = sandbox_in("cancel-pgroup");
+        let marker = "ai-harness-cancel-marker";
+        let script = format!("sh -c 'sleep 30 # {marker}' & sleep 30");
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = cancel_tx.send(());
+        });
+
+        let out = run_cancellable(&sandbox, &script, secs(60), async {
+            let _ = cancel_rx.await;
+        })
+        .await
+        .unwrap();
+        assert!(out.cancelled);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let survivors = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(marker)
+            .output()
+            .unwrap();
+        assert!(
+            survivors.stdout.is_empty(),
+            "grandchild survived the cancel: {}",
+            String::from_utf8_lossy(&survivors.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_that_finishes_before_cancel_is_not_marked_cancelled() {
+        let (sandbox, _dir) = sandbox_in("cancel-race");
+        // Cancel never fires; the command completes normally.
+        let out = run_cancellable(&sandbox, "echo done", secs(10), std::future::pending())
+            .await
+            .unwrap();
+        assert!(!out.cancelled);
+        assert!(out.succeeded());
+        assert_eq!(out.stdout.trim(), "done");
     }
 
     #[tokio::test]

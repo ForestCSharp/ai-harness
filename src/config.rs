@@ -32,8 +32,16 @@ pub struct Args {
     pub command_timeout: u64,
 
     /// Maximum model round-trips per prompt, bounding the agentic loop.
-    #[arg(long, default_value_t = 10, env = "AI_HARNESS_MAX_ITERATIONS")]
+    ///
+    /// Reads consume a round-trip like any other action, so this has to leave
+    /// room for gathering context as well as doing the work.
+    #[arg(long, default_value_t = 100, env = "AI_HARNESS_MAX_ITERATIONS")]
     pub max_iterations: usize,
+
+    /// Ask before each file read. Off by default: a read mutates nothing and
+    /// cannot leave the working directory, so it runs without interrupting you.
+    #[arg(long, env = "AI_HARNESS_CONFIRM_READS")]
+    pub confirm_reads: bool,
 
     /// Start with debug mode on, showing raw protocol frames. Toggle with /debug.
     ///
@@ -45,6 +53,10 @@ pub struct Args {
     /// Corrective retries allowed when a reply breaks the protocol.
     #[arg(long, default_value_t = crate::app::DEFAULT_MAX_RETRIES, env = "AI_HARNESS_MAX_RETRIES")]
     pub max_retries: usize,
+
+    /// Directory for `/save` and `/load` session files.
+    #[arg(long, default_value = "sessions", env = "AI_HARNESS_SESSIONS_DIR")]
+    pub sessions_dir: PathBuf,
 }
 
 impl Args {

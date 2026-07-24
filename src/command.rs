@@ -12,6 +12,14 @@ pub enum Command {
     Help,
     Clear,
     Quit,
+    /// Save the session; `None` uses a generated name.
+    Save(Option<String>),
+    /// Load a saved session; `None` lists what is available.
+    Load(Option<String>),
+    /// Rename the current session's file; `None` reports usage.
+    Rename(Option<String>),
+    /// Branch the current conversation into a new session; `None` generates a name.
+    Fork(Option<String>),
     /// Something starting with `/` that we do not recognise. Reported to the
     /// user rather than forwarded — silently sending a typo'd command to the
     /// model is the worst available outcome.
@@ -41,14 +49,20 @@ pub fn parse(input: &str) -> Input {
         return Input::Prompt(input.trim_end().to_string());
     };
 
-    // Arguments are captured but unused, so adding a command that takes one
-    // later does not change this signature.
+    // Split the name from its argument (everything after the first whitespace).
     let name = rest.split_whitespace().next().unwrap_or("");
+    let arg = rest[name.len()..].trim();
+    let arg = (!arg.is_empty()).then(|| arg.to_string());
+
     Input::Command(match name.to_ascii_lowercase().as_str() {
         "debug" => Command::Debug,
         "help" | "h" | "?" => Command::Help,
         "clear" | "reset" => Command::Clear,
         "quit" | "exit" | "q" => Command::Quit,
+        "save" => Command::Save(arg),
+        "load" => Command::Load(arg),
+        "rename" => Command::Rename(arg),
+        "fork" => Command::Fork(arg),
         // A bare "/" has no name; report it the same way as any unknown.
         _ => Command::Unknown(name.to_string()),
     })
@@ -73,6 +87,22 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "clear",
         description: "clear the conversation, keeping the system prompt",
+    },
+    Spec {
+        name: "save",
+        description: "save this session to disk (/save [name])",
+    },
+    Spec {
+        name: "load",
+        description: "load a saved session (/load [name], or /load to list)",
+    },
+    Spec {
+        name: "rename",
+        description: "rename the current session (/rename <name>)",
+    },
+    Spec {
+        name: "fork",
+        description: "branch into a new session, keeping the original (/fork [name])",
     },
     Spec {
         name: "help",
@@ -250,10 +280,37 @@ mod tests {
     #[test]
     fn matching_filters_by_prefix() {
         let names: Vec<_> = matching("").iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["debug", "clear", "help", "quit"]);
+        assert_eq!(
+            names,
+            vec![
+                "debug", "clear", "save", "load", "rename", "fork", "help", "quit"
+            ]
+        );
 
         let names: Vec<_> = matching("c").iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["clear"]);
+
+        let names: Vec<_> = matching("f").iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["fork"]);
+    }
+
+    #[test]
+    fn parses_commands_with_an_argument() {
+        assert_eq!(
+            parse("/save foo"),
+            Input::Command(Command::Save(Some("foo".into())))
+        );
+        assert_eq!(parse("/save"), Input::Command(Command::Save(None)));
+        assert_eq!(
+            parse("/load my-session"),
+            Input::Command(Command::Load(Some("my-session".into())))
+        );
+        assert_eq!(parse("/load"), Input::Command(Command::Load(None)));
+        // Surrounding whitespace in the argument is trimmed.
+        assert_eq!(
+            parse("/save   spaced  "),
+            Input::Command(Command::Save(Some("spaced".into())))
+        );
     }
 
     #[test]

@@ -74,7 +74,7 @@ pub struct Completion {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub prompt_tokens: u32,

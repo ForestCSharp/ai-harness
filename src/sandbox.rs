@@ -88,6 +88,27 @@ impl Sandbox {
         &self.root
     }
 
+    /// Whether an already-resolved path falls under the read denylist.
+    ///
+    /// Built from the same constants the SBPL profile is rendered from, so an
+    /// in-process read (see `crate::files`) and a shelled-out one can never
+    /// disagree about what counts as a secret. Expects a canonical path — the
+    /// kernel matches resolved paths, and so must this.
+    pub fn denies_read(&self, path: &Path) -> bool {
+        if let Some(home) = &self.home {
+            // `(subpath …)`: the directory itself and everything beneath it.
+            for entry in SECRET_HOME_SUBPATHS {
+                if path.starts_with(home.join(entry)) {
+                    return true;
+                }
+            }
+        }
+        // `(literal …)`: an exact match only.
+        SECRET_ROOT_FILES
+            .iter()
+            .any(|file| path == self.root.join(file))
+    }
+
     /// Render the Seatbelt (SBPL) profile.
     ///
     /// Deny rules come last so they take precedence over the broad `allow`.
@@ -146,6 +167,16 @@ impl Sandbox {
             .arg("-c")
             .arg(script)
             .current_dir(&self.root);
+        command
+    }
+
+    /// Run a program directly under the sandbox, with no shell in between. Each
+    /// argument is passed literally, so a value like a file path can never be
+    /// reinterpreted as shell syntax.
+    pub fn program(&self, program: &str, args: &[&str]) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+        command.arg("-p").arg(self.profile()).arg(program);
+        command.args(args).current_dir(&self.root);
         command
     }
 }

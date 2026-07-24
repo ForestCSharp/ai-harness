@@ -24,6 +24,10 @@ pub struct Metrics {
     /// the modal is not up.
     pub allow_button: Option<Rect>,
     pub deny_button: Option<Rect>,
+    /// The session picker's row area and the index of its first visible row, so
+    /// a click can be mapped back to a session. `None` when the picker is closed.
+    pub picker_list: Option<Rect>,
+    pub picker_offset: usize,
 }
 
 /// Did `(column, row)` land inside `area`?
@@ -74,13 +78,78 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Metrics {
     draw_status(frame, app, status_area);
     draw_input(frame, app, input_area, &input_layout, input_rows);
 
-    // Drawn last so it sits above everything else.
+    // Drawn last so it sits above everything else. The two modals are mutually
+    // exclusive; approval takes precedence if both were ever set.
     if let Some(pending) = app.pending() {
         let (allow, deny) = draw_approval(frame, pending, area);
         metrics.allow_button = Some(allow);
         metrics.deny_button = Some(deny);
+    } else if let Some(picker) = app.picker() {
+        let (list, offset) = draw_picker(frame, picker, area);
+        metrics.picker_list = Some(list);
+        metrics.picker_offset = offset;
     }
     metrics
+}
+
+/// The `/load` session picker. Returns the inner row area and the index of the
+/// first visible row, so a click can be mapped back to a session.
+fn draw_picker(frame: &mut Frame, picker: &crate::app::Picker, area: Rect) -> (Rect, usize) {
+    let width = area.width.saturating_sub(8).clamp(20, 60);
+    // Border (2) + footer (1) + a blank (1), plus one row per session, capped.
+    let max_list = (area.height.saturating_sub(2) / 2).max(1);
+    let list_rows = (picker.sessions.len() as u16).clamp(1, max_list);
+    let height = list_rows + 4;
+
+    let modal = center(area, width, height);
+    frame.render_widget(Clear, modal);
+    let block = Block::bordered()
+        .title(Line::from(" load session ").bold())
+        .border_style(Style::default().fg(Color::Blue));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let [list_area, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    // Scroll a window around the selection so it stays visible in a long list.
+    let visible = list_area.height as usize;
+    let offset = picker
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(picker.sessions.len().saturating_sub(visible));
+
+    let rows: Vec<Line> = picker
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(i, name)| {
+            let focused = i == picker.selected;
+            let style = if focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let marker = if focused { "› " } else { "  " };
+            Line::from(Span::styled(format!("{marker}{name}"), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(rows)), list_area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑/↓ choose · Enter load · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        footer_area,
+    );
+
+    (list_area, offset)
 }
 
 /// The slash-command completion menu, shown above the status line.
@@ -132,15 +201,56 @@ fn draw_completions(
 /// loop can hit-test mouse clicks against them.
 fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rect) {
     let width = area.width.saturating_sub(8).clamp(24, 76);
-    let command_rows = wrap::text(&pending.command, width.saturating_sub(4) as usize).len() as u16;
-    // Border + prompt + blank + command + blank + buttons.
-    let height = (command_rows + 7).min(area.height.saturating_sub(2)).max(7);
 
+    // Build the body: a command shown in full, or a write shown as path + a
+    // bounded preview so a large file never blows up the box.
+    let inner_width = width.saturating_sub(4) as usize;
+    let (prompt, title, mut body): (&str, &str, Vec<Line>) = match &pending.action {
+        // Only reachable under `--confirm-reads`; reads are otherwise silent.
+        Action::Read { path } => (
+            "The model wants to read:",
+            " read this file? ",
+            vec![Line::from(Span::styled(
+                path.clone(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ))],
+        ),
+        Action::Write { path, contents } => (
+            "The model wants to write:",
+            " write this file? ",
+            std::iter::once(Line::from(Span::styled(
+                path.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .chain(preview_lines(contents, inner_width))
+            .collect(),
+        ),
+        action => (
+            "The model wants to run:",
+            " run this command? ",
+            body_lines(
+                action.body(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+                inner_width,
+            ),
+        ),
+    };
+
+    // Border + prompt + blank + body + blank + buttons.
+    let height = (body.len() as u16 + 7)
+        .min(area.height.saturating_sub(2))
+        .max(7);
     let modal = center(area, width, height);
     frame.render_widget(Clear, modal);
 
     let block = Block::bordered()
-        .title(Line::from(" run this command? ").bold())
+        .title(Line::from(title).bold())
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
@@ -149,22 +259,11 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
     let mut lines = vec![Line::from(Span::styled(
-        "The model wants to run:",
+        prompt,
         Style::default().fg(Color::Gray),
     ))];
     lines.push(Line::default());
-    lines.extend(
-        wrap::text(&pending.command, text_area.width as usize)
-            .into_iter()
-            .map(|row| {
-                Line::from(Span::styled(
-                    row,
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            }),
-    );
+    lines.append(&mut body);
     frame.render_widget(Paragraph::new(Text::from(lines)), text_area);
 
     // Two fixed-width buttons, centred as a pair.
@@ -318,18 +417,25 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
             // protocol: the user should see which branch the model chose.
             let (label, colour) = match action {
                 Action::Shell(_) => ("shell", Color::Magenta),
+                Action::Read { .. } => ("read", Color::Blue),
+                Action::Write { .. } => ("write", Color::Cyan),
                 Action::Response(_) => ("response", Color::Green),
             };
-            let mut header = vec![
-                Span::styled(
-                    label,
-                    Style::default().fg(colour).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  {}", app.model),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ];
+            let mut header = vec![Span::styled(
+                label,
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            )];
+            // For a write, the path is the headline; the contents preview below.
+            if let Action::Write { path, .. } = action {
+                header.push(Span::styled(
+                    format!("  {path}"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            header.push(Span::styled(
+                format!("  {}", app.model),
+                Style::default().fg(Color::DarkGray),
+            ));
             if let Some(u) = usage {
                 header.push(Span::styled(
                     format!("  {} in / {} out", u.prompt_tokens, u.completion_tokens),
@@ -338,12 +444,21 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
             }
             lines.push(Line::from(header));
 
-            let body_style = match action {
+            match action {
                 // Shell commands read as commands, not prose.
-                Action::Shell(_) => Style::default().fg(Color::Magenta),
-                Action::Response(_) => Style::default(),
-            };
-            lines.extend(body_lines(action.body(), body_style, width));
+                Action::Shell(cmd) => {
+                    lines.extend(body_lines(cmd, Style::default().fg(Color::Magenta), width))
+                }
+                // The path is the whole action; the contents arrive as a result.
+                Action::Read { path } => {
+                    lines.extend(body_lines(path, Style::default().fg(Color::Blue), width))
+                }
+                Action::Response(text) => lines.extend(body_lines(text, Style::default(), width)),
+                // A file could be huge; show a bounded preview, not the whole thing.
+                Action::Write { contents, .. } => {
+                    lines.extend(preview_lines(contents, width));
+                }
+            }
         }
         Entry::Malformed { reason, raw } => {
             lines.push(Line::from(vec![
@@ -387,6 +502,47 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                     "… output truncated",
                     dim.add_modifier(Modifier::ITALIC),
                 )));
+            }
+        }
+        Entry::ReadResult(outcome) => {
+            let ok = outcome.succeeded();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "result",
+                    Style::default()
+                        .fg(if ok { Color::Blue } else { Color::Red })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}  {}", outcome.path, outcome.summary()),
+                    Style::default().fg(if ok { Color::DarkGray } else { Color::Red }),
+                ),
+            ]));
+            match &outcome.error {
+                Some(error) => {
+                    lines.extend(body_lines(error, Style::default().fg(Color::Red), width))
+                }
+                // The model gets the whole file; the transcript gets a taste of
+                // it, since a read happens without the user asking for it. The
+                // counts are already in the header above.
+                None => lines.extend(preview_body(&outcome.contents, width)),
+            }
+        }
+        Entry::WriteResult(outcome) => {
+            let ok = outcome.succeeded();
+            let mut spans = vec![Span::styled(
+                "result",
+                Style::default()
+                    .fg(if ok { Color::Blue } else { Color::Red })
+                    .add_modifier(Modifier::BOLD),
+            )];
+            spans.push(Span::styled(
+                format!("  {} {}", outcome.summary(), outcome.path),
+                Style::default().fg(if ok { Color::DarkGray } else { Color::Red }),
+            ));
+            lines.push(Line::from(spans));
+            if let Some(error) = &outcome.error {
+                lines.extend(body_lines(error, Style::default().fg(Color::Red), width));
             }
         }
         Entry::Denied(command) => {
@@ -449,6 +605,41 @@ fn body_lines(content: &str, style: Style, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// The first few lines of file contents, plus a size summary — so a large write
+/// never floods the transcript or the approval modal.
+fn preview_lines(contents: &str, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "{} line(s), {} bytes",
+            contents.lines().count(),
+            contents.len()
+        ),
+        dim.add_modifier(Modifier::ITALIC),
+    ))];
+    lines.extend(preview_body(contents, width));
+    lines
+}
+
+/// Just the bounded excerpt, for callers whose header already carries the size.
+fn preview_body(contents: &str, width: usize) -> Vec<Line<'static>> {
+    const MAX: usize = 8;
+    let total = contents.lines().count();
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for line in contents.lines().take(MAX) {
+        lines.extend(body_lines(line, dim, width));
+    }
+    if total > MAX {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more line(s)", total - MAX),
+            dim.add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let (label, colour) = match app.status {
         Status::Idle => (" ready ", Color::Green),
@@ -479,6 +670,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     }
     let hints = if app.pending().is_some() {
         "  ←/→ choose · Enter confirm · y allow · n/Esc deny"
+    } else if matches!(
+        app.status,
+        Status::Waiting | Status::Streaming | Status::Running
+    ) {
+        // Busy without a modal: the one useful key is Esc.
+        "  Esc cancel · Ctrl+C quit"
     } else {
         "  Enter send · Alt+Enter newline · Ctrl+L clear · Ctrl+C quit"
     };
@@ -581,7 +778,7 @@ mod tests {
 
     #[test]
     fn prompt_is_pinned_to_the_bottom_of_the_screen() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hello");
         let (rows, _) = render(&mut app, 40, 12);
 
@@ -605,7 +802,7 @@ mod tests {
 
     #[test]
     fn prompt_grows_downward_keeping_its_bottom_edge_fixed() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("one\ntwo\nthree");
         let (rows, _) = render(&mut app, 40, 12);
 
@@ -633,7 +830,7 @@ mod tests {
 
     #[test]
     fn transcript_renders_both_turns() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("what is 2+2");
         app.submit().unwrap();
         app.push_response("<ai-harness-response>4</ai-harness-response>".into(), None);
@@ -654,7 +851,7 @@ mod tests {
 
     /// Drive an app to the point where a shell command awaits approval.
     fn awaiting_approval(command: &str) -> App {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("list files");
         app.submit().unwrap();
         app.push_response(
@@ -673,6 +870,146 @@ mod tests {
         let screen = transcript_only(&rows);
         assert!(screen.contains("shell"), "missing shell label:\n{screen}");
         assert!(screen.contains("ls -la"), "missing command:\n{screen}");
+    }
+
+    /// Drive an app to a pending write approval.
+    fn awaiting_write(path: &str, contents: &str) -> App {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("write a file");
+        app.submit().unwrap();
+        app.push_response(
+            format!("<ai-harness-write file={path}>\n{contents}</ai-harness-write>"),
+            None,
+        );
+        assert!(app.pending().is_some(), "should be awaiting write approval");
+        app
+    }
+
+    #[test]
+    fn write_approval_modal_shows_the_path_and_a_bounded_preview() {
+        // Twenty lines — the preview must summarise, not dump them all.
+        let contents: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let mut app = awaiting_write("src/big.rs", &contents);
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+
+        assert!(
+            screen.contains("write this file?"),
+            "missing title:\n{screen}"
+        );
+        assert!(screen.contains("src/big.rs"), "missing path:\n{screen}");
+        assert!(screen.contains("line 0"), "missing preview head:\n{screen}");
+        assert!(
+            screen.contains("more line"),
+            "missing truncation note:\n{screen}"
+        );
+        assert!(
+            !screen.contains("line 19"),
+            "the full file must not be dumped into the modal:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn read_action_and_its_result_are_rendered() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Read {
+                path: "src/app.rs".into(),
+            },
+            usage: None,
+        });
+        app.transcript
+            .push(Entry::ReadResult(crate::files::ReadOutcome {
+                path: "src/app.rs".into(),
+                contents: "alpha\nbeta\n".into(),
+                lines: 2,
+                truncated: false,
+                error: None,
+            }));
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("read"), "missing read label:\n{screen}");
+        assert!(screen.contains("src/app.rs"), "missing path:\n{screen}");
+        assert!(screen.contains("2 line(s)"), "missing counts:\n{screen}");
+        assert!(screen.contains("alpha"), "missing preview:\n{screen}");
+    }
+
+    #[test]
+    fn a_failed_read_is_rendered_with_its_reason() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript
+            .push(Entry::ReadResult(crate::files::ReadOutcome::failed(
+                "gone.txt",
+                "gone.txt: no such file",
+            )));
+
+        let (rows, _) = render(&mut app, 70, 12);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("gone.txt"), "missing path:\n{screen}");
+        assert!(screen.contains("no such file"), "missing reason:\n{screen}");
+    }
+
+    /// A long file must not flood the transcript just because nobody approved it.
+    #[test]
+    fn a_long_read_result_is_previewed_not_dumped() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let contents: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        app.transcript
+            .push(Entry::ReadResult(crate::files::ReadOutcome {
+                path: "big.txt".into(),
+                lines: 40,
+                contents,
+                truncated: false,
+                error: None,
+            }));
+
+        let (rows, _) = render(&mut app, 70, 24);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("line 0"), "missing preview head:\n{screen}");
+        assert!(screen.contains("more line"), "missing summary:\n{screen}");
+        assert!(
+            !screen.contains("line 39"),
+            "the whole file leaked into the transcript:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn read_approval_modal_appears_under_confirm_reads() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.confirm_reads = true;
+        app.input.insert_str("look at a file");
+        app.submit().unwrap();
+        app.push_response("<ai-harness-read>src/app.rs</ai-harness-read>".into(), None);
+        assert!(app.pending().is_some(), "should be awaiting read approval");
+
+        let (rows, _) = render(&mut app, 70, 18);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("read this file?"),
+            "missing title:\n{screen}"
+        );
+        assert!(screen.contains("src/app.rs"), "missing path:\n{screen}");
+    }
+
+    #[test]
+    fn write_result_is_rendered_with_its_path() {
+        let mut app = awaiting_write("out.txt", "hi");
+        app.approve();
+        app.push_write_result(crate::exec::WriteOutcome {
+            path: "out.txt".into(),
+            bytes: 2,
+            error: None,
+            timed_out: false,
+            cancelled: false,
+        });
+        let (rows, _) = render(&mut app, 60, 16);
+        let screen = transcript_only(&rows);
+        assert!(
+            screen.contains("wrote 2 bytes"),
+            "missing summary:\n{screen}"
+        );
+        assert!(screen.contains("out.txt"), "missing path:\n{screen}");
     }
 
     #[test]
@@ -739,7 +1076,7 @@ mod tests {
 
     #[test]
     fn frames_are_hidden_until_debug_is_on() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("count the files");
         app.submit().unwrap();
         app.push_response(
@@ -774,7 +1111,7 @@ mod tests {
 
     #[test]
     fn hidden_frames_leave_no_blank_gap() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
 
@@ -787,7 +1124,7 @@ mod tests {
 
     #[test]
     fn completion_menu_appears_above_the_prompt() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_char('/');
         let (rows, _) = render(&mut app, 70, 20);
         let screen = rows.join("\n");
@@ -803,7 +1140,7 @@ mod tests {
 
     #[test]
     fn menu_highlights_the_selected_entry() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_char('/');
 
         let (rows, _) = render(&mut app, 70, 20);
@@ -820,7 +1157,7 @@ mod tests {
 
     #[test]
     fn menu_is_absent_for_an_ordinary_prompt() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("what is 2+2");
         let (rows, _) = render(&mut app, 70, 20);
         assert!(
@@ -831,7 +1168,7 @@ mod tests {
 
     #[test]
     fn menu_narrows_to_the_typed_prefix() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("/c");
         let (rows, _) = render(&mut app, 70, 20);
         let screen = rows.join("\n");
@@ -844,7 +1181,7 @@ mod tests {
 
     #[test]
     fn menu_does_not_push_the_prompt_off_a_short_screen() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_char('/');
         // Tight enough that the menu must yield space to the prompt.
         let (rows, _) = render(&mut app, 60, 10);
@@ -857,7 +1194,7 @@ mod tests {
 
     #[test]
     fn streaming_text_renders_live_below_the_transcript() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
         app.push_delta("Hello, wor");
@@ -874,7 +1211,7 @@ mod tests {
 
     #[test]
     fn the_live_view_grows_as_tokens_arrive() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
 
@@ -893,7 +1230,7 @@ mod tests {
 
     #[test]
     fn the_spinner_shows_before_the_first_token() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
         // Waiting, no deltas yet.
@@ -911,8 +1248,26 @@ mod tests {
     }
 
     #[test]
+    fn status_hint_offers_cancel_while_busy() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        // Idle: no cancel hint.
+        let (rows, _) = render(&mut app, 80, 12);
+        assert!(!rows.join("\n").contains("Esc cancel"));
+
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_delta("partial");
+        let (rows, _) = render(&mut app, 80, 12);
+        assert!(
+            rows.join("\n").contains("Esc cancel"),
+            "a busy status bar should offer cancel:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
     fn status_bar_shows_streaming() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
         app.push_delta("partial");
@@ -926,7 +1281,7 @@ mod tests {
 
     #[test]
     fn status_bar_shows_the_debug_marker() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         let (rows, _) = render(&mut app, 70, 12);
         assert!(!rows.join("\n").contains("debug"));
 
@@ -941,11 +1296,84 @@ mod tests {
 
     #[test]
     fn no_button_rects_are_reported_without_a_modal() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         let (_, metrics) = render(&mut app, 60, 14);
         assert!(metrics.allow_button.is_none());
         assert!(metrics.deny_button.is_none());
         assert!(!hit(None, 0, 0), "a missing rect must never register a hit");
+    }
+
+    /// An app whose sessions dir holds `names`, with the load picker open.
+    fn app_with_picker(names: &[&str]) -> (App, std::path::PathBuf) {
+        // A per-call unique id so parallel tests never share a directory.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ai-harness-ui-picker-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in names {
+            let session = crate::session::Session::new("m".into(), vec![], vec![], vec![]);
+            crate::session::save(&dir, name, &session).unwrap();
+        }
+        let mut app = App::new("test/model".into(), None, 10, dir.clone());
+        app.open_load_picker();
+        (app, dir)
+    }
+
+    #[test]
+    fn picker_lists_sessions_and_reports_its_geometry() {
+        let (mut app, dir) = app_with_picker(&["alpha", "beta", "gamma"]);
+        let (rows, metrics) = render(&mut app, 60, 20);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("load session"), "missing title:\n{screen}");
+        for name in ["alpha", "beta", "gamma"] {
+            assert!(screen.contains(name), "missing {name}:\n{screen}");
+        }
+        assert!(screen.contains("Enter load"), "missing footer:\n{screen}");
+        assert!(metrics.picker_list.is_some(), "list rect must be reported");
+        assert_eq!(metrics.picker_offset, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_highlights_the_selection_and_a_click_maps_to_it() {
+        let (mut app, dir) = app_with_picker(&["one", "two", "three"]);
+        app.picker_move(1); // second row (names are listed sorted)
+        // The marker sits on whatever the second sorted entry is.
+        let selected = app.picker().unwrap().sessions[1].clone();
+        let (rows, metrics) = render(&mut app, 60, 20);
+        assert!(
+            rows.iter().any(|r| r.contains(&format!("› {selected}"))),
+            "the selected row should carry the marker:\n{}",
+            rows.join("\n")
+        );
+
+        // A click on that row maps back to index 1 via the reported geometry.
+        let list = metrics.picker_list.unwrap();
+        let clicked = metrics.picker_offset + (list.y + 1 - list.y) as usize;
+        assert_eq!(clicked, 1, "click math recovers the row index");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_scrolls_to_keep_a_deep_selection_visible() {
+        let names: Vec<String> = (0..40).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut app, dir) = app_with_picker(&refs);
+        for _ in 0..39 {
+            app.picker_move(1); // select the last one
+        }
+        let (rows, metrics) = render(&mut app, 60, 16);
+        assert!(
+            rows.iter().any(|r| r.contains("s39")),
+            "the deep selection must be scrolled into view:\n{}",
+            rows.join("\n")
+        );
+        assert!(metrics.picker_offset > 0, "a long list must scroll");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -970,6 +1398,7 @@ mod tests {
             stderr: String::new(),
             truncated: false,
             timed_out: false,
+            cancelled: false,
         });
 
         let (rows, _) = render(&mut app, 60, 20);
@@ -991,7 +1420,7 @@ mod tests {
 
     #[test]
     fn transcript_shows_the_typed_prompt_not_the_query_tag() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("list files");
         app.submit().unwrap();
 
@@ -1006,7 +1435,7 @@ mod tests {
 
     #[test]
     fn malformed_reply_is_shown_with_its_raw_text() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
         app.push_response("Sure, I can help with that!".into(), None);
@@ -1025,7 +1454,7 @@ mod tests {
 
     #[test]
     fn long_transcript_sticks_to_the_bottom() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         for i in 0..30 {
             app.transcript.push(Entry::User(format!("message {i}")));
         }
@@ -1049,7 +1478,7 @@ mod tests {
 
     #[test]
     fn scrolled_back_view_shows_older_content_and_is_clamped() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         for i in 0..30 {
             app.transcript.push(Entry::User(format!("message {i}")));
         }
@@ -1072,7 +1501,7 @@ mod tests {
 
     #[test]
     fn narrow_terminal_wraps_instead_of_overflowing() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.transcript.push(Entry::User(
             "the quick brown fox jumps over the lazy dog".into(),
         ));
@@ -1085,7 +1514,7 @@ mod tests {
 
     #[test]
     fn waiting_state_shows_the_spinner() {
-        let mut app = App::new("test/model".into(), None, 10);
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
         let (rows, _) = render(&mut app, 40, 12);
