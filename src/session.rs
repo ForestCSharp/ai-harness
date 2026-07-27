@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::app::Entry;
+use crate::ledger::Ledger;
 use crate::openrouter::Message;
 
 /// The on-disk format version. Bumped only on an incompatible change so an old
@@ -27,6 +28,11 @@ pub struct Session {
     pub history: Vec<Message>,
     pub transcript: Vec<Entry>,
     pub prompt_history: Vec<String>,
+    /// Cumulative token spend. Added after `VERSION` 1 without a bump: it
+    /// defaults when absent, and older builds ignore the unknown field, so
+    /// files stay readable in both directions.
+    #[serde(default)]
+    pub ledger: Ledger,
 }
 
 impl Session {
@@ -35,6 +41,7 @@ impl Session {
         history: Vec<Message>,
         transcript: Vec<Entry>,
         prompt_history: Vec<String>,
+        ledger: Ledger,
     ) -> Self {
         Self {
             version: VERSION,
@@ -43,6 +50,7 @@ impl Session {
             history,
             transcript,
             prompt_history,
+            ledger,
         }
     }
 }
@@ -179,6 +187,7 @@ mod tests {
                 },
             ],
             vec!["hi".into()],
+            Ledger::default(),
         )
     }
 
@@ -218,6 +227,16 @@ mod tests {
                 timed_out: false,
                 cancelled: false,
             })),
+            Entry::FetchResult(Box::new(crate::fetch::FetchOutcome {
+                url: "https://example.com".into(),
+                final_url: None,
+                status: Some(200),
+                content_type: Some("text/html".into()),
+                text: "page".into(),
+                bytes: 4,
+                truncated: false,
+                error: None,
+            })),
             Entry::Denied("rm -rf /".into()),
             Entry::Frame {
                 direction: Direction::Sent,
@@ -226,7 +245,13 @@ mod tests {
             Entry::Error("boom".into()),
             Entry::Notice("hi".into()),
         ];
-        let session = Session::new("m".into(), vec![], entries.clone(), vec![]);
+        let session = Session::new(
+            "m".into(),
+            vec![],
+            entries.clone(),
+            vec![],
+            Ledger::default(),
+        );
 
         let dir = temp_dir("variants");
         save(&dir, "v", &session).unwrap();
@@ -237,6 +262,38 @@ mod tests {
             Entry::CommandResult(o) => assert_eq!(o.exit_code, Some(0)),
             other => panic!("variant 3 changed shape: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ledger_round_trips() {
+        let dir = temp_dir("ledger");
+        let mut session = sample();
+        session.ledger.record(&Usage {
+            prompt_tokens: 120,
+            completion_tokens: 40,
+        });
+        save(&dir, "led", &session).unwrap();
+
+        let loaded = load(&dir, "led").unwrap();
+        assert_eq!(loaded.ledger, session.ledger);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ledger was added without a version bump, so files written before it
+    /// existed must still load — with the totals simply starting at zero.
+    #[test]
+    fn a_session_saved_without_a_ledger_still_loads() {
+        let dir = temp_dir("no-ledger");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"version":{VERSION},"saved_at":0,"model":"m","history":[],
+                 "transcript":[],"prompt_history":[]}}"#
+        );
+        std::fs::write(dir.join("old.json"), json).unwrap();
+
+        let loaded = load(&dir, "old").expect("an older session must still load");
+        assert!(loaded.ledger.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

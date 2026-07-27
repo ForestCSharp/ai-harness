@@ -43,6 +43,16 @@ pub struct Args {
     #[arg(long, env = "AI_HARNESS_CONFIRM_READS")]
     pub confirm_reads: bool,
 
+    /// Ask before each URL fetch. Off by default, like reads.
+    ///
+    /// Turn it on to keep the network step under approval: an auto-approved
+    /// read followed by an auto-approved fetch can move file contents off the
+    /// machine without asking, and the https-only, no-private-addresses rules
+    /// do not prevent that — they only stop a fetch reaching this machine or
+    /// this network.
+    #[arg(long, env = "AI_HARNESS_CONFIRM_FETCH")]
+    pub confirm_fetch: bool,
+
     /// Start with debug mode on, showing raw protocol frames. Toggle with /debug.
     ///
     /// Also enabled by default in non-shipping (`dev`) builds; the flag forces it on
@@ -57,6 +67,18 @@ pub struct Args {
     /// Directory for `/save` and `/load` session files.
     #[arg(long, default_value = "sessions", env = "AI_HARNESS_SESSIONS_DIR")]
     pub sessions_dir: PathBuf,
+
+    /// Input price in dollars per million tokens, for the `/cost` estimate.
+    ///
+    /// Rates differ per model and change over time, so they are supplied rather
+    /// than baked in — a hardcoded table would go stale without anyone noticing.
+    /// Both this and `--price-out` must be set for a cost figure to appear.
+    #[arg(long, env = "AI_HARNESS_PRICE_IN")]
+    pub price_in: Option<f64>,
+
+    /// Output price in dollars per million tokens. See `--price-in`.
+    #[arg(long, env = "AI_HARNESS_PRICE_OUT")]
+    pub price_out: Option<f64>,
 }
 
 impl Args {

@@ -169,10 +169,20 @@ fn draw_completions(
     // Align descriptions into a column so the list reads as a table.
     let name_width = completions.iter().map(|c| c.name.len()).max().unwrap_or(0);
 
+    // The menu is capped so it cannot push the prompt off a short screen, which
+    // means the list can outgrow it. Scroll a window around the selection — the
+    // same treatment `draw_picker` gives a long session list — or entries past
+    // the cap would be invisible and unreachable.
+    let visible = inner.height as usize;
+    let offset = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(completions.len().saturating_sub(visible));
+
     let lines: Vec<Line> = completions
         .iter()
-        .take(inner.height as usize)
         .enumerate()
+        .skip(offset)
+        .take(visible)
         .map(|(i, spec)| {
             let focused = i == selected;
             let name = format!(" /{:<name_width$} ", spec.name, name_width = name_width);
@@ -212,6 +222,17 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
             " read this file? ",
             vec![Line::from(Span::styled(
                 path.clone(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ))],
+        ),
+        // Only reachable under `--confirm-fetch`; fetches are otherwise silent.
+        Action::Fetch { url } => (
+            "The model wants to fetch:",
+            " fetch this URL? ",
+            vec![Line::from(Span::styled(
+                url.clone(),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
@@ -430,6 +451,7 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
             let (label, colour) = match action {
                 Action::Shell(_) => ("shell", Color::Magenta),
                 Action::Read { .. } => ("read", Color::Blue),
+                Action::Fetch { .. } => ("fetch", Color::Blue),
                 Action::Write { .. } => ("write", Color::Cyan),
                 Action::Edit { .. } => ("edit", Color::Cyan),
                 Action::Response(_) => ("response", Color::Green),
@@ -465,6 +487,10 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                 // The path is the whole action; the contents arrive as a result.
                 Action::Read { path } => {
                     lines.extend(body_lines(path, Style::default().fg(Color::Blue), width))
+                }
+                // Likewise the URL; the page text arrives as a result.
+                Action::Fetch { url } => {
+                    lines.extend(body_lines(url, Style::default().fg(Color::Blue), width))
                 }
                 Action::Response(text) => lines.extend(body_lines(text, Style::default(), width)),
                 // A file could be huge; show a bounded preview, not the whole thing.
@@ -543,6 +569,35 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                 // it, since a read happens without the user asking for it. The
                 // counts are already in the header above.
                 None => lines.extend(preview_body(&outcome.contents, width)),
+            }
+        }
+        Entry::FetchResult(outcome) => {
+            let ok = outcome.succeeded();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "result",
+                    Style::default()
+                        .fg(if ok { Color::Blue } else { Color::Red })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}  {}", outcome.url, outcome.summary()),
+                    Style::default().fg(if ok { Color::DarkGray } else { Color::Red }),
+                ),
+            ]));
+            // Where it actually landed matters more than usual here — a fetch
+            // the user never approved may have been redirected somewhere else.
+            if let Some(final_url) = &outcome.final_url {
+                lines.push(Line::from(Span::styled(
+                    format!("  → {final_url}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            match &outcome.error {
+                Some(error) => {
+                    lines.extend(body_lines(error, Style::default().fg(Color::Red), width))
+                }
+                None => lines.extend(preview_body(&outcome.text, width)),
             }
         }
         Entry::WriteResult(outcome) => {
@@ -720,6 +775,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(app.model.clone(), Style::default().fg(Color::Gray)),
     ];
+    // Cumulative spend, once there is any. Hidden on a fresh session so the bar
+    // does not open with a row of zeroes.
+    if !app.ledger.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", app.cost_status()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if app.debug {
         spans.push(Span::styled(
             "  debug",
@@ -999,6 +1062,76 @@ mod tests {
         assert!(screen.contains("src/app.rs"), "missing path:\n{screen}");
         assert!(screen.contains("2 line(s)"), "missing counts:\n{screen}");
         assert!(screen.contains("alpha"), "missing preview:\n{screen}");
+    }
+
+    #[test]
+    fn fetch_action_and_its_result_are_rendered() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Fetch {
+                url: "https://example.com/docs".into(),
+            },
+            usage: None,
+        });
+        app.transcript
+            .push(Entry::FetchResult(Box::new(crate::fetch::FetchOutcome {
+                url: "https://example.com/docs".into(),
+                final_url: Some("https://example.com/en/docs".into()),
+                status: Some(200),
+                content_type: Some("text/html".into()),
+                text: "Title\nBody text\n".into(),
+                bytes: 900,
+                truncated: false,
+                error: None,
+            })));
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("fetch"), "missing fetch label:\n{screen}");
+        assert!(screen.contains("example.com"), "missing url:\n{screen}");
+        assert!(screen.contains("Title"), "missing preview:\n{screen}");
+        // Where it actually landed matters: nobody approved this request.
+        assert!(
+            screen.contains("/en/docs"),
+            "the redirect target should be visible:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_refused_fetch_is_rendered_with_its_reason() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::FetchResult(Box::new(
+            crate::fetch::FetchOutcome::failed(
+                "https://169.254.169.254/",
+                "169.254.169.254 is a link-local address",
+            ),
+        )));
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("failed"), "missing failure:\n{screen}");
+        assert!(screen.contains("link-local"), "missing reason:\n{screen}");
+    }
+
+    #[test]
+    fn fetch_approval_modal_appears_under_confirm_fetch() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.confirm_fetches = true;
+        app.push_response(
+            "<ai-harness-fetch>https://example.com/docs</ai-harness-fetch>".into(),
+            None,
+        );
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("wants to fetch"),
+            "the modal should name the action:\n{screen}"
+        );
+        assert!(
+            screen.contains("example.com/docs"),
+            "the modal must show the URL being fetched:\n{screen}"
+        );
     }
 
     #[test]
@@ -1282,12 +1415,34 @@ mod tests {
         let screen = rows.join("\n");
 
         assert!(screen.contains("commands"), "missing menu title:\n{screen}");
-        for name in ["/debug", "/clear", "/help", "/quit"] {
+        for name in ["/debug", "/clear", "/save"] {
             assert!(screen.contains(name), "missing {name}:\n{screen}");
         }
         // The prompt must still own the bottom rows.
         assert!(rows[19].starts_with('└'), "prompt lost the bottom edge");
         assert!(rows[18].contains("> /"), "prompt row was {:?}", rows[18]);
+    }
+
+    /// The menu is height-capped, so a list longer than the cap must scroll —
+    /// otherwise the last commands are invisible and cannot be selected.
+    #[test]
+    fn the_menu_scrolls_to_keep_a_deep_selection_visible() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_char('/');
+        let total = app.completions().len();
+
+        // Walk to the final entry.
+        let last = total - 1;
+        app.move_completion(last as isize);
+        assert_eq!(app.completion_index(), last);
+
+        let name = app.completions()[last].name;
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains(&format!("/{name}")),
+            "the selected entry /{name} scrolled out of view:\n{screen}"
+        );
     }
 
     #[test]
@@ -1297,8 +1452,8 @@ mod tests {
 
         let (rows, _) = render(&mut app, 70, 20);
         let debug_row = rows.iter().position(|r| r.contains("/debug")).unwrap();
-        let quit_row = rows.iter().position(|r| r.contains("/quit")).unwrap();
-        assert!(debug_row < quit_row, "menu order should follow the table");
+        let save_row = rows.iter().position(|r| r.contains("/save")).unwrap();
+        assert!(debug_row < save_row, "menu order should follow the table");
 
         // Moving the highlight must not reorder or drop entries.
         app.move_completion(1);
@@ -1466,7 +1621,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         for name in names {
-            let session = crate::session::Session::new("m".into(), vec![], vec![], vec![]);
+            let session = crate::session::Session::new(
+                "m".into(),
+                vec![],
+                vec![],
+                vec![],
+                Default::default(),
+            );
             crate::session::save(&dir, name, &session).unwrap();
         }
         let mut app = App::new("test/model".into(), None, 10, dir.clone());

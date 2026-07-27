@@ -20,6 +20,8 @@ pub enum Command {
     Rename(Option<String>),
     /// Branch the current conversation into a new session; `None` generates a name.
     Fork(Option<String>),
+    /// Report cumulative token spend for the session.
+    Cost,
     /// Something starting with `/` that we do not recognise. Reported to the
     /// user rather than forwarded — silently sending a typo'd command to the
     /// model is the worst available outcome.
@@ -63,6 +65,7 @@ pub fn parse(input: &str) -> Input {
         "load" => Command::Load(arg),
         "rename" => Command::Rename(arg),
         "fork" => Command::Fork(arg),
+        "cost" | "tokens" => Command::Cost,
         // A bare "/" has no name; report it the same way as any unknown.
         _ => Command::Unknown(name.to_string()),
     })
@@ -103,6 +106,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "fork",
         description: "branch into a new session, keeping the original (/fork [name])",
+    },
+    Spec {
+        name: "cost",
+        description: "show cumulative tokens and estimated spend",
     },
     Spec {
         name: "help",
@@ -279,15 +286,16 @@ mod tests {
 
     #[test]
     fn matching_filters_by_prefix() {
+        // An empty prefix offers the whole table, in table order.
         let names: Vec<_> = matching("").iter().map(|s| s.name).collect();
-        assert_eq!(
-            names,
-            vec![
-                "debug", "clear", "save", "load", "rename", "fork", "help", "quit"
-            ]
-        );
+        let expected: Vec<_> = COMMANDS.iter().map(|s| s.name).collect();
+        assert_eq!(names, expected);
 
+        // A prefix shared by two commands offers both.
         let names: Vec<_> = matching("c").iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["clear", "cost"]);
+
+        let names: Vec<_> = matching("cl").iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["clear"]);
 
         let names: Vec<_> = matching("f").iter().map(|s| s.name).collect();

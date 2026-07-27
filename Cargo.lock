@@ -29,6 +29,7 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "unicode-width",
+ "url",
 ]
 
 [[package]]

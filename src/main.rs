@@ -2,8 +2,10 @@ mod app;
 mod command;
 mod config;
 mod exec;
+mod fetch;
 mod files;
 mod input;
+mod ledger;
 mod openrouter;
 mod protocol;
 mod sandbox;
@@ -25,6 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use app::{App, Choice};
 use config::Args;
 use exec::{CommandOutput, WriteOutcome};
+use fetch::{FetchOutcome, Fetcher};
 use openrouter::{Client, Completion, Message};
 use protocol::Action;
 use sandbox::Sandbox;
@@ -42,6 +45,9 @@ enum Update {
     Command(Result<CommandOutput, String>),
     /// A sandboxed file write finished, or failed to start.
     Write(Result<WriteOutcome, String>),
+    /// A URL fetch finished. Refusals and HTTP errors arrive as a `FetchOutcome`
+    /// carrying the reason, so `Err` here means the request never started.
+    Fetch(Box<FetchOutcome>),
 }
 
 /// An [`Update`] tagged with the generation of the task that produced it, so a
@@ -61,6 +67,10 @@ struct InFlight {
 struct Ctx {
     client: Client,
     sandbox: Sandbox,
+    /// Its own HTTP client, never the OpenRouter one: a separate connection pool
+    /// keeps a vetted connection from being shared across a trust boundary, and
+    /// the API-key-bearing client is never pointed at a model-chosen URL.
+    fetcher: Fetcher,
     timeout: Duration,
     tx: mpsc::Sender<Tagged>,
 }
@@ -96,6 +106,9 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     // the sandbox itself, not just its root.
     app.sandbox = Some(sandbox.clone());
     app.confirm_reads = args.confirm_reads;
+    app.confirm_fetches = args.confirm_fetch;
+    app.price_in = args.price_in;
+    app.price_out = args.price_out;
     app.push_notice(format!(
         "Sandbox root: {}   Type /help for commands.",
         sandbox.root().display()
@@ -106,6 +119,9 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     let ctx = Ctx {
         client,
         sandbox,
+        // `Policy::strict` is the only policy production ever builds; the
+        // loosened one is `#[cfg(test)]` and does not exist in this binary.
+        fetcher: Fetcher::new(fetch::Policy::strict(args.timeout()))?,
         timeout: args.timeout(),
         tx,
     };
@@ -169,13 +185,22 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
         // which comes back as messages to resend.
         Update::ReplyEnd(Ok(completion)) => {
             *inflight = None;
+            app.mark_request_done();
             app.finish_stream();
-            if let Some(messages) = app.push_response(completion.content, completion.usage) {
-                spawn_request(app, ctx, inflight, messages);
+            match app.push_response(completion.content, completion.usage) {
+                Some(messages) => spawn_request(app, ctx, inflight, messages),
+                // An auto-approved fetch is parked rather than returned, since
+                // it is background work the app layer cannot start itself.
+                None => {
+                    if let Some(url) = app.take_pending_fetch() {
+                        spawn_fetch(app, ctx, inflight, url);
+                    }
+                }
             }
         }
         Update::ReplyEnd(Err(message)) => {
             *inflight = None;
+            app.mark_request_done();
             app.finish_stream();
             app.push_error(message);
         }
@@ -198,6 +223,13 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
         Update::Write(Err(message)) => {
             *inflight = None;
             app.push_error(format!("could not write file: {message}"));
+        }
+        // A fetch always produces an outcome — a refused URL or an HTTP error is
+        // reported to the model as a result, so it can try something else.
+        Update::Fetch(outcome) => {
+            *inflight = None;
+            let messages = app.push_fetch_result(*outcome);
+            spawn_request(app, ctx, inflight, messages);
         }
     }
 }
@@ -280,6 +312,12 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
             spawn_request(app, ctx, inflight, messages);
             return;
         }
+        // Only reachable under `--confirm-fetch`; otherwise the dispatch parks
+        // the fetch rather than making it pending.
+        Action::Fetch { url } => {
+            spawn_fetch(app, ctx, inflight, url);
+            return;
+        }
         other => other,
     };
 
@@ -305,9 +343,13 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
                     .await
                     .map_err(|e| format!("{e:#}")),
             ),
-            // A Response is never approvable, a Read was handled above, and an
-            // Edit is converted to a Write by `approve`, so none are reachable.
-            Action::Read { .. } | Action::Edit { .. } | Action::Response(_) => return,
+            // A Response is never approvable, a Read and a Fetch were handled
+            // above, and an Edit is converted to a Write by `approve`, so none
+            // are reachable.
+            Action::Read { .. }
+            | Action::Fetch { .. }
+            | Action::Edit { .. }
+            | Action::Response(_) => return,
         };
         let _ = tx.send(Tagged { generation, update }).await;
     });
@@ -452,6 +494,31 @@ fn handle_key(
     }
 }
 
+/// Fetch a URL in the background.
+///
+/// Shared by the automatic path and the `--confirm-fetch` approval path. Unlike
+/// a read this cannot run inline: it is network I/O, so it needs the same
+/// generation tagging and cancel signal a command gets.
+fn spawn_fetch(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: String) {
+    let generation = app.next_generation();
+    let fetcher = ctx.fetcher.clone();
+    let tx = ctx.tx.clone();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+        let outcome = fetcher.fetch(&url, cancel).await;
+        let _ = tx
+            .send(Tagged {
+                generation,
+                update: Update::Fetch(Box::new(outcome)),
+            })
+            .await;
+    });
+    *inflight = Some(InFlight { cancel: cancel_tx });
+}
+
 fn spawn_request(
     app: &mut App,
     ctx: &Ctx,
@@ -459,6 +526,7 @@ fn spawn_request(
     messages: Vec<Message>,
 ) {
     let generation = app.next_generation();
+    app.mark_request_sent();
     let client = ctx.client.clone();
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();

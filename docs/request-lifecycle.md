@@ -123,6 +123,30 @@ Doing file I/O on the event loop is a deliberate trade: a read is capped at
 64 KB from local disk, which is far cheaper than the task spawning, channel
 plumbing, and generation tagging a background job would need.
 
+**(e) `<ai-harness-fetch>`** — the model wants to read a web page. Also
+auto-approved, but it cannot take the read's shortcut: it is network I/O, so it
+needs exactly the task spawning and generation tagging a read avoids. The
+dispatch therefore parks the URL in `App.pending_fetch` and returns `None`,
+which normally means "the loop pauses here". `handle_update` treats that `None`
+as a question rather than an answer: it calls `take_pending_fetch`, and on a hit
+runs `spawn_fetch`. That keeps every background task starting from the same
+place in the event loop, instead of giving `App` the ability to spawn.
+
+The safety argument is different from the read's, and lives in `src/fetch.rs`.
+A read is *more* confined than a shell command; a fetch cannot be, since it is
+an outbound request to a host the model chose. What bounds it is the
+destination: https only, and no address on this machine or this network. The
+address check is installed as the HTTP client's DNS resolver rather than run
+beforehand, because checking and then connecting leaves a rebinding race — the
+client resolves again at connect time, and a redirect resolves a fresh host.
+As the resolver it is the single point every hop must pass.
+
+Like a read, a refusal is data: a blocked URL or an HTTP error comes back as an
+`<ai-harness-fetch-result>` the model can react to, and counts against
+`iterations`. Unlike a read, the result carries a note telling the model the
+text is untrusted — it is the only result body written by neither the user nor
+the harness.
+
 ## 4. If it's a command, write, or edit: approval → execution → back to the model
 
 With the modal up, the keyboard is rerouted ([src/main.rs:210](../src/main.rs),
@@ -147,8 +171,8 @@ model** (step 2 again).
 A single prompt can bounce through **query → reply → read → result → reply →
 command → result → reply → …**, each hop a full round-trip, until the model
 finally emits an `<ai-harness-response>` — or the `iterations` cap stops it and
-returns control to you. Read hops pass through without pausing for you; command
-and write hops stop at the modal.
+returns control to you. Read and fetch hops pass through without pausing for
+you; command and write hops stop at the modal.
 
 The shape worth holding onto: **`push_response` is the hub.** Streaming, retries,
 the approval modal, and command results are all just different edges feeding back
@@ -202,5 +226,6 @@ cannot be run.
 | `src/openrouter.rs` | `open_stream` and SSE framing |
 | `src/exec.rs` / `src/sandbox.rs` | Sandboxed command execution |
 | `src/files.rs` | Path resolution and bounded reads for `<ai-harness-read>` |
+| `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Saving and loading sessions (`/save`, `/load`) |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |
