@@ -193,11 +193,32 @@ cannot inject) and the contents piped on stdin. A write outside the root is deni
 by the kernel and reported as an error, never an escape.
 
 By default every command, write, and edit is shown in an approval modal before it
-runs (a write shows its path and a bounded preview; an edit shows its path and a
-`-`/`+` diff). `←`/`→` move between Allow and Deny, `Enter` confirms, `y`/`n` are
+runs. `←`/`→` move between Allow and Deny, `Enter` confirms, `y`/`n` are
 shortcuts, and the buttons are clickable. Denial is reported to the model so it
 can propose something else. An edit is resolved against the file *before* the
 modal, so you are never asked to approve one that cannot apply.
+
+Writes and edits are shown as a diff, syntax-highlighted for the language the
+file extension implies:
+
+```
+rust · +1 -1
+  fn main() {
+-     println!("one");
++     println!("two");
+  }
+```
+
+Unchanged lines are kept for orientation and elided once they are far from
+anything that moved, so a one-line change in a large rewrite reads as a one-line
+change. A write is diffed against the file it replaces — the harness reads the
+target during pre-flight purely to show you this, which is not an
+`<ai-harness-read>` and is never shown to the model. A brand-new file has no
+"before", so it falls back to a bounded preview of what it will contain.
+
+The same block is used by the modal and the transcript, which matters most under
+`--auto-approve`: with no modal, the transcript is the only place a change is
+ever seen.
 
 `--auto-approve` (or `/auto` mid-session) skips the modal: actions run as soon as
 the model proposes them, still inside the sandbox. It is meant for a long
@@ -365,6 +386,8 @@ The prompt box grows downward from a fixed bottom edge as you add lines, up to
 | `src/exec.rs` | Running commands: timeout, process-group kill, output caps |
 | `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
 | `src/fetch.rs` | URL policy, fetching, and HTML-to-text for `<ai-harness-fetch>` |
+| `src/diff.rs` | Line-by-line diffs of writes and edits, bounded for storage |
+| `src/highlight.rs` | Language detection and tokenising for code blocks |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
 | `src/session.rs` | Saving and loading sessions to disk (`/save`, `/load`) |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |

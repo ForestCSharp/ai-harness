@@ -7,6 +7,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::{App, Choice, Direction, Entry, Pending, Status};
+use crate::diff::Change;
+use crate::highlight;
 use crate::protocol::Action;
 use crate::wrap;
 
@@ -207,6 +209,18 @@ fn draw_completions(
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// A modal body headed by the file path, which is the thing being decided about.
+fn path_then(path: &str, rest: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    std::iter::once(Line::from(Span::styled(
+        path.to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .chain(rest)
+    .collect()
+}
+
 /// The approval modal. Returns the Allow and Deny button areas so the event
 /// loop can hit-test mouse clicks against them.
 fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rect) {
@@ -238,30 +252,35 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
                     .add_modifier(Modifier::BOLD),
             ))],
         ),
+        // The same `code_block` the transcript uses, fed the same pre-flight
+        // diff, so what you approve and what you scroll back to cannot differ.
         Action::Write { path, contents } => (
             "The model wants to write:",
             " write this file? ",
-            std::iter::once(Line::from(Span::styled(
-                path.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .chain(preview_lines(contents, inner_width))
-            .collect(),
+            path_then(
+                path,
+                code_block(
+                    path,
+                    match &pending.diff {
+                        Some(changes) => CodeBody::Diff(changes),
+                        None => CodeBody::Contents(contents),
+                    },
+                    inner_width,
+                ),
+            ),
         ),
-        Action::Edit { path, old, new } => (
-            "The model wants to edit:",
-            " apply this edit? ",
-            std::iter::once(Line::from(Span::styled(
-                path.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .chain(diff_lines(old, new, inner_width))
-            .collect(),
-        ),
+        Action::Edit { path, old, new } => {
+            let changes = crate::diff::lines(old, new);
+            let body = match &changes {
+                Some(changes) => CodeBody::Diff(changes),
+                None => CodeBody::Contents(new),
+            };
+            (
+                "The model wants to edit:",
+                " apply this edit? ",
+                path_then(path, code_block(path, body, inner_width)),
+            )
+        }
         action => (
             "The model wants to run:",
             " run this command? ",
@@ -445,7 +464,11 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
             )));
             lines.extend(body_lines(content, Style::default(), width));
         }
-        Entry::Action { action, usage } => {
+        Entry::Action {
+            action,
+            usage,
+            diff,
+        } => {
             // Label the action type, since that is the whole point of the
             // protocol: the user should see which branch the model chose.
             let (label, colour) = match action {
@@ -493,13 +516,25 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                     lines.extend(body_lines(url, Style::default().fg(Color::Blue), width))
                 }
                 Action::Response(text) => lines.extend(body_lines(text, Style::default(), width)),
-                // A file could be huge; show a bounded preview, not the whole thing.
-                Action::Write { contents, .. } => {
-                    lines.extend(preview_lines(contents, width));
+                // A diff of what the write changes, when the pre-flight could
+                // read the file it replaces; otherwise a bounded preview of the
+                // new contents, which is all there is to show for a new file.
+                Action::Write { path, contents } => {
+                    let body = match diff {
+                        Some(changes) => CodeBody::Diff(changes),
+                        None => CodeBody::Contents(contents),
+                    };
+                    lines.extend(code_block(path, body, width));
                 }
-                // An edit reads as a diff: what goes, what comes.
-                Action::Edit { old, new, .. } => {
-                    lines.extend(diff_lines(old, new, width));
+                // An edit's diff comes from the spans in the action, so it needs
+                // nothing stored and nothing read.
+                Action::Edit { path, old, new } => {
+                    let changes = crate::diff::lines(old, new);
+                    let body = match &changes {
+                        Some(changes) => CodeBody::Diff(changes),
+                        None => CodeBody::Contents(new),
+                    };
+                    lines.extend(code_block(path, body, width));
                 }
             }
         }
@@ -677,88 +712,182 @@ fn body_lines(content: &str, style: Style, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// The first few lines of file contents, plus a size summary — so a large write
-/// never floods the transcript or the approval modal.
-fn preview_lines(contents: &str, width: usize) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let mut lines = vec![Line::from(Span::styled(
-        format!(
-            "{} line(s), {} bytes",
-            contents.lines().count(),
-            contents.len()
-        ),
-        dim.add_modifier(Modifier::ITALIC),
-    ))];
-    lines.extend(preview_body(contents, width));
-    lines
-}
-
-/// Just the bounded excerpt, for callers whose header already carries the size.
+/// A bounded excerpt of text with no file behind it — a read's contents, a
+/// fetched page — for callers whose own header already carries the size.
 fn preview_body(contents: &str, width: usize) -> Vec<Line<'static>> {
-    const MAX: usize = 8;
     let total = contents.lines().count();
     let dim = Style::default().fg(Color::DarkGray);
 
     let mut lines: Vec<Line> = Vec::new();
-    for line in contents.lines().take(MAX) {
+    for line in contents.lines().take(MAX_PREVIEW) {
         lines.extend(body_lines(line, dim, width));
     }
-    if total > MAX {
-        lines.push(Line::from(Span::styled(
-            format!("… {} more line(s)", total - MAX),
-            dim.add_modifier(Modifier::ITALIC),
-        )));
+    if total > MAX_PREVIEW {
+        lines.push(elision(total - MAX_PREVIEW, "more"));
     }
     lines
 }
 
-/// A unified diff of an edit: removed lines in red with `-`, added lines in
-/// green with `+`. Each side is capped like a preview so a large edit never
-/// blows up the modal or the transcript.
-fn diff_lines(old: &str, new: &str, width: usize) -> Vec<Line<'static>> {
-    const MAX: usize = 6;
+/// What a code block is showing.
+enum CodeBody<'a> {
+    /// File contents with nothing to compare against — a new file, or one that
+    /// could not be read. Bounded, so a large write never floods the transcript.
+    Contents(&'a str),
+    Diff(&'a [Change]),
+}
 
-    fn side(text: &str, marker: char, colour: Color, width: usize, lines: &mut Vec<Line<'static>>) {
-        // Line up wrapped continuations under the text, not the marker.
-        let cont = "  ";
-        let inner = width.saturating_sub(2).max(1);
-        let total = text.lines().count();
-        for line in text.lines().take(MAX) {
-            let wrapped = wrap::text(line, inner);
-            for (i, row) in wrapped.into_iter().enumerate() {
-                let prefix = if i == 0 {
-                    format!("{marker} ")
-                } else {
-                    cont.to_string()
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("{prefix}{row}"),
-                    Style::default().fg(colour),
-                )));
+/// Lines beyond which plain contents are elided. A diff arrives already bounded
+/// by [`crate::diff`], which has to cap it anyway to keep session files small.
+const MAX_PREVIEW: usize = 8;
+
+/// Width of the `+ ` / `- ` gutter, and of the indent wrapped rows sit under.
+const GUTTER: usize = 2;
+
+/// Render file contents or a diff as a labelled, syntax-highlighted block.
+///
+/// The language comes from the path, so the same function serves the modal and
+/// the transcript and they cannot drift apart.
+fn code_block(path: &str, body: CodeBody<'_>, width: usize) -> Vec<Line<'static>> {
+    let lang = highlight::detect(path);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+
+    let summary = match &body {
+        CodeBody::Contents(contents) => format!("{} line(s)", contents.lines().count()),
+        CodeBody::Diff(changes) => {
+            let (added, removed) = crate::diff::summary(changes);
+            format!("+{added} -{removed}")
+        }
+    };
+    lines.push(Line::from(Span::styled(
+        format!("{} · {summary}", highlight::label(lang)),
+        dim.add_modifier(Modifier::ITALIC),
+    )));
+
+    match body {
+        CodeBody::Contents(contents) => {
+            let total = contents.lines().count();
+            for line in contents.lines().take(MAX_PREVIEW) {
+                lines.extend(code_line(line, lang, ' ', None, width));
+            }
+            if total > MAX_PREVIEW {
+                lines.push(elision(total - MAX_PREVIEW, "more"));
             }
         }
-        if total > MAX {
-            lines.push(Line::from(Span::styled(
-                format!("{marker} … {} more line(s)", total - MAX),
-                Style::default().fg(colour).add_modifier(Modifier::ITALIC),
-            )));
+        CodeBody::Diff(changes) => {
+            for change in changes {
+                match change {
+                    Change::Context(text) => lines.extend(code_line(text, lang, ' ', None, width)),
+                    Change::Removed(text) => {
+                        lines.extend(code_line(text, lang, '-', Some(Color::Red), width))
+                    }
+                    Change::Added(text) => {
+                        lines.extend(code_line(text, lang, '+', Some(Color::Green), width))
+                    }
+                    Change::Elided(n) => lines.push(elision(*n, "unchanged")),
+                }
+            }
         }
     }
-
-    let mut lines = Vec::new();
-    side(old, '-', Color::Red, width, &mut lines);
-    // An empty replacement is a deletion; say so rather than showing nothing.
-    if new.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "+ (deleted)",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::ITALIC),
-        )));
-    } else {
-        side(new, '+', Color::Green, width, &mut lines);
-    }
     lines
+}
+
+fn elision(count: usize, what: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  ⋯ {count} {what} line(s)"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// One source line: a gutter marker, then the line highlighted and wrapped.
+///
+/// `marker_colour` is `Some` for a changed line, which also tints the row so the
+/// change reads at a glance without painting over the syntax colours — those are
+/// most worth reading on exactly the lines that changed.
+fn code_line(
+    text: &str,
+    lang: highlight::Language,
+    marker: char,
+    marker_colour: Option<Color>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(GUTTER).max(1);
+    let spans = highlight::spans(text, lang);
+    let tint = marker_colour.map(|c| Style::default().bg(tinted(c)));
+
+    // `wrap::line` rather than `wrap::text`: its rows carry the byte offset they
+    // start at, which is what lets a highlight run be split across a wrap
+    // boundary and keep its colour on both halves.
+    let rows = wrap::line(text, inner);
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let gutter = if i == 0 {
+            format!("{marker} ")
+        } else {
+            " ".repeat(GUTTER)
+        };
+        let mut rendered = vec![Span::styled(
+            gutter,
+            match marker_colour {
+                Some(colour) => Style::default().fg(colour).add_modifier(Modifier::BOLD),
+                None => Style::default().fg(Color::DarkGray),
+            },
+        )];
+        rendered.extend(highlighted(&row.text, row.start, &spans, tint));
+        out.push(Line::from(rendered));
+    }
+    out
+}
+
+/// Slice the line's highlight runs down to the piece of it this row holds.
+fn highlighted(
+    row: &str,
+    start: usize,
+    spans: &[(std::ops::Range<usize>, highlight::Token)],
+    tint: Option<Style>,
+) -> Vec<Span<'static>> {
+    let end = start + row.len();
+    let base = tint.unwrap_or_default();
+    let mut out = Vec::new();
+    for (range, token) in spans {
+        // The overlap between this run and this row, in source coordinates.
+        let (from, to) = (range.start.max(start), range.end.min(end));
+        if from >= to {
+            continue;
+        }
+        out.push(Span::styled(
+            row[from - start..to - start].to_string(),
+            base.fg(token_colour(*token)),
+        ));
+    }
+    // A blank row still has to occupy its line, and a tinted one has to show its
+    // tint across the full width rather than collapsing to nothing.
+    if out.is_empty() {
+        out.push(Span::styled(row.to_string(), base));
+    }
+    out
+}
+
+/// Red and green belong to the diff gutter, so no syntax token may claim them.
+fn token_colour(token: highlight::Token) -> Color {
+    match token {
+        highlight::Token::Comment => Color::DarkGray,
+        highlight::Token::Str => Color::Yellow,
+        highlight::Token::Number => Color::Magenta,
+        highlight::Token::Keyword => Color::Cyan,
+        highlight::Token::Plain => Color::Reset,
+    }
+}
+
+/// A background dark enough to sit behind ordinary foreground colours. Indexed
+/// rather than RGB so it degrades sensibly on a 256-colour terminal.
+fn tinted(colour: Color) -> Color {
+    match colour {
+        Color::Red => Color::Indexed(52),
+        _ => Color::Indexed(22),
+    }
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -1054,6 +1183,7 @@ mod tests {
                 path: "src/app.rs".into(),
             },
             usage: None,
+            diff: None,
         });
         app.transcript
             .push(Entry::ReadResult(crate::files::ReadOutcome {
@@ -1080,6 +1210,7 @@ mod tests {
                 url: "https://example.com/docs".into(),
             },
             usage: None,
+            diff: None,
         });
         app.transcript
             .push(Entry::FetchResult(Box::new(crate::fetch::FetchOutcome {
@@ -1209,6 +1340,7 @@ mod tests {
                 new: "let x = 2;".into(),
             },
             usage: None,
+            diff: None,
         });
 
         let (rows, _) = render(&mut app, 70, 16);
@@ -1263,7 +1395,142 @@ mod tests {
     }
 
     #[test]
-    fn a_deletion_edit_says_deleted_in_the_diff() {
+    fn a_code_block_is_labelled_with_the_detected_language() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Write {
+                path: "src/lib.rs".into(),
+                contents: "fn main() {}\n".into(),
+            },
+            usage: None,
+            diff: None,
+        });
+        let (rows, _) = render(&mut app, 70, 12);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("rust"), "missing language label:\n{screen}");
+        assert!(screen.contains("1 line(s)"), "missing summary:\n{screen}");
+    }
+
+    #[test]
+    fn an_edit_shows_unchanged_neighbours_as_context() {
+        // The whole point of the diff: five lines in, one changed. The four
+        // that did not change must not appear as removals and additions.
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Edit {
+                path: "m.rs".into(),
+                old: "a\nb\nOLD\nd\ne".into(),
+                new: "a\nb\nNEW\nd\ne".into(),
+            },
+            usage: None,
+            diff: None,
+        });
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("+1 -1"), "one line each way:\n{screen}");
+        assert!(screen.contains("- OLD"), "{screen}");
+        assert!(screen.contains("+ NEW"), "{screen}");
+        for unchanged in ["a", "b", "d", "e"] {
+            assert!(
+                !screen.contains(&format!("- {unchanged}")),
+                "{unchanged} did not change but is shown as removed:\n{screen}"
+            );
+            assert!(
+                !screen.contains(&format!("+ {unchanged}")),
+                "{unchanged} did not change but is shown as added:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_over_an_existing_file_renders_its_diff() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Write {
+                path: "conf.json".into(),
+                contents: "{\n  \"n\": 2\n}\n".into(),
+            },
+            usage: None,
+            diff: crate::diff::lines("{\n  \"n\": 1\n}\n", "{\n  \"n\": 2\n}\n"),
+        });
+
+        let (rows, _) = render(&mut app, 70, 16);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("json"), "missing language label:\n{screen}");
+        assert!(screen.contains("+1 -1"), "missing summary:\n{screen}");
+        // Marked in the gutter, with the source line's own indentation intact.
+        let marked = |marker: char, text: &str| {
+            screen.lines().any(|l| {
+                l.trim_start().trim_start_matches('│').starts_with(marker) && l.contains(text)
+            })
+        };
+        assert!(marked('-', r#""n": 1"#), "{screen}");
+        assert!(marked('+', r#""n": 2"#), "{screen}");
+    }
+
+    #[test]
+    fn a_token_split_across_a_wrap_boundary_keeps_its_colour() {
+        // The reason this uses `wrap::line` and its byte offsets rather than
+        // `wrap::text`: a long string literal wraps, and both halves must still
+        // read as a string.
+        let line = r#"let s = "aaaaaaaaaabbbbbbbbbb";"#;
+        let spans = highlight::spans(line, highlight::Language::Rust);
+        let rows = wrap::line(line, 16);
+        assert!(
+            rows.len() > 1,
+            "the line should wrap for this to mean anything"
+        );
+
+        let string_colour = token_colour(highlight::Token::Str);
+        let mut halves = 0;
+        for row in &rows {
+            for span in highlighted(&row.text, row.start, &spans, None) {
+                if span.style.fg == Some(string_colour) {
+                    halves += 1;
+                    assert!(
+                        span.content.contains('a') || span.content.contains('b'),
+                        "only the literal should be string-coloured: {span:?}"
+                    );
+                }
+            }
+        }
+        assert!(halves >= 2, "the literal should be coloured on both rows");
+
+        // And the rows still reconstruct the original line exactly.
+        let rebuilt: String = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(rebuilt, line);
+    }
+
+    #[test]
+    fn a_code_block_never_overflows_its_width() {
+        // Highlighting splits a line into spans; the gutter and the wrap width
+        // have to stay in agreement or long lines spill past the edge.
+        let long = format!("let s = \"{}\"; // {}", "x".repeat(120), "y".repeat(80));
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Edit {
+                path: "m.rs".into(),
+                old: long.clone(),
+                new: format!("{long} more"),
+            },
+            usage: None,
+            diff: None,
+        });
+
+        for width in [40u16, 55, 80] {
+            let (rows, _) = render(&mut app, width, 40);
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "row overflows {width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_deletion_edit_shows_removals_and_nothing_added() {
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.transcript.push(Entry::Action {
             action: crate::protocol::Action::Edit {
@@ -1272,6 +1539,7 @@ mod tests {
                 new: String::new(),
             },
             usage: None,
+            diff: None,
         });
         let (rows, _) = render(&mut app, 60, 12);
         let screen = transcript_only(&rows);
@@ -1279,9 +1547,11 @@ mod tests {
             screen.contains("- remove me"),
             "missing removed line:\n{screen}"
         );
+        // The header carries what the old "(deleted)" marker used to: a diff
+        // with removals and no additions is a deletion, and says so by counting.
         assert!(
-            screen.contains("(deleted)"),
-            "missing deletion marker:\n{screen}"
+            screen.contains("+0 -1"),
+            "the summary should show nothing added:\n{screen}"
         );
     }
 

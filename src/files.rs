@@ -168,14 +168,13 @@ pub struct EditPlan {
     pub new_len: usize,
 }
 
-/// Resolve an edit against the file on disk, replacing the single occurrence of
-/// `old` with `new`.
+/// Read a whole file, bounded by [`MAX_EDIT_BYTES`].
 ///
-/// Reads the *whole* file (not the truncating [`read`]) because the result is
-/// written back in full — a truncated read would silently drop the tail. Every
-/// failure is a message the model can act on: the match must exist and be
-/// unique, and the fix for each case is spelled out.
-pub fn plan_edit(sandbox: &Sandbox, path: &str, old: &str, new: &str) -> Result<EditPlan, String> {
+/// Unlike [`read`], which truncates for the model, this returns the file or
+/// nothing: its callers either write the result back or diff against it, and a
+/// silently truncated read would drop the tail either way. Every failure is a
+/// message the caller can hand to the model or discard.
+pub fn read_all(sandbox: &Sandbox, path: &str) -> Result<String, String> {
     let resolved = resolve(sandbox, path)?;
     if resolved.is_dir() {
         return Err(format!("{path} is a directory, not a file"));
@@ -189,8 +188,17 @@ pub fn plan_edit(sandbox: &Sandbox, path: &str, old: &str, new: &str) -> Result<
             "{path} is too large to edit in place; change it with a shell command instead"
         ));
     }
-    let contents = std::fs::read_to_string(&resolved)
-        .map_err(|_| format!("{path} is not UTF-8 text and cannot be edited this way"))?;
+    std::fs::read_to_string(&resolved)
+        .map_err(|_| format!("{path} is not UTF-8 text and cannot be edited this way"))
+}
+
+/// Resolve an edit against the file on disk, replacing the single occurrence of
+/// `old` with `new`.
+///
+/// Every failure is a message the model can act on: the match must exist and be
+/// unique, and the fix for each case is spelled out.
+pub fn plan_edit(sandbox: &Sandbox, path: &str, old: &str, new: &str) -> Result<EditPlan, String> {
+    let contents = read_all(sandbox, path)?;
 
     match contents.matches(old).count() {
         0 => Err(format!(
@@ -449,5 +457,47 @@ mod tests {
         std::fs::write(dir.join("big.txt"), &big).unwrap();
         let err = plan_edit(&sandbox, "big.txt", "x", "y").unwrap_err();
         assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn read_all_returns_the_whole_file_untruncated() {
+        // Unlike `read`, which bounds what the model sees: this one's callers
+        // write the result back or diff against it, so a silent truncation
+        // would drop the tail either way.
+        let (sandbox, dir) = sandbox_in("read-all");
+        let body = "line\n".repeat(MAX_READ_BYTES / 2);
+        std::fs::write(dir.join("long.txt"), &body).unwrap();
+
+        assert_eq!(read_all(&sandbox, "long.txt").unwrap(), body);
+    }
+
+    #[test]
+    fn read_all_refuses_what_it_cannot_return_whole() {
+        let (sandbox, dir) = sandbox_in("read-all-refusals");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("b.bin"), [0xFF, 0xFE]).unwrap();
+        std::fs::write(dir.join("big.txt"), "x".repeat(MAX_EDIT_BYTES as usize + 1)).unwrap();
+
+        assert!(read_all(&sandbox, "sub").unwrap_err().contains("directory"));
+        assert!(
+            read_all(&sandbox, "b.bin")
+                .unwrap_err()
+                .contains("not UTF-8")
+        );
+        assert!(
+            read_all(&sandbox, "big.txt")
+                .unwrap_err()
+                .contains("too large")
+        );
+        assert!(read_all(&sandbox, "nope.txt").is_err());
+    }
+
+    #[test]
+    fn read_all_cannot_escape_the_sandbox() {
+        // It shares `resolve` with every other read, so a write's pre-flight
+        // diff is confined exactly as `<ai-harness-read>` is.
+        let (sandbox, _dir) = sandbox_in("read-all-escape");
+        assert!(read_all(&sandbox, "../outside.txt").is_err());
+        assert!(read_all(&sandbox, "/etc/hosts").is_err());
     }
 }

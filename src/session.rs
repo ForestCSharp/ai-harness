@@ -184,6 +184,7 @@ mod tests {
                         prompt_tokens: 3,
                         completion_tokens: 1,
                     }),
+                    diff: None,
                 },
             ],
             vec!["hi".into()],
@@ -213,6 +214,7 @@ mod tests {
             Entry::Action {
                 action: Action::Shell("ls".into()),
                 usage: None,
+                diff: None,
             },
             Entry::Malformed {
                 reason: "bad".into(),

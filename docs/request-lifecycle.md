@@ -124,6 +124,23 @@ prepared full rewrite is stashed in `Pending.edit_plan` and the modal shows a
 execution reuses the write path entirely — the file is not re-read after you
 approve, so the bytes that land are exactly the ones the diff showed.
 
+A **write** now has a pre-flight of its own, for a different reason. `App::diff_against_disk`
+reads the target through the same `files::read_all` and diffs the proposed
+contents against it, so a full rewrite shows what changes rather than what it
+contains. Three things about it are deliberate:
+
+- It is a **display** read. Not an `<ai-harness-read>`: it is never shown to the
+  model, costs no iteration, and `--confirm-reads` does not gate it. It goes
+  through `files::resolve`, so it is confined exactly as a read is.
+- It **cannot fail the write**. A new file, an unreadable one, one past
+  `MAX_EDIT_BYTES` — each just means no diff, and the renderer falls back to a
+  bounded preview. None of them is an error worth reporting.
+- The diff is computed **once**, here, and stored on both `Pending` and the
+  `Entry::Action`. Rendering is pure and repeats every frame, and by the time the
+  transcript is re-rendered the write has landed — "diff against the file" would
+  no longer mean what it meant when you needed to see it. Storing it also keeps
+  the modal and the scrollback showing one computation rather than two.
+
 **(d) `<ai-harness-read>`** — the model wants to see a file. This one never
 reaches the modal. `perform_read` runs `files::read` **synchronously, right
 here**, pushes an `Entry::ReadResult`, appends `<ai-harness-read-result>` to
@@ -273,6 +290,8 @@ cannot be run.
 | `src/openrouter.rs` | `open_stream` and SSE framing |
 | `src/exec.rs` / `src/sandbox.rs` | Sandboxed command execution |
 | `src/files.rs` | Path resolution and bounded reads for `<ai-harness-read>` |
+| `src/diff.rs` | Line-by-line diffs of a write or edit, bounded for storage |
+| `src/highlight.rs` | Language detection and per-line tokenising for code blocks |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Saving and loading sessions (`/save`, `/load`) |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

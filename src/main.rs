@@ -1,9 +1,11 @@
 mod app;
 mod command;
 mod config;
+mod diff;
 mod exec;
 mod fetch;
 mod files;
+mod highlight;
 mod input;
 mod ledger;
 mod openrouter;

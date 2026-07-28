@@ -23,6 +23,19 @@ pub enum Entry {
     Action {
         action: Action,
         usage: Option<Usage>,
+        /// For a write, the diff against the file as it was beforehand.
+        ///
+        /// Stored rather than computed at render time because rendering is pure
+        /// and repeats every frame, and because by the time this is re-rendered
+        /// the write has landed — "diff against the file" no longer means what
+        /// it meant when the user needed to see it. An edit needs nothing here:
+        /// its diff comes from the two spans in the action itself.
+        ///
+        /// `serde(default)` and no `session::VERSION` bump, the same way
+        /// `Session::ledger` was added: absent in older files, ignored by older
+        /// builds.
+        #[serde(default)]
+        diff: Option<Vec<crate::diff::Change>>,
     },
     /// A reply that reached us but violated the protocol. `raw` is kept so the
     /// user can see exactly what the model said.
@@ -95,6 +108,9 @@ pub struct Pending {
     /// becomes the write that actually runs, so the diff the user saw is exactly
     /// what lands. `None` for every other action.
     pub edit_plan: Option<crate::files::EditPlan>,
+    /// For a write, the same diff stored on the transcript entry, so the modal
+    /// and the scrollback show one computation rather than two.
+    pub diff: Option<Vec<crate::diff::Change>>,
 }
 
 /// The `/load` session picker overlay. A UI overlay, not a conversation status:
@@ -788,9 +804,17 @@ impl App {
             self.history.truncate(anchor);
         }
         self.history.push(Message::assistant(content));
+        // A write's diff needs the file as it is *now*, so it has to be computed
+        // before the write runs — and once, since the transcript re-renders long
+        // afterwards. Both the entry and the modal below get this same value.
+        let write_diff = match &action {
+            Action::Write { path, contents } => self.diff_against_disk(path, contents),
+            _ => None,
+        };
         self.transcript.push(Entry::Action {
             action: action.clone(),
             usage,
+            diff: write_diff.clone(),
         });
 
         match action {
@@ -832,6 +856,7 @@ impl App {
                             action: Action::Edit { path, old, new },
                             selected: Choice::Allow,
                             edit_plan: Some(plan),
+                            diff: None,
                         });
                     }
                     Err(message) => return Some(self.push_edit_failure(&path, message)),
@@ -843,10 +868,27 @@ impl App {
                     action: other,
                     selected: Choice::Allow,
                     edit_plan: None,
+                    diff: write_diff,
                 });
             }
         }
         None
+    }
+
+    /// Diff a proposed write against the file it will replace.
+    ///
+    /// `None` when there is nothing to compare — a new file, an unreadable or
+    /// oversized one — and the caller falls back to previewing the new contents.
+    /// Every one of those is an ordinary case, not an error worth reporting: the
+    /// write itself is unaffected either way.
+    ///
+    /// This is a harness-internal read for display, not an `<ai-harness-read>`
+    /// action: it is not gated by `--confirm-reads`, costs no iteration, and is
+    /// never shown to the model. It is confined exactly as a read is, since it
+    /// goes through the same `files::resolve`.
+    fn diff_against_disk(&self, path: &str, contents: &str) -> Option<Vec<crate::diff::Change>> {
+        let before = crate::files::read_all(self.sandbox.as_ref()?, path).ok()?;
+        crate::diff::lines(&before, contents)
     }
 
     /// Report a pre-flight edit failure to the model. An edit runs as a write, so
@@ -3333,5 +3375,82 @@ mod file_tests {
             "let x = 1;\n",
             "the edit must not hit disk until the sandboxed write runs"
         );
+    }
+
+    fn write_reply(path: &str, contents: &str) -> String {
+        format!("<ai-harness-write file={path}>\n{contents}</ai-harness-write>")
+    }
+
+    /// The diff stored on the newest `Entry::Action`.
+    fn stored_diff(app: &App) -> Option<Vec<crate::diff::Change>> {
+        match last_visible(app) {
+            Entry::Action { diff, .. } => diff.clone(),
+            other => panic!("expected an action entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_write_over_an_existing_file_is_diffed_against_it() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "a\nOLD\nc\n")]);
+        app.push_response(write_reply("m.rs", "a\nNEW\nc\n"), None);
+
+        let changes = stored_diff(&app).expect("an existing file should be diffed");
+        assert!(changes.contains(&crate::diff::Change::Removed("OLD".into())));
+        assert!(changes.contains(&crate::diff::Change::Added("NEW".into())));
+        assert!(
+            changes.contains(&crate::diff::Change::Context("a".into())),
+            "unchanged lines stay as context: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn the_modal_and_the_transcript_share_one_diff() {
+        // Computed once: showing the user one thing to approve and a different
+        // thing in scrollback would be the worst available outcome.
+        let (mut app, _dir) = app_with_files(&[("m.rs", "a\nOLD\n")]);
+        app.push_response(write_reply("m.rs", "a\nNEW\n"), None);
+
+        let pending = app.pending().expect("a write waits for approval");
+        assert_eq!(pending.diff, stored_diff(&app));
+        assert!(pending.diff.is_some());
+    }
+
+    #[test]
+    fn a_write_of_a_new_file_has_nothing_to_diff_against() {
+        // Not an error — there is simply no "before", and the renderer falls
+        // back to previewing the contents.
+        let (mut app, _dir) = app_with_files(&[]);
+        app.push_response(write_reply("fresh.rs", "a\nb\n"), None);
+
+        assert_eq!(stored_diff(&app), None);
+    }
+
+    #[test]
+    fn the_pre_flight_diff_does_not_disturb_the_turn() {
+        // It is a display read: it must not count an iteration, send anything to
+        // the model, or stop the write from being proposed.
+        let (mut app, _dir) = app_with_files(&[("m.rs", "a\n")]);
+        let before = app.iterations;
+        let sent = app.push_response(write_reply("m.rs", "b\n"), None);
+
+        assert!(sent.is_none(), "nothing is sent until the write runs");
+        assert_eq!(app.iterations, before + 1, "one round-trip, not two");
+        assert!(app.pending().is_some(), "the write still awaits approval");
+    }
+
+    #[test]
+    fn a_stored_diff_survives_a_session_round_trip() {
+        let (mut app, dir) = app_with_files(&[("m.rs", "a\nOLD\n")]);
+        app.push_response(write_reply("m.rs", "a\nNEW\n"), None);
+        let original = stored_diff(&app);
+
+        let session = app.to_session();
+        let json = serde_json::to_string(&session).unwrap();
+        let loaded: crate::session::Session = serde_json::from_str(&json).unwrap();
+
+        let mut reloaded = App::new("m".into(), None, 10, dir.join("sessions"));
+        reloaded.apply_session(loaded);
+        assert_eq!(stored_diff(&reloaded), original);
+        assert!(original.is_some());
     }
 }
