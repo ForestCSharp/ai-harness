@@ -123,6 +123,7 @@ Commands are handled locally and never sent to the model.
 | Command | Action |
 | --- | --- |
 | `/debug` | Toggle showing the raw protocol sent and received |
+| `/auto` | Toggle running actions without the approval modal (see [Sandboxing](#sandboxing)) |
 | `/clear` | Clear the conversation, keeping the system prompt |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -191,12 +192,20 @@ the sandbox with the path passed as an argv element (never shell text, so it
 cannot inject) and the contents piped on stdin. A write outside the root is denied
 by the kernel and reported as an error, never an escape.
 
-Every command, write, and edit is shown in an approval modal before it runs (a
-write shows its path and a bounded preview; an edit shows its path and a `-`/`+`
-diff). `←`/`→` move between Allow and Deny, `Enter` confirms, `y`/`n` are
+By default every command, write, and edit is shown in an approval modal before it
+runs (a write shows its path and a bounded preview; an edit shows its path and a
+`-`/`+` diff). `←`/`→` move between Allow and Deny, `Enter` confirms, `y`/`n` are
 shortcuts, and the buttons are clickable. Denial is reported to the model so it
 can propose something else. An edit is resolved against the file *before* the
 modal, so you are never asked to approve one that cannot apply.
+
+`--auto-approve` (or `/auto` mid-session) skips the modal: actions run as soon as
+the model proposes them, still inside the sandbox. It is meant for a long
+unattended task, where a twenty-step refactor is otherwise twenty keypresses. The
+transcript still records every action and its result, so you review after the fact
+instead of before it, a red `auto-approve` marker sits in the status bar for as
+long as the mode is on, and `Esc` still cancels whatever is running. **Read the
+paragraph below on what it gives up before leaving it on.**
 
 The agentic loop is bounded by `--max-iterations` so a model that keeps proposing
 actions cannot spin forever; reads and edits count against it like anything else.
@@ -219,8 +228,19 @@ before you leave it auto-approved:
 - **It does not bound what a page says.** Fetched text lands in the model's
   context, and a page can try to instruct it. The result is labelled as
   untrusted when it is handed over, but what actually contains this is
-  structural: shell, write, and edit still require approval, so a page can
-  persuade the model to *propose* something, not to do it.
+  structural: by default shell, write, and edit still require approval, so a
+  page can persuade the model to *propose* something, not to do it. **This is
+  the containment `--auto-approve` removes** — see below.
+
+What auto-approve costs, stated plainly: the modal is the structural check in the
+paragraph above. With it off, a fetched page that talks the model into proposing a
+command gets that command run, inside the sandbox, with nobody asked. The sandbox
+still bounds *where* a command can reach; it never bounded *whether* it runs —
+that was the modal's job. Nor does the sandbox protect the working directory
+itself: it is the root commands are confined *to*, so an auto-approved `rm -rf .`
+is inside the boundary, not outside it. Use the mode on a tree you can restore
+from git, and prefer `--confirm-fetch` alongside it if the task involves reading
+the web.
 
 Non-macOS platforms fail closed at startup rather than running commands
 unsandboxed.
@@ -286,6 +306,9 @@ Other flags: `--workdir` sets the sandbox root (default: cwd),
 `--command-timeout` the per-command limit in seconds, `--max-iterations` the
 agentic loop bound, `--confirm-reads` puts file reads behind the approval modal
 along with everything else, and `--confirm-fetch` does the same for URL fetches.
+`--auto-approve` goes the other way and removes the modal entirely — read
+[Sandboxing](#sandboxing) first. Every flag also has an environment variable
+(`AI_HARNESS_AUTO_APPROVE`, and so on).
 
 ## Keys
 

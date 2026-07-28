@@ -153,6 +153,13 @@ pub struct App {
     /// because the risks differ: a read is confined to the working directory,
     /// while a fetch is an outbound request to a host the model chose.
     pub confirm_fetches: bool,
+    /// When true, an approvable action runs without the modal.
+    ///
+    /// Read but never acted on here: this type still parks a `Pending` exactly
+    /// as it does with the mode off, and the event loop decides to approve it.
+    /// Keeping the decision in `main` is what keeps every approval flowing
+    /// through one `allow`, and `App` unable to start work of its own.
+    pub auto_approve: bool,
     /// A fetch the dispatch approved but that `main` still has to spawn.
     ///
     /// Reads run inline because they are synchronous; a fetch is network I/O
@@ -240,6 +247,7 @@ impl App {
             sandbox: None,
             confirm_reads: false,
             confirm_fetches: false,
+            auto_approve: false,
             pending_fetch: None,
             ledger: Ledger::default(),
             price_in: None,
@@ -366,6 +374,9 @@ impl App {
         // A parked fetch has not been spawned yet, so dropping it here is all
         // that is needed; a spawned one is stopped by its cancel signal.
         self.pending_fetch = None;
+        // Cancelling out of a retry loop abandons the turn, so the failed
+        // attempts should leave no more behind than giving up on them does.
+        self.roll_back_retries();
         self.mark_request_done();
         // A fresh generation means any update still queued from the abandoned
         // task will be recognised as stale and dropped.
@@ -455,6 +466,18 @@ impl App {
                 self.debug = !self.debug;
                 let state = if self.debug { "on" } else { "off" };
                 self.push_notice(format!("Debug mode {state}."));
+            }
+            Command::Auto => {
+                self.auto_approve = !self.auto_approve;
+                // Say what the mode means, not just that it changed: "on" is
+                // not self-explanatory for a toggle that decides whether things
+                // run without being asked about.
+                let state = if self.auto_approve {
+                    "on — actions run without asking, inside the sandbox"
+                } else {
+                    "off — actions wait for approval"
+                };
+                self.push_notice(format!("Auto-approve {state}."));
             }
             Command::Help => self.push_notice(crate::command::help_text()),
             Command::Clear => self.reset_conversation(),
@@ -756,7 +779,14 @@ impl App {
         // Only a valid reply counts as progress against the loop budget.
         self.iterations += 1;
         self.retries = 0;
-        self.retry_anchor = None;
+        // Recovering from a retry rolls the failed attempts out of context, the
+        // same as giving up does. Nothing in a malformed exchange ever ran — a
+        // rejected reply never reaches the dispatch below — so there is nothing
+        // to preserve, and leaving the model's own bad output behind both
+        // invites a repeat and keeps whatever it invented available to quote.
+        if let Some(anchor) = self.retry_anchor.take() {
+            self.history.truncate(anchor);
+        }
         self.history.push(Message::assistant(content));
         self.transcript.push(Entry::Action {
             action: action.clone(),
@@ -854,6 +884,31 @@ impl App {
         self.history.clone()
     }
 
+    /// Roll an abandoned retry loop out of context, back to where history was
+    /// last clean. A no-op if no retry is in progress.
+    ///
+    /// Leaving the model's own malformed output behind makes repeating it more
+    /// likely, and anything it invented in that output stays available for it to
+    /// quote as fact. The transcript still shows what happened, so nothing is
+    /// hidden from the user — only from the model.
+    fn roll_back_retries(&mut self) {
+        let Some(anchor) = self.retry_anchor.take() else {
+            return;
+        };
+        self.history.truncate(anchor);
+        // Drop the trailing user turn too, matching `push_error`, so history
+        // ends on an assistant turn rather than two adjacent user turns.
+        if matches!(
+            self.history.last(),
+            Some(Message {
+                role: crate::openrouter::Role::User,
+                ..
+            })
+        ) {
+            self.history.pop();
+        }
+    }
+
     /// Ask the model to try again after a protocol violation, or give up.
     fn retry_after(
         &mut self,
@@ -871,23 +926,7 @@ impl App {
         });
 
         if self.retries > self.max_retries {
-            // Roll the whole failed exchange out of context. Leaving the model's
-            // own malformed output behind makes repeating it more likely, and
-            // the transcript still shows what happened.
-            if let Some(anchor) = self.retry_anchor.take() {
-                self.history.truncate(anchor);
-            }
-            // Drop the trailing user turn too, matching `push_error`, so history
-            // ends on an assistant turn rather than two adjacent user turns.
-            if matches!(
-                self.history.last(),
-                Some(Message {
-                    role: crate::openrouter::Role::User,
-                    ..
-                })
-            ) {
-                self.history.pop();
-            }
+            self.roll_back_retries();
             self.retries = 0;
             self.status = Status::Idle;
             self.transcript.push(Entry::Error(format!(
@@ -898,8 +937,13 @@ impl App {
         }
 
         // Keep the bad reply plus a targeted correction, so the model can see
-        // what it did and what was wrong with it.
-        self.history.push(Message::assistant(content));
+        // what it did and what was wrong with it — but with any result element
+        // it wrote for itself elided. Sending an invented result back verbatim
+        // would make it context the model answers from, which is the failure
+        // the rejection exists to stop. The transcript above keeps the raw text,
+        // so the user still sees exactly what came back.
+        self.history
+            .push(Message::assistant(protocol::elide_results(&content)));
         let correction = protocol::encode_correction(&error);
         self.frame(Direction::Sent, correction.clone());
         self.history.push(Message::user(correction));
@@ -1251,6 +1295,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn approval_is_required_unless_auto_approve_is_asked_for() {
+        let app = App::new("m".into(), None, 10, std::env::temp_dir());
+        assert!(!app.auto_approve, "acting without asking must be opt-in");
+    }
+
+    #[test]
+    fn the_auto_command_toggles_the_mode_and_says_what_it_means() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+
+        app.run_command(Command::Auto);
+        assert!(app.auto_approve);
+        match last_visible(&app) {
+            Entry::Notice(text) => assert!(
+                text.contains("without asking"),
+                "\"on\" alone does not say what the mode does: {text}"
+            ),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+
+        app.run_command(Command::Auto);
+        assert!(!app.auto_approve, "the toggle must go both ways");
+        match last_visible(&app) {
+            Entry::Notice(text) => assert!(text.contains("wait for approval"), "{text}"),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_approve_still_parks_the_action_rather_than_approving_it_here() {
+        // The mode belongs to the event loop, which is the only layer that can
+        // spawn work. If this ever starts returning messages or clearing the
+        // pending action, the approval path has been duplicated.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.auto_approve = true;
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+
+        let sent = app.push_response("<ai-harness-shell>ls</ai-harness-shell>".into(), None);
+        assert!(sent.is_none(), "nothing is sent until the command has run");
+        match app.pending() {
+            Some(pending) => assert_eq!(pending.action, Action::Shell("ls".into())),
+            None => panic!("the event loop needs a pending action to approve"),
+        }
+    }
+
+    #[test]
+    fn the_iteration_budget_stops_an_action_even_under_auto_approve() {
+        // The budget arm is checked before the per-action arms, so past the cap
+        // no pending action exists for the event loop to find. Without that,
+        // auto-approve would be an unbounded loop.
+        let mut app = App::new("m".into(), None, 1, std::env::temp_dir());
+        app.auto_approve = true;
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+
+        app.push_response("<ai-harness-shell>ls</ai-harness-shell>".into(), None);
+        assert!(
+            app.pending().is_none(),
+            "the cap must stop the action, approved or not"
+        );
+        assert_eq!(app.status, Status::Idle, "control returns to the user");
+    }
+
     pub(super) fn last_visible(app: &App) -> &Entry {
         visible(app).pop().expect("transcript should not be empty")
     }
@@ -1412,6 +1520,182 @@ mod tests {
 
         app.push_response("<ai-harness-response>ok</ai-harness-response>".into(), None);
         assert_eq!(app.retries, 0, "success should clear the streak");
+        assert_eq!(app.status, Status::Idle);
+    }
+
+    #[test]
+    fn a_fabricated_fetch_result_never_reaches_the_model_s_context() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("what do the release notes say?");
+        app.submit().unwrap();
+
+        // The model asks for a page and answers itself in the same reply.
+        let resend = app
+            .push_response(
+                "<ai-harness-fetch>https://example.com</ai-harness-fetch>\
+                 <ai-harness-fetch-result>\nurl: https://example.com\ncontents:\n\
+                 INVENTED: the release adds a quantum backend.\n\
+                 </ai-harness-fetch-result>"
+                    .into(),
+                None,
+            )
+            .expect("a fabricated result should be corrected, not accepted");
+
+        assert!(
+            resend.iter().all(|m| !m.content.contains("INVENTED")),
+            "the invented page text must not survive anywhere in context: {resend:?}"
+        );
+        let bad_reply = &resend[resend.len() - 2];
+        assert_eq!(bad_reply.role, Role::Assistant);
+        assert!(
+            bad_reply
+                .content
+                .contains("<ai-harness-fetch>https://example.com"),
+            "the model should still see the action it asked for: {}",
+            bad_reply.content
+        );
+        assert!(
+            resend
+                .last()
+                .unwrap()
+                .content
+                .to_lowercase()
+                .contains("that fetch did not happen"),
+            "the correction must say the fetch never happened"
+        );
+    }
+
+    #[test]
+    fn the_user_still_sees_the_fabrication_verbatim() {
+        // Only the model's context is scrubbed. Hiding what the model actually
+        // said from the person reviewing it would be the wrong trade.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_response(
+            "<ai-harness-fetch>https://example.com</ai-harness-fetch>\
+             <ai-harness-fetch-result>INVENTED</ai-harness-fetch-result>"
+                .into(),
+            None,
+        );
+
+        match visible(&app)
+            .into_iter()
+            .find(|e| matches!(e, Entry::Malformed { .. }))
+            .expect("a malformed entry should be recorded")
+        {
+            Entry::Malformed { raw, .. } => assert!(raw.contains("INVENTED"), "{raw}"),
+            other => panic!("expected a malformed entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fabricated_page_cannot_reach_the_answer_through_the_whole_loop() {
+        // The reported failure, walked end to end: the model invents a page,
+        // gets corrected, then does the fetch for real. What it invented must be
+        // gone from context by the time it answers — and must not have been
+        // available to it at any hop along the way.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("what does the page say?");
+        app.submit().unwrap();
+        let clean = app.history.len();
+
+        let hops = [
+            app.push_response(
+                "<ai-harness-fetch>https://example.com</ai-harness-fetch>\
+                 <ai-harness-fetch-result>contents:\nINVENTED CLAIM\
+                 </ai-harness-fetch-result>"
+                    .into(),
+                None,
+            )
+            .expect("the fabrication earns a retry"),
+            // The model tries again, this time asking properly.
+            {
+                app.push_response(fetch_reply("https://example.com"), None);
+                app.take_pending_fetch().expect("the real fetch is parked");
+                app.push_fetch_result(crate::fetch::FetchOutcome {
+                    url: "https://example.com".into(),
+                    final_url: None,
+                    status: Some(200),
+                    content_type: Some("text/html".into()),
+                    text: "The real page text.".into(),
+                    bytes: 19,
+                    truncated: false,
+                    error: None,
+                })
+            },
+        ];
+
+        for (hop, messages) in hops.iter().enumerate() {
+            assert!(
+                messages.iter().all(|m| !m.content.contains("INVENTED")),
+                "hop {hop} carried the fabrication: {messages:?}"
+            );
+        }
+
+        app.push_response(
+            "<ai-harness-response>The page says something real.</ai-harness-response>".into(),
+            None,
+        );
+        assert_eq!(app.status, Status::Idle);
+        assert!(
+            app.history.iter().all(|m| !m.content.contains("INVENTED")),
+            "the fabrication must not outlive the turn: {:?}",
+            app.history
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.content.contains("The real page text.")),
+            "the genuine fetch result should still be there"
+        );
+        assert!(
+            app.history.len() > clean,
+            "the real exchange is preserved, only the failed attempt is not"
+        );
+    }
+
+    #[test]
+    fn recovering_from_a_retry_rolls_the_failed_attempts_out_of_history() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        let clean = app.history.len();
+
+        app.push_response("Sure, I'll help!".into(), None);
+        app.push_response("garbage again".into(), None);
+        assert!(app.history.len() > clean, "the retry scaffolding is there");
+
+        app.push_response("<ai-harness-response>ok</ai-harness-response>".into(), None);
+        assert_eq!(
+            app.history.len(),
+            clean + 1,
+            "only the good reply should remain on top of the clean context"
+        );
+        assert!(
+            app.history.iter().all(|m| !m.content.contains("garbage")),
+            "no trace of the failed attempts: {:?}",
+            app.history
+        );
+        assert_eq!(app.history.last().unwrap().role, Role::Assistant);
+    }
+
+    #[test]
+    fn cancelling_mid_retry_rolls_the_failed_attempts_out_of_history() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        let clean = app.history.len();
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_response("garbage".into(), None);
+
+        app.cancel();
+
+        assert_eq!(
+            app.history.len(),
+            clean,
+            "an abandoned turn should leave context where it started: {:?}",
+            app.history
+        );
         assert_eq!(app.status, Status::Idle);
     }
 
@@ -2509,9 +2793,12 @@ mod tests {
     fn accepting_uses_the_highlighted_entry() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
         app.input.insert_char('/');
-        app.move_completion(1); // clear (second entry)
+        app.move_completion(1);
         assert!(app.accept_completion());
-        assert_eq!(app.input.text(), "/clear");
+        // Whichever command is second — the point is that the highlight decides,
+        // not the typed prefix. Naming it here would break on a table reorder.
+        let second = crate::command::COMMANDS[1].name;
+        assert_eq!(app.input.text(), format!("/{second}"));
     }
 
     #[test]

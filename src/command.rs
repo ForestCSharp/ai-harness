@@ -9,6 +9,8 @@
 pub enum Command {
     /// Toggle protocol frame visibility.
     Debug,
+    /// Toggle running actions without the approval modal.
+    Auto,
     Help,
     Clear,
     Quit,
@@ -58,6 +60,7 @@ pub fn parse(input: &str) -> Input {
 
     Input::Command(match name.to_ascii_lowercase().as_str() {
         "debug" => Command::Debug,
+        "auto" | "auto-approve" => Command::Auto,
         "help" | "h" | "?" => Command::Help,
         "clear" | "reset" => Command::Clear,
         "quit" | "exit" | "q" => Command::Quit,
@@ -86,6 +89,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "debug",
         description: "toggle showing the raw protocol sent and received",
+    },
+    Spec {
+        name: "auto",
+        description: "toggle running actions without the approval modal",
     },
     Spec {
         name: "clear",
@@ -186,6 +193,8 @@ mod tests {
     #[test]
     fn parses_each_command() {
         assert_eq!(command("/debug"), Command::Debug);
+        assert_eq!(command("/auto"), Command::Auto);
+        assert_eq!(command("/auto-approve"), Command::Auto);
         assert_eq!(command("/help"), Command::Help);
         assert_eq!(command("/clear"), Command::Clear);
         assert_eq!(command("/quit"), Command::Quit);

@@ -81,12 +81,31 @@ records the `Direction::Received` debug frame, then runs `protocol::parse_reply`
 on the whole reply. Four outcomes:
 
 **(a) Malformed** — prose, a code fence, two elements, an empty body. It records
-an `Entry::Malformed`, and under the retry cap (default 3) appends a targeted
-correction to history via `retry_after` ([src/app.rs:356](../src/app.rs)) and
-returns `Some(messages)`, which `handle_update` immediately re-sends. That is a
-loop back to step 2. After the cap it gives up, rolls the failed exchange out of
-history, and returns to `Idle`. Malformed replies do **not** count against the
-agentic `iterations` budget — only valid ones do.
+an `Entry::Malformed`, and under the retry cap (default 3) appends the bad reply
+plus a targeted correction to history via `retry_after` ([src/app.rs](../src/app.rs))
+and returns `Some(messages)`, which `handle_update` immediately re-sends. That is
+a loop back to step 2. Malformed replies do **not** count against the agentic
+`iterations` budget — only valid ones do.
+
+A retry loop leaves nothing behind. However it ends — the model recovers, the cap
+is hit, or you press `Esc` — `roll_back_retries` truncates history to
+`retry_anchor`, the point where context was last clean, so the failed attempts and
+their corrections are gone before the next request. Nothing in a malformed
+exchange ever ran (a rejected reply never reaches the dispatch above), so there is
+nothing to preserve. The transcript still shows every attempt; only the model's
+context is rewound.
+
+One class of malformed reply is not merely badly shaped. If the model writes a
+**result element itself** — `<ai-harness-fetch>url</ai-harness-fetch>` followed by
+its own invented `<ai-harness-fetch-result>` — it has fabricated the outcome of an
+action that never ran. `parse_reply` names that specifically
+(`ProtocolError::FabricatedResult`) rather than reporting it as trailing content,
+because the problem is not the shape of the reply but that its contents are
+fiction; the correction says the fetch did not happen and that nothing in the
+element may be used. And `retry_after` runs the reply through
+`protocol::elide_results` before it goes into history, replacing every result body
+with a marker — sending the invented text back verbatim would make it context the
+model answers from, which is the failure the rejection exists to prevent.
 
 **(b) `<ai-harness-response>`** — a final answer. Status → `Idle`. **This is where
 the journey ends**: the answer sits in the transcript, the prompt is live again.
@@ -147,6 +166,10 @@ Like a read, a refusal is data: a blocked URL or an HTTP error comes back as an
 text is untrusted — it is the only result body written by neither the user nor
 the harness.
 
+The converse case is not data at all. A `<ai-harness-fetch-result>` the *model*
+wrote is not a refusal to react to, it is a page that was never fetched, and it
+is elided rather than answered — see the fabrication paragraph in **(a)** above.
+
 ## 4. If it's a command, write, or edit: approval → execution → back to the model
 
 With the modal up, the keyboard is rerouted ([src/main.rs:210](../src/main.rs),
@@ -162,9 +185,32 @@ decide:
   `Update::Command(output)`.
 
 `handle_update` takes that output and calls `push_command_result`
-([src/app.rs:453](../src/app.rs)) — which wraps stdout/exit code as
+([src/app.rs](../src/app.rs)) — which wraps stdout/exit code as
 `<ai-harness-shell-result>`, feeds it back into history, and **re-sends to the
 model** (step 2 again).
+
+### Under `--auto-approve`, the modal step is skipped
+
+The dispatch above is unchanged: `push_response` still parks a `Pending` and still
+returns `None`. What differs is what `handle_update` does with that `None` — the
+same branch that spawns a parked fetch also calls `allow()` directly when the mode
+is on. Everything after that point is identical, because it is literally the same
+function the Allow button calls.
+
+Two consequences of putting the decision there rather than in `App`:
+
+- The modal never renders. `push_response` and `allow` both run inside one
+  `handle_update` call, which returns before the loop reaches `terminal.draw`, so
+  no frame is ever drawn with `Status::AwaitingApproval` set.
+- `App` still cannot start work of its own. It parks; the event loop spawns. That
+  is the same split the parked fetch uses, and it keeps every approval — button,
+  click, or automatic — flowing through a single `allow`.
+
+The `iterations` cap is not bypassed: the budget arm in `push_response` is checked
+*before* the per-action arms, so past the cap no `Pending` is created and there is
+nothing for the mode to approve. `Esc` also still cancels, since an auto-approved
+command is `Running` like any other. Those two are the only brakes left, which is
+the trade the mode makes.
 
 ## The loop closes
 
@@ -172,7 +218,8 @@ A single prompt can bounce through **query → reply → read → result → rep
 command → result → reply → …**, each hop a full round-trip, until the model
 finally emits an `<ai-harness-response>` — or the `iterations` cap stops it and
 returns control to you. Read and fetch hops pass through without pausing for
-you; command and write hops stop at the modal.
+you; command and write hops stop at the modal — unless `--auto-approve` is on, in
+which case nothing stops and the whole chain runs on the `iterations` cap alone.
 
 The shape worth holding onto: **`push_response` is the hub.** Streaming, retries,
 the approval modal, and command results are all just different edges feeding back

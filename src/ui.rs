@@ -791,6 +791,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // Red where debug is yellow: `/debug` changes what you see, this changes
+    // what happens without you.
+    if app.auto_approve {
+        spans.push(Span::styled(
+            "  auto-approve",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
     if !app.follow {
         spans.push(Span::styled(
             "  scrolled — End to resume",
@@ -1597,6 +1605,23 @@ mod tests {
         assert!(
             rows.join("\n").contains("debug"),
             "debug mode must be visible in the status bar:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_the_auto_approve_marker() {
+        // With no modal to interrupt you, the status bar is the only standing
+        // signal that the harness will act on its own.
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let (rows, _) = render(&mut app, 70, 12);
+        assert!(!rows.join("\n").contains("auto-approve"));
+
+        app.auto_approve = true;
+        let (rows, _) = render(&mut app, 70, 12);
+        assert!(
+            rows.join("\n").contains("auto-approve"),
+            "auto-approve must be visible in the status bar:\n{}",
             rows.join("\n")
         );
     }

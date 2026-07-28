@@ -107,12 +107,22 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     app.sandbox = Some(sandbox.clone());
     app.confirm_reads = args.confirm_reads;
     app.confirm_fetches = args.confirm_fetch;
+    app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
     app.price_out = args.price_out;
     app.push_notice(format!(
         "Sandbox root: {}   Type /help for commands.",
         sandbox.root().display()
     ));
+    // Said at startup rather than left to the status-bar marker: whether the
+    // harness will act without asking should be known before the first action,
+    // not inferred from the corner of the screen afterwards.
+    if app.auto_approve {
+        app.push_notice(
+            "Auto-approve is on — commands, writes, and edits run without asking, \
+             inside the sandbox. Esc cancels; /auto turns it off.",
+        );
+    }
 
     let mut events = EventStream::new();
     let (tx, mut rx) = mpsc::channel::<Tagged>(8);
@@ -194,6 +204,17 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
                 None => {
                     if let Some(url) = app.take_pending_fetch() {
                         spawn_fetch(app, ctx, inflight, url);
+                    // Under `--auto-approve` the modal is skipped: the app still
+                    // parked a `Pending` exactly as it always does, and the
+                    // decision to act on it is made here. `else if` rather than a
+                    // second `if` because the two are mutually exclusive — the
+                    // fetch arm in `push_response` parks and returns, everything
+                    // else falls through to awaiting approval.
+                    //
+                    // This runs before the loop returns to `terminal.draw`, so
+                    // there is no frame in which the modal is visible.
+                    } else if app.auto_approve && app.pending().is_some() {
+                        allow(app, ctx, inflight);
                     }
                 }
             }

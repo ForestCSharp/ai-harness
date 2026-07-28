@@ -53,6 +53,15 @@ pub struct Args {
     #[arg(long, env = "AI_HARNESS_CONFIRM_FETCH")]
     pub confirm_fetch: bool,
 
+    /// Run actions without the approval modal. Toggle with /auto.
+    ///
+    /// The sandbox still applies, so this changes *whether* you are asked, not
+    /// where a command can reach. It does remove the structural check that a
+    /// fetched page can only make the model *propose* something: under this,
+    /// a proposal runs.
+    #[arg(long, env = "AI_HARNESS_AUTO_APPROVE")]
+    pub auto_approve: bool,
+
     /// Start with debug mode on, showing raw protocol frames. Toggle with /debug.
     ///
     /// Also enabled by default in non-shipping (`dev`) builds; the flag forces it on

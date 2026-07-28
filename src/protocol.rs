@@ -71,6 +71,16 @@ const REPLY_TAGS: [&str; 6] = [
     RESPONSE_TAG,
 ];
 
+/// Tags only the harness may write. A model that emits one has invented the
+/// outcome of an action that never ran, which is a different failure from an
+/// unknown tag and is worth naming as such — both to the model and in the code.
+const RESULT_TAGS: [&str; 4] = [
+    RESULT_TAG,
+    WRITE_RESULT_TAG,
+    READ_RESULT_TAG,
+    FETCH_RESULT_TAG,
+];
+
 /// A validated model reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -116,6 +126,65 @@ fn expected_tags() -> String {
     }
 }
 
+/// What a fabricated result element falsely claims to be the outcome of,
+/// phrased to be dropped into a sentence: "…, so everything inside…".
+///
+/// Naming the specific action matters more than it looks: the correction has to
+/// contradict a concrete belief the model now holds ("I fetched that page"),
+/// and a generic "that did not happen" leaves it to work out which "that".
+fn did_not_happen(tag: &str) -> &'static str {
+    match tag {
+        FETCH_RESULT_TAG => "that fetch did not happen",
+        READ_RESULT_TAG => "that file was not read",
+        WRITE_RESULT_TAG => "that write did not happen",
+        _ => "that command did not run",
+    }
+}
+
+/// Replace every harness → model result element with a marker.
+///
+/// A rejected reply is sent back to the model so it can see what it did wrong,
+/// but a reply carrying a result element the model wrote itself cannot be shown
+/// back verbatim: the invented contents would become context it answers from,
+/// which is exactly the failure the rejection is meant to prevent. The marker
+/// keeps the shape of the mistake visible while dropping the fiction.
+///
+/// An unclosed element is elided to the end of the input. A truncated stream is
+/// the case most likely to leave one dangling, and leaking the tail of a
+/// fabricated page would defeat the point.
+pub fn elide_results(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+
+    loop {
+        // Elide whichever result element opens earliest in what is left, so
+        // several in one reply are all removed rather than only the first.
+        let next = RESULT_TAGS
+            .iter()
+            .filter_map(|tag| rest.find(&format!("<{tag}>")).map(|at| (at, *tag)))
+            .min_by_key(|(at, _)| *at);
+
+        let Some((at, tag)) = next else {
+            break;
+        };
+
+        out.push_str(&rest[..at]);
+        out.push_str(&format!(
+            "[removed by the harness: a fabricated <{tag}> you wrote yourself]"
+        ));
+
+        let after_open = &rest[at + tag.len() + 2..];
+        let closing = format!("</{tag}>");
+        rest = match after_open.find(&closing) {
+            Some(close_at) => &after_open[close_at + closing.len()..],
+            None => "",
+        };
+    }
+
+    out.push_str(rest);
+    out
+}
+
 /// Why a reply was rejected. Each carries enough detail to show the user what
 /// actually came back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +202,14 @@ pub enum ProtocolError {
     },
     /// The model used the query tag, which only the harness may send.
     QueryTagFromModel,
+    /// The model wrote a harness → model result element itself, inventing the
+    /// outcome of an action that never ran. Distinguished from
+    /// [`Self::UnknownTag`] and [`Self::TrailingContent`] — which is what this
+    /// used to be reported as — because the problem is not the shape of the
+    /// reply but that its contents are fiction.
+    FabricatedResult {
+        tag: String,
+    },
     /// Opening tag had no matching closing tag.
     MissingClosingTag {
         tag: String,
@@ -191,6 +268,12 @@ impl fmt::Display for ProtocolError {
                 f,
                 "<{QUERY_TAG}> is sent by the harness, not the model; expected {}",
                 expected_tags()
+            ),
+            Self::FabricatedResult { tag } => write!(
+                f,
+                "<{tag}> is written by the harness, not the model: {}, so everything \
+                 inside that element was invented",
+                did_not_happen(tag)
             ),
             Self::MissingClosingTag { tag } => {
                 write!(f, "missing closing </{tag}>")
@@ -350,6 +433,24 @@ pub fn encode_fetch_result(outcome: &crate::fetch::FetchOutcome) -> String {
 /// the system prompt already carries those, and a targeted correction is more
 /// likely to land.
 pub fn encode_correction(error: &ProtocolError) -> String {
+    // A fabricated result is not a formatting slip, and the boilerplate below
+    // would answer the wrong question: the model does not need to be told to
+    // emit one element, it needs to be told that the outcome it just wrote for
+    // itself is fiction and that it is about to answer from it.
+    if let ProtocolError::FabricatedResult { tag } = error {
+        return format!(
+            "Your last reply was rejected by the parser: it contained a <{tag}> element \
+             that you wrote yourself.\n\n\
+             Only the harness writes result elements. {}, so nothing in that element \
+             came from the real world — you invented all of it. It has been removed \
+             from this conversation and you must not use anything it said, or repeat \
+             any claim you drew from it.\n\n\
+             If you still need that information, reply with the action element alone \
+             and stop. The harness will run it and send you the real result; that \
+             result is the only source you may treat as what actually happened.",
+            capitalise(did_not_happen(tag))
+        );
+    }
     format!(
         "Your last reply was rejected by the parser: {error}\n\n\
          Reply again with exactly one element and nothing else — no prose, no \
@@ -370,6 +471,16 @@ pub fn encode_denied() -> String {
         "<{RESULT_TAG}>\nstatus: the user denied permission to run this command; \
          it was not executed\n</{RESULT_TAG}>"
     )
+}
+
+/// Upper-case the first character, for a clause reused mid-sentence and at the
+/// start of one.
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 fn section(name: &str, content: &str) -> String {
@@ -407,6 +518,13 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
     if tag == QUERY_TAG {
         return Err(ProtocolError::QueryTagFromModel);
     }
+    // Checked before the unknown-tag arm below, which would otherwise report a
+    // model that invented an outcome as a simple spelling mistake.
+    if RESULT_TAGS.contains(&tag) {
+        return Err(ProtocolError::FabricatedResult {
+            tag: tag.to_string(),
+        });
+    }
     if !REPLY_TAGS.contains(&tag) {
         return Err(ProtocolError::UnknownTag {
             tag: tag.to_string(),
@@ -433,6 +551,24 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
     let body = &after_open[..closing_at];
     let trailing = after_open[closing_at + closing.len()..].trim();
     if !trailing.is_empty() {
+        // A valid action followed by the model's own invented result for it —
+        // "<fetch>url</fetch><fetch-result>…the page said…</fetch-result>".
+        // Technically trailing content, but reporting it that way complains
+        // about the shape and leaves the model believing the fetch happened.
+        if let Some(fabricated) = RESULT_TAGS
+            .iter()
+            .filter_map(|result| {
+                trailing
+                    .find(&format!("<{result}>"))
+                    .map(|at| (at, *result))
+            })
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, result)| result)
+        {
+            return Err(ProtocolError::FabricatedResult {
+                tag: fabricated.to_string(),
+            });
+        }
         // A body that swallowed its own delimiter leaves the *real* closing tag
         // dangling at the very end; a genuine second element instead opens with a
         // fresh `<tag`. Distinguishing the two turns a baffling "trailing content"
@@ -668,7 +804,14 @@ status: wrote 128 bytes to path/to/file
 </{WRITE_RESULT_TAG}>
 
 Reply to a result with another action to keep going, or <{RESPONSE_TAG}> when you \
-have what you need. Never emit a result element yourself.
+have what you need.
+
+Never write a result element yourself. Only the harness writes those, and only \
+after the action has really happened. Emitting an action and its result together \
+— <{FETCH_TAG}>…</{FETCH_TAG}> followed by your own <{FETCH_RESULT_TAG}> — does \
+not fetch anything; it invents an outcome. Send the action alone and stop. The \
+result the harness sends back is the only account of what actually happened, and \
+the only one you may answer from.
 
 The user approves every command, write, and edit before it happens. If a result \
 says it was denied, it did NOT run: propose a different approach or explain the \
@@ -1228,6 +1371,139 @@ mod tests {
                 tag: "ai-harness-think".into()
             }
         );
+    }
+
+    #[test]
+    fn a_result_element_from_the_model_is_named_as_fabrication_not_a_typo() {
+        // Reported as an unknown tag, this reads as a spelling mistake. The
+        // model needs to hear that it invented an outcome.
+        assert_eq!(
+            parse_reply(
+                "<ai-harness-fetch-result>\nurl: https://example.com\ncontents:\n\
+                 The 2026 release notes list four features.\n</ai-harness-fetch-result>"
+            )
+            .unwrap_err(),
+            ProtocolError::FabricatedResult {
+                tag: "ai-harness-fetch-result".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_action_followed_by_its_own_invented_result_is_fabrication() {
+        // The exact failure this was written for: the model asks for a page and
+        // answers itself in the same breath, so the "fetch" never happens.
+        assert_eq!(
+            parse_reply(
+                "<ai-harness-fetch>https://example.com</ai-harness-fetch>\
+                 <ai-harness-fetch-result>\ncontents:\nmade up\n</ai-harness-fetch-result>"
+            )
+            .unwrap_err(),
+            ProtocolError::FabricatedResult {
+                tag: "ai-harness-fetch-result".into()
+            },
+            "trailing content is true but misses the point"
+        );
+    }
+
+    #[test]
+    fn a_fabricated_shell_result_is_caught_too() {
+        assert_eq!(
+            parse_reply(
+                "<ai-harness-shell>ls</ai-harness-shell>\
+                 <ai-harness-shell-result>\nexit code: 0\n</ai-harness-shell-result>"
+            )
+            .unwrap_err(),
+            ProtocolError::FabricatedResult {
+                tag: "ai-harness-shell-result".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_fabrication_correction_says_the_action_never_happened() {
+        // Lower-cased for the comparison: the clause opens a sentence here and
+        // sits mid-sentence in `Display`, so only its wording is under test.
+        let correction = encode_correction(&ProtocolError::FabricatedResult {
+            tag: FETCH_RESULT_TAG.into(),
+        })
+        .to_lowercase();
+        assert!(
+            correction.contains("that fetch did not happen"),
+            "the correction must contradict the belief, not the formatting: {correction}"
+        );
+        assert!(correction.contains("invented"), "{correction}");
+        assert!(
+            correction.contains("removed"),
+            "the model should know the text is gone, not merely disapproved of: {correction}"
+        );
+        assert!(
+            !correction.contains("markdown fences"),
+            "the shape boilerplate answers the wrong question here: {correction}"
+        );
+    }
+
+    #[test]
+    fn each_result_tag_names_its_own_action_in_the_correction() {
+        for (tag, expected) in [
+            (READ_RESULT_TAG, "that file was not read"),
+            (WRITE_RESULT_TAG, "that write did not happen"),
+            (RESULT_TAG, "that command did not run"),
+        ] {
+            let correction = encode_correction(&ProtocolError::FabricatedResult {
+                tag: tag.to_string(),
+            })
+            .to_lowercase();
+            assert!(correction.contains(expected), "{tag}: {correction}");
+        }
+    }
+
+    #[test]
+    fn eliding_removes_an_invented_body_but_keeps_the_reply_around_it() {
+        let elided = elide_results(
+            "<ai-harness-fetch>https://example.com</ai-harness-fetch>\
+             <ai-harness-fetch-result>\nSECRET INVENTED TEXT\n</ai-harness-fetch-result>",
+        );
+        assert!(
+            !elided.contains("SECRET INVENTED TEXT"),
+            "the fabrication must not survive: {elided}"
+        );
+        assert!(
+            elided.starts_with("<ai-harness-fetch>https://example.com</ai-harness-fetch>"),
+            "the model should still see what it did: {elided}"
+        );
+        assert!(elided.contains("removed by the harness"), "{elided}");
+    }
+
+    #[test]
+    fn eliding_handles_an_element_the_model_never_closed() {
+        // A truncated stream is the likeliest source of a dangling result, and
+        // leaking the tail would defeat the point of eliding at all.
+        let elided = elide_results("<ai-harness-shell-result>\nexit code: 0\nstdout:\nfake");
+        assert!(!elided.contains("fake"), "{elided}");
+        assert!(!elided.contains("exit code"), "{elided}");
+    }
+
+    #[test]
+    fn eliding_removes_every_result_not_just_the_first() {
+        let elided = elide_results(
+            "<ai-harness-read-result>alpha</ai-harness-read-result>middle\
+             <ai-harness-shell-result>beta</ai-harness-shell-result>",
+        );
+        assert!(!elided.contains("alpha"), "{elided}");
+        assert!(!elided.contains("beta"), "{elided}");
+        assert!(
+            elided.contains("middle"),
+            "text between them survives: {elided}"
+        );
+    }
+
+    #[test]
+    fn eliding_leaves_a_reply_with_no_results_untouched() {
+        // Every malformed reply passes through this, so the common case — an
+        // ordinary formatting slip — must come out byte-identical.
+        let raw = "Sure, I'll do that! <ai-harness-shell>ls</ai-harness-shell>";
+        assert_eq!(elide_results(raw), raw);
     }
 
     #[test]
