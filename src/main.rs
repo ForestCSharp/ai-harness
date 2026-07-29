@@ -43,6 +43,9 @@ enum Update {
     Delta(String),
     /// The model reply finished, or the error that replaced it.
     ReplyEnd(Result<Completion, String>),
+    /// A piece of output from the command running now. Display-only: the
+    /// authoritative text arrives with `Command`.
+    CommandChunk(exec::Chunk),
     /// A sandboxed command finished, or failed to start.
     Command(Result<CommandOutput, String>),
     /// A sandboxed file write finished, or failed to start.
@@ -63,6 +66,18 @@ struct Tagged {
 /// resolves the task's cancel future, stopping its work cleanly.
 struct InFlight {
     cancel: oneshot::Sender<()>,
+    /// Lines typed to the running command's stdin. `Some` only for a command
+    /// started in interactive mode; dropping it closes the child's stdin.
+    stdin: Option<mpsc::Sender<String>>,
+}
+
+impl InFlight {
+    fn new(cancel: oneshot::Sender<()>) -> Self {
+        Self {
+            cancel,
+            stdin: None,
+        }
+    }
 }
 
 /// Shared context the event handlers need to start new background work.
@@ -110,6 +125,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     app.confirm_reads = args.confirm_reads;
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
+    app.interactive = args.interactive;
     app.price_in = args.price_in;
     app.price_out = args.price_out;
     app.push_notice(format!(
@@ -123,6 +139,16 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         app.push_notice(
             "Auto-approve is on — commands, writes, and edits run without asking, \
              inside the sandbox. Esc cancels; /auto turns it off.",
+        );
+    }
+    // Said here for the same reason as auto-approve, plus one of its own: the
+    // mode has to be on *before* a command starts, since whether stdin is a pipe
+    // is settled when it spawns and /interactive cannot be typed mid-run.
+    if app.interactive {
+        app.push_notice(
+            "Interactive mode is on — a running command gets a real stdin, and Enter \
+             sends a line to it. This is a pipe, not a terminal: shell prompts and \
+             `read` work, but REPLs and anything wanting a tty will not.",
         );
     }
 
@@ -226,6 +252,11 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
             app.mark_request_done();
             app.finish_stream();
             app.push_error(message);
+        }
+        // Live output for the running window. Display-only; the authoritative
+        // text arrives with `Command` below.
+        Update::CommandChunk(chunk) => {
+            app.push_command_chunk(chunk.stream == exec::Stream::Stderr, &chunk.text)
         }
         // A finished command goes straight back to the model, continuing the loop.
         Update::Command(Ok(output)) => {
@@ -344,6 +375,13 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
         other => other,
     };
 
+    // A shell command is watched while it runs; a write is not, being a single
+    // atomic act with nothing to show in progress.
+    if let Action::Shell(command) = action {
+        spawn_shell(app, ctx, inflight, command);
+        return;
+    }
+
     let generation = app.next_generation();
     let sandbox = ctx.sandbox.clone();
     let timeout = ctx.timeout;
@@ -356,27 +394,83 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
             let _ = cancel_rx.await;
         };
         let update = match action {
-            Action::Shell(command) => Update::Command(
-                exec::run_cancellable(&sandbox, &command, timeout, cancel)
-                    .await
-                    .map_err(|e| format!("{e:#}")),
-            ),
             Action::Write { path, contents } => Update::Write(
                 exec::write_file(&sandbox, &path, &contents, timeout, cancel)
                     .await
                     .map_err(|e| format!("{e:#}")),
             ),
             // A Response is never approvable, a Read and a Fetch were handled
-            // above, and an Edit is converted to a Write by `approve`, so none
-            // are reachable.
-            Action::Read { .. }
+            // above, a Shell was handled just now, and an Edit is converted to a
+            // Write by `approve`, so none are reachable.
+            Action::Shell(_)
+            | Action::Read { .. }
             | Action::Fetch { .. }
             | Action::Edit { .. }
             | Action::Response(_) => return,
         };
         let _ = tx.send(Tagged { generation, update }).await;
     });
-    *inflight = Some(InFlight { cancel: cancel_tx });
+    *inflight = Some(InFlight::new(cancel_tx));
+}
+
+/// Run a shell command, forwarding its output as it arrives.
+///
+/// Two channels beyond the usual cancel: one carrying output chunks back for the
+/// live window, and — in interactive mode — one carrying typed lines to the
+/// child's stdin. The forwarder relays chunks onto the single `Tagged` channel
+/// the event loop drains, so live output is generation-tagged and dropped on
+/// cancel exactly like every other update.
+fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, command: String) {
+    let generation = app.next_generation();
+    app.start_running(command.clone());
+
+    let sandbox = ctx.sandbox.clone();
+    let timeout = ctx.timeout;
+    let tx = ctx.tx.clone();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let (chunk_tx, mut chunk_rx) = mpsc::channel::<exec::Chunk>(32);
+    // Only in interactive mode: with no receiver, `run_streaming` leaves stdin
+    // at /dev/null and an interactive command fails fast as it always has.
+    let (stdin_tx, stdin_rx) = if app.interactive {
+        let (tx, rx) = mpsc::channel::<String>(8);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    tokio::spawn(async move {
+        let cancel = async {
+            let _ = cancel_rx.await;
+        };
+        let relay = {
+            let tx = tx.clone();
+            async move {
+                while let Some(chunk) = chunk_rx.recv().await {
+                    let _ = tx
+                        .send(Tagged {
+                            generation,
+                            update: Update::CommandChunk(chunk),
+                        })
+                        .await;
+                }
+            }
+        };
+        // Both at once: the relay ends when `run_streaming` drops its sender.
+        let (result, ()) = tokio::join!(
+            exec::run_streaming(&sandbox, &command, timeout, cancel, chunk_tx, stdin_rx),
+            relay,
+        );
+        let _ = tx
+            .send(Tagged {
+                generation,
+                update: Update::Command(result.map_err(|e| format!("{e:#}"))),
+            })
+            .await;
+    });
+    *inflight = Some(InFlight {
+        cancel: cancel_tx,
+        stdin: stdin_tx,
+    });
 }
 
 /// Refuse the pending command and let the model know.
@@ -440,11 +534,34 @@ fn handle_key(
     }
 
     // While a stream or command is in flight (no modal), Esc interrupts it.
+    // Checked before the interactive branch below, so Esc always cancels rather
+    // than becoming a character the running command swallows.
     if app.is_busy() && key.code == KeyCode::Esc {
         if let Some(handle) = inflight.take() {
             let _ = handle.cancel.send(());
         }
         app.cancel();
+        return;
+    }
+
+    // Enter while a command runs never reaches the model — the turn is not over.
+    // Either it goes to the command's stdin, or we say why it cannot, because
+    // a keypress that silently does nothing is the worst of the three.
+    if app.status == app::Status::Running && key.code == KeyCode::Enter && !alt && !shift {
+        match inflight.as_ref().and_then(|f| f.stdin.clone()) {
+            Some(sender) if app.accepts_input() => {
+                let line = app.input.take();
+                // `try_send` rather than awaiting: this is the event loop, and a
+                // full channel means the command is not keeping up, which is not
+                // worth freezing the UI over.
+                if sender.try_send(line.clone()).is_ok() {
+                    app.push_command_input(line);
+                }
+            }
+            // No pipe: the mode was off when this command was spawned.
+            _ if !app.input.is_blank() => app.warn_no_stdin(),
+            _ => {}
+        }
         return;
     }
 
@@ -483,7 +600,9 @@ fn handle_key(
             }
         }
 
-        _ if app.is_busy() => {} // editing is frozen while work is in flight
+        // Editing is frozen while work is in flight — except while a command is
+        // waiting to be typed at, which is the whole point of interactive mode.
+        _ if app.is_busy() && !app.accepts_input() => {}
 
         // --- Editing ---
         KeyCode::Char('l') if ctrl => app.reset_conversation(),
@@ -539,7 +658,7 @@ fn spawn_fetch(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: S
             })
             .await;
     });
-    *inflight = Some(InFlight { cancel: cancel_tx });
+    *inflight = Some(InFlight::new(cancel_tx));
 }
 
 fn spawn_request(
@@ -573,7 +692,7 @@ fn spawn_request(
                 .await;
         }
     });
-    *inflight = Some(InFlight { cancel: cancel_tx });
+    *inflight = Some(InFlight::new(cancel_tx));
 }
 
 /// Forward stream deltas to the UI, accumulating the full reply.

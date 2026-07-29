@@ -124,6 +124,7 @@ Commands are handled locally and never sent to the model.
 | --- | --- |
 | `/debug` | Toggle showing the raw protocol sent and received |
 | `/auto` | Toggle running actions without the approval modal (see [Sandboxing](#sandboxing)) |
+| `/interactive` | Toggle typing into a running command's stdin (see [Sandboxing](#sandboxing)) |
 | `/clear` | Clear the conversation, keeping the system prompt |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -228,6 +229,48 @@ instead of before it, a red `auto-approve` marker sits in the status bar for as
 long as the mode is on, and `Esc` still cancels whatever is running. **Read the
 paragraph below on what it gives up before leaving it on.**
 
+A command's output streams into an outlined window while it runs, so a slow build
+looks different from a hang:
+
+```
+┌─ ⠋ cargo build --release ──────────────────────────────────
+│    Compiling ai-harness v0.1.0
+│ warning: unused variable `x`
+│     Finished in 3.4s
+└─ Esc cancels ──────────────────────────────────────────────
+```
+
+stderr shows in red, the newest output is kept when there is more than fits, and
+the window is replaced by the ordinary result entry when the command exits. The
+live view is display-only — the text sent to the model is the complete output
+captured at the end, the same split streamed replies use.
+
+`--interactive` (or `/interactive`) gives the command a real stdin: the prompt
+stays live while it runs, and `Enter` sends a line to the command instead of to
+the model. What you type is recorded in the result, so the model knows a human
+answered rather than inventing what the answer must have been.
+
+**This connects a pipe, not a terminal, and the difference is bigger than it
+sounds.** It serves shell prompts (`printf "name: "; read n`), y/n confirms, and
+anything reading stdin line by line. It does **not** serve a REPL or console:
+`python3`, `node`, and `sqlite3` all check whether stdin is a tty, and under a
+pipe they print no prompt, echo nothing, and just consume input as a script.
+`sudo` and `ssh` read passwords from `/dev/tty` and bypass the pipe entirely.
+Making those work needs a real PTY, which this does not allocate.
+
+Two things follow from stdin being decided when a command **spawns**: turn the
+mode on *before* asking for something interactive, and note that `/interactive`
+cannot be typed while a command is running, because slash commands need an idle
+prompt. If you press Enter at a command that cannot hear you, the harness says
+so rather than doing nothing — press `Esc`, run `/interactive`, and ask again.
+
+`--command-timeout` is an **idle** bound, not a total one: it resets whenever the
+command produces output or you send it a line, so a command is killed after that
+long doing nothing rather than that long running. A build that prints progress
+for two minutes survives; a silent one still dies on schedule. A separate ceiling
+of twenty times the timeout (ten minutes by default) stops a command that prints
+forever from running forever.
+
 The agentic loop is bounded by `--max-iterations` so a model that keeps proposing
 actions cannot spin forever; reads and edits count against it like anything else.
 
@@ -236,6 +279,13 @@ determined attacker.** Network is on, so any command you approve can send
 anything it can read. Command output is also sent to OpenRouter, which means
 reading a secret leaks it even with no network in the command itself — the `.env`
 deny closes the obvious case, and the denylist is not exhaustive.
+
+Interactive mode gives up one of the smaller guards here. Closed stdin is what
+makes a command that wants a terminal die immediately instead of sitting there;
+with a pipe attached it will wait instead, and a command that would have failed
+in a second can now occupy the loop until the idle timeout. Nothing about the
+filesystem confinement changes — but leave the mode off unless you are watching,
+which is the same rule `--auto-approve` follows.
 
 Two things `<ai-harness-fetch>` specifically does **not** do, both worth knowing
 before you leave it auto-approved:
@@ -327,9 +377,10 @@ Other flags: `--workdir` sets the sandbox root (default: cwd),
 `--command-timeout` the per-command limit in seconds, `--max-iterations` the
 agentic loop bound, `--confirm-reads` puts file reads behind the approval modal
 along with everything else, and `--confirm-fetch` does the same for URL fetches.
-`--auto-approve` goes the other way and removes the modal entirely — read
-[Sandboxing](#sandboxing) first. Every flag also has an environment variable
-(`AI_HARNESS_AUTO_APPROVE`, and so on).
+`--auto-approve` goes the other way and removes the modal entirely, and
+`--interactive` lets you type to a running command — read
+[Sandboxing](#sandboxing) before using either. Every flag also has an environment
+variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 
 ## Keys
 
@@ -383,7 +434,7 @@ The prompt box grows downward from a fixed bottom edge as you add lines, up to
 | `src/protocol.rs` | Query encoding, the system prompt, and strict reply parsing |
 | `src/command.rs` | Slash-command parsing, the command table, and completion |
 | `src/sandbox.rs` | Seatbelt profile generation and the sandboxed command |
-| `src/exec.rs` | Running commands: timeout, process-group kill, output caps |
+| `src/exec.rs` | Running commands: streamed output, stdin, idle timeout, output caps |
 | `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
 | `src/fetch.rs` | URL policy, fetching, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/diff.rs` | Line-by-line diffs of writes and edits, bounded for storage |

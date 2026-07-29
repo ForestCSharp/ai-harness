@@ -196,10 +196,39 @@ decide:
 - **Deny** → `app.deny()` ([src/app.rs:438](../src/app.rs)) tells the model the
   user refused and it did **not** run, so it proposes an alternative instead of
   assuming success, and re-sends. Back to step 2.
-- **Allow** → `allow()` ([src/main.rs:190](../src/main.rs)) spawns another
-  background task running `exec::run`, which executes the command under the macOS
+- **Allow** → `allow()` ([src/main.rs](../src/main.rs)) spawns another background
+  task running `exec::run_streaming`, which executes the command under the macOS
   Seatbelt sandbox with a timeout and output caps. When it finishes →
   `Update::Command(output)`.
+
+A command does not stay silent while it runs. `run_streaming` reads both pipes
+incrementally and forwards each read as an `exec::Chunk`; the spawned task relays
+those onto the same `Tagged` channel everything else uses, so live output arrives
+as `Update::CommandChunk` and is generation-tagged — chunks from a cancelled
+command are dropped by the same check that drops a late token. `App.running`
+accumulates them into the outlined window the transcript draws in place of the
+`running…` spinner.
+
+That buffer is **display-only**, exactly like `streaming` for a model reply: the
+authoritative text is the `CommandOutput` at the end, so nothing acts on a
+half-read pipe and the window can be bounded without losing anything the model
+needs.
+
+Two consequences of reading incrementally, both deliberate:
+
+- **The timeout is an idle bound.** It resets on every read and every line
+  written, so a command is killed after that long producing nothing rather than
+  that long running. `HARD_TIMEOUT_MULTIPLE` bounds the total anyway, since a
+  command that prints forever would otherwise reset the clock forever.
+- **stdin can be a pipe.** `run_streaming` takes an optional receiver of lines;
+  with `None` stdin stays `/dev/null` and an interactive command fails fast as it
+  always has. Under `--interactive` the event loop holds the sender in
+  `InFlight.stdin`, and `Enter` routes the prompt line there instead of to the
+  model. What was typed is collected by `App` — `exec` wrote bytes to a pipe and
+  never saw lines — and attached to the `CommandOutput`, so `encode_shell_result`
+  can tell the model a human answered. Without that the model would see a prompt
+  in stdout, output that depends on the answer, and no answer: a gap it would
+  fill by guessing.
 
 `handle_update` takes that output and calls `push_command_result`
 ([src/app.rs](../src/app.rs)) — which wraps stdout/exit code as

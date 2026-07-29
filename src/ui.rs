@@ -434,6 +434,11 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         // A block cursor on the last line signals the reply is still arriving.
         let mut body = body_lines(&format!("{text}▌"), Style::default(), width);
         lines.append(&mut body);
+    } else if let Some(running) = &app.running {
+        // Live state, not a transcript entry: it belongs after the entries and
+        // is replaced by the real `Entry::CommandResult` when the command exits.
+        lines.push(Line::default());
+        lines.extend(running_window(app, running, width));
     } else {
         let activity = match app.status {
             Status::Waiting => Some("thinking…"),
@@ -451,6 +456,111 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// Output lines shown in the running window. Enough to see what a command is
+/// doing without the window swallowing the transcript above it.
+const RUNNING_WINDOW_ROWS: usize = 12;
+
+/// The live command window: an outlined box that fills as output arrives.
+///
+/// Drawn as text rather than a `Block` because it lives inside the scrolling
+/// transcript paragraph, where a real widget cannot go — and because it has to
+/// scroll away with the rest of the history once the command finishes.
+fn running_window(
+    app: &App,
+    running: &crate::app::RunningCommand,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let edge = Style::default().fg(Color::Yellow);
+    // Border verticals take a column each, plus a space of padding inside.
+    let inner = width.saturating_sub(4).max(1);
+    let spinner = SPINNER[(app.tick / 2) % SPINNER.len()];
+
+    let mut lines = Vec::new();
+    let title = truncate(&running.command, inner.saturating_sub(4));
+    lines.push(rule(
+        vec![
+            Span::styled("┌─ ", edge),
+            Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", edge),
+        ],
+        width,
+        edge,
+    ));
+
+    // Wrap everything, then keep the last screenful: a command's newest output
+    // is the part worth seeing, and wrapping first means the count is in rows
+    // rather than logical lines that might each take three.
+    let mut body: Vec<Line> = Vec::new();
+    for (stderr, text) in running.lines() {
+        let style = if stderr {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        for row in wrap::text(text, inner) {
+            body.push(Line::from(vec![
+                Span::styled("│ ", edge),
+                Span::styled(row, style),
+            ]));
+        }
+    }
+    let hidden = body.len().saturating_sub(RUNNING_WINDOW_ROWS);
+    if hidden > 0 {
+        body.drain(..hidden);
+        lines.push(Line::from(vec![
+            Span::styled("│ ", edge),
+            Span::styled(format!("⋯ {hidden} earlier line(s)"), dim),
+        ]));
+    }
+    lines.append(&mut body);
+
+    let hint = if app.accepts_input() {
+        "type to answer · Enter sends · Esc cancels"
+    } else {
+        "Esc cancels"
+    };
+    lines.push(rule(
+        vec![
+            Span::styled("└─ ", edge),
+            Span::styled(hint.to_string(), dim),
+            Span::styled(" ", edge),
+        ],
+        width,
+        edge,
+    ));
+    lines
+}
+
+/// Close a header or footer with a horizontal rule out to `width`, so the box
+/// reads as a box rather than as a stray corner.
+fn rule(mut spans: Vec<Span<'static>>, width: usize, style: Style) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    if let Some(fill) = width.checked_sub(used).filter(|f| *f > 0) {
+        spans.push(Span::styled("─".repeat(fill), style));
+    }
+    Line::from(spans)
+}
+
+/// Shorten to `width` cells, marking the cut.
+fn truncate(text: &str, width: usize) -> String {
+    let flat = text.replace('\n', " ");
+    if flat.chars().count() <= width {
+        return flat;
+    }
+    flat.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'static>>) {
@@ -928,6 +1038,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
+    if app.interactive {
+        spans.push(Span::styled(
+            "  interactive",
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     if !app.follow {
         spans.push(Span::styled(
             "  scrolled — End to resume",
@@ -936,6 +1052,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     }
     let hints = if app.pending().is_some() {
         "  ←/→ choose · Enter confirm · y allow · n/Esc deny"
+    } else if app.accepts_input() {
+        "  Enter sends to the command · Esc cancel"
     } else if matches!(
         app.status,
         Status::Waiting | Status::Streaming | Status::Running
@@ -1879,6 +1997,141 @@ mod tests {
         );
     }
 
+    /// An app watching a command, as the event loop leaves it.
+    fn running(command: &str) -> App {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("do it");
+        app.submit().unwrap();
+        app.start_running(command.into());
+        app.status = crate::app::Status::Running;
+        app
+    }
+
+    #[test]
+    fn a_running_command_gets_an_outlined_window() {
+        let mut app = running("cargo build");
+        app.push_command_chunk(false, "compiling\n");
+
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = transcript_only(&rows);
+        // `┌─` is the window's own corner; the transcript's is `┌ ai-harness`.
+        assert!(screen.contains("┌─"), "no outline:\n{screen}");
+        assert!(screen.contains("cargo build"), "missing command:\n{screen}");
+        assert!(screen.contains("compiling"), "missing output:\n{screen}");
+        assert!(screen.contains("Esc cancels"), "missing hint:\n{screen}");
+    }
+
+    #[test]
+    fn the_window_replaces_the_running_spinner() {
+        // Both occupy the same slot; showing them together would be two claims
+        // about the same state.
+        let mut app = running("sleep 5");
+        let (rows, _) = render(&mut app, 60, 16);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("sleep 5"));
+        assert!(
+            !screen.contains("running…"),
+            "spinner should be gone:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_window_hint_changes_when_input_is_accepted() {
+        let mut app = running("read name");
+        let (rows, _) = render(&mut app, 70, 16);
+        assert!(!transcript_only(&rows).contains("type to answer"));
+
+        app.interactive = true;
+        let (rows, _) = render(&mut app, 70, 16);
+        let screen = transcript_only(&rows);
+        assert!(
+            screen.contains("type to answer"),
+            "the window should say it is waiting on you:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_window_keeps_the_newest_output_and_says_what_it_dropped() {
+        let mut app = running("spew");
+        for i in 0..60 {
+            app.push_command_chunk(false, &format!("line {i}\n"));
+        }
+
+        let (rows, _) = render(&mut app, 60, 30);
+        let screen = transcript_only(&rows);
+        assert!(
+            screen.contains("line 59"),
+            "newest output must show:\n{screen}"
+        );
+        assert!(
+            screen.contains("earlier line(s)"),
+            "missing marker:\n{screen}"
+        );
+        assert!(!screen.contains("line 0\n"), "oldest should be dropped");
+    }
+
+    #[test]
+    fn the_window_never_overflows_its_width() {
+        let mut app = running(&"a-very-long-command ".repeat(10));
+        app.push_command_chunk(false, &format!("{}\n", "x".repeat(300)));
+
+        for width in [40u16, 60, 100] {
+            let (rows, _) = render(&mut app, width, 30);
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "row overflows {width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_window_goes_away_when_the_command_finishes() {
+        let mut app = running("ls");
+        app.push_command_chunk(false, "a.txt\n");
+        app.push_command_result(crate::exec::CommandOutput {
+            command: "ls".into(),
+            exit_code: Some(0),
+            stdout: "a.txt".into(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+            cancelled: false,
+            input: Vec::new(),
+        });
+
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = transcript_only(&rows);
+        assert!(
+            !screen.contains("┌─"),
+            "the window should be gone:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Esc cancels"),
+            "and its hint with it:\n{screen}"
+        );
+        assert!(
+            screen.contains("exit 0"),
+            "the result replaces it:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_the_interactive_marker() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let (rows, _) = render(&mut app, 70, 12);
+        assert!(!rows.join("\n").contains("interactive"));
+
+        app.interactive = true;
+        let (rows, _) = render(&mut app, 70, 12);
+        assert!(
+            rows.join("\n").contains("interactive"),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
     #[test]
     fn status_bar_shows_the_auto_approve_marker() {
         // With no modal to interrupt you, the status bar is the only standing
@@ -2007,6 +2260,7 @@ mod tests {
             truncated: false,
             timed_out: false,
             cancelled: false,
+            input: Vec::new(),
         });
 
         let (rows, _) = render(&mut app, 60, 20);

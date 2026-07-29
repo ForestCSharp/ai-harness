@@ -3,21 +3,54 @@
 //! The sandbox confines the filesystem; it does not bound time, output, or
 //! process count. Those limits live here:
 //!
-//! - stdin is `/dev/null`, so interactive commands fail fast instead of hanging,
+//! - stdin is `/dev/null` unless the caller supplies a channel, so by default an
+//!   interactive command fails fast instead of hanging,
 //! - the child gets its own process group, killed wholesale on timeout,
 //! - combined output is capped, since a runaway command would otherwise exhaust
 //!   memory and the model's token budget alike.
+//!
+//! Output is read incrementally and forwarded as it arrives, which is what lets
+//! the caller show a command running rather than only its corpse. The recorded
+//! text is still capped; forwarding is a second consumer of the same reads, not
+//! a second buffer.
 
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::sandbox::Sandbox;
 
 /// Cap on captured output per stream. Anything past this is dropped with a marker.
 pub const MAX_STREAM_BYTES: usize = 32 * 1024;
+
+/// Multiple of the idle timeout at which a command is killed regardless of how
+/// busy it looks.
+///
+/// The timeout below is an *idle* bound — it resets on every read and write — so
+/// a command that prints forever would otherwise never hit it. Ten minutes at
+/// the default, which is far past anything worth waiting on unattended.
+pub const HARD_TIMEOUT_MULTIPLE: u32 = 20;
+
+/// Which pipe a chunk of live output came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// A piece of output, forwarded while the command is still running.
+///
+/// Display-only. The authoritative text is the [`CommandOutput`] returned at the
+/// end — the same split streamed model replies use, and for the same reason:
+/// nothing should act on a half-arrived buffer.
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub stream: Stream,
+    pub text: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandOutput {
@@ -30,6 +63,13 @@ pub struct CommandOutput {
     pub timed_out: bool,
     /// The user interrupted the command before it finished.
     pub cancelled: bool,
+    /// Lines the user typed to the command while it ran.
+    ///
+    /// Piped stdin is not echoed into stdout, so without this the answers would
+    /// exist nowhere: the transcript would show a prompt and an answer-shaped
+    /// gap, and the model would see output depending on input it never saw.
+    #[serde(default)]
+    pub input: Vec<String>,
 }
 
 impl CommandOutput {
@@ -109,15 +149,48 @@ pub async fn run(sandbox: &Sandbox, script: &str, timeout: Duration) -> Result<C
 /// Like [`run`], but `cancel` resolving interrupts the command. On cancel the
 /// process group is killed — reusing the same clean teardown as the timeout, so
 /// grandchildren are reaped rather than orphaned.
+///
+/// Non-streaming and non-interactive: the convenience shape for callers that
+/// only want the finished output. [`run_streaming`] does the work.
 pub async fn run_cancellable(
     sandbox: &Sandbox,
     script: &str,
     timeout: Duration,
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<CommandOutput> {
+    // A sender whose receiver is dropped immediately: sends fail and are
+    // ignored, which is exactly "nobody is watching".
+    let (tx, _) = mpsc::channel(1);
+    run_streaming(sandbox, script, timeout, cancel, tx, None).await
+}
+
+/// Run `script`, forwarding output as it arrives and optionally feeding stdin.
+///
+/// `timeout` is an **idle** bound: it resets whenever output is read or input is
+/// written, so a command is killed after that long doing nothing rather than
+/// that long in total. A build that prints progress for two minutes survives; a
+/// silent one still dies on schedule. [`HARD_TIMEOUT_MULTIPLE`] bounds the total
+/// regardless, so a command that prints forever cannot run forever.
+///
+/// `stdin` is a pipe only when a receiver is given. With `None` it stays
+/// `/dev/null`, so an interactive command fails fast instead of hanging — the
+/// default this module was built around.
+pub async fn run_streaming(
+    sandbox: &Sandbox,
+    script: &str,
+    timeout: Duration,
+    cancel: impl std::future::Future<Output = ()>,
+    output: mpsc::Sender<Chunk>,
+    mut stdin: Option<mpsc::Receiver<String>>,
+) -> Result<CommandOutput> {
+    let interactive = stdin.is_some();
     let mut command = sandbox.command(script);
     command
-        .stdin(Stdio::null())
+        .stdin(if interactive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -134,62 +207,191 @@ pub async fn run_cancellable(
 
     let mut stdout_pipe = child.stdout.take().expect("stdout piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let mut stdin_pipe = child.stdin.take();
 
-    // Drain both pipes while waiting. Without this a command producing more than
-    // a pipe buffer of output would block forever and only surface as a timeout.
-    let collect = async {
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let (a, b) = tokio::join!(
-            read_capped(&mut stdout_pipe, &mut out),
-            read_capped(&mut stderr_pipe, &mut err),
-        );
-        let status = child.wait().await;
-        (out, err, a, b, status)
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut truncated = false;
+    // Set once a pipe hits EOF, so its arm stops being polled — a closed pipe
+    // reads 0 forever and would spin the loop.
+    let (mut out_done, mut err_done) = (false, false);
+    let mut out_buf = [0u8; 8192];
+    let mut err_buf = [0u8; 8192];
+
+    let started = tokio::time::Instant::now();
+    let hard_deadline = started + timeout * HARD_TIMEOUT_MULTIPLE;
+    let idle = tokio::time::sleep(timeout);
+    tokio::pin!(idle);
+    tokio::pin!(cancel);
+
+    let finished = loop {
+        tokio::select! {
+            // Cancel and the deadlines are checked first so a command that
+            // floods its pipes cannot starve them.
+            biased;
+
+            _ = &mut cancel => {
+                kill_group(pid);
+                return Ok(CommandOutput {
+                    stderr: "command cancelled".to_string(),
+                    cancelled: true,
+                    ..empty(script)
+                });
+            }
+
+            _ = &mut idle => {
+                kill_group(pid);
+                return Ok(CommandOutput {
+                    stderr: format!(
+                        "command produced nothing for {}s and was killed",
+                        timeout.as_secs()
+                    ),
+                    timed_out: true,
+                    ..empty(script)
+                });
+            }
+
+            _ = tokio::time::sleep_until(hard_deadline) => {
+                kill_group(pid);
+                return Ok(CommandOutput {
+                    stderr: format!(
+                        "command ran longer than the {}s ceiling and was killed",
+                        (timeout * HARD_TIMEOUT_MULTIPLE).as_secs()
+                    ),
+                    timed_out: true,
+                    ..empty(script)
+                });
+            }
+
+            read = stdout_pipe.read(&mut out_buf), if !out_done => {
+                match read.context("reading stdout")? {
+                    0 => out_done = true,
+                    n => {
+                        truncated |= record(&mut out, &out_buf[..n]);
+                        forward(&output, Stream::Stdout, &out_buf[..n]).await;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                }
+            }
+
+            read = stderr_pipe.read(&mut err_buf), if !err_done => {
+                match read.context("reading stderr")? {
+                    0 => err_done = true,
+                    n => {
+                        truncated |= record(&mut err, &err_buf[..n]);
+                        forward(&output, Stream::Stderr, &err_buf[..n]).await;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                }
+            }
+
+            // A line to answer the command with. `None` means the sender was
+            // dropped: close the pipe so the child sees EOF rather than waiting
+            // on input that will never come.
+            line = async { stdin.as_mut().expect("guarded by the condition").recv().await },
+                if stdin.is_some() =>
+            {
+                match (line, stdin_pipe.as_mut()) {
+                    (Some(line), Some(pipe)) => {
+                        let _ = pipe.write_all(format!("{line}\n").as_bytes()).await;
+                        let _ = pipe.flush().await;
+                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    }
+                    _ => {
+                        stdin = None;
+                        stdin_pipe = None;
+                    }
+                }
+            }
+
+            status = child.wait() => break status.context("waiting for sandboxed command")?,
+        }
     };
 
-    tokio::pin!(cancel);
-    tokio::select! {
-        // The user interrupted before the command finished.
-        _ = &mut cancel => {
-            kill_group(pid);
-            Ok(CommandOutput {
-                command: script.to_string(),
-                exit_code: None,
-                stdout: String::new(),
-                stderr: "command cancelled".to_string(),
-                truncated: false,
-                timed_out: false,
-                cancelled: true,
-            })
+    // The child is gone, but its pipes may still hold buffered output. Drain
+    // what is left, or the last lines of a fast command would be lost.
+    if !out_done {
+        truncated |= drain(&mut stdout_pipe, &mut out, &output, Stream::Stdout).await?;
+    }
+    if !err_done {
+        truncated |= drain(&mut stderr_pipe, &mut err, &output, Stream::Stderr).await?;
+    }
+
+    Ok(CommandOutput {
+        command: script.to_string(),
+        exit_code: finished.code(),
+        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stderr: String::from_utf8_lossy(&err).into_owned(),
+        truncated,
+        timed_out: false,
+        cancelled: false,
+        input: Vec::new(),
+    })
+}
+
+/// A `CommandOutput` for a run that produced nothing usable.
+fn empty(script: &str) -> CommandOutput {
+    CommandOutput {
+        command: script.to_string(),
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        truncated: false,
+        timed_out: false,
+        cancelled: false,
+        input: Vec::new(),
+    }
+}
+
+/// Append to the capped buffer. Returns whether anything was dropped.
+///
+/// Past the cap the bytes are discarded but still read, so the child never
+/// blocks on a full pipe — it just stops being recorded.
+fn record(sink: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    if sink.len() >= MAX_STREAM_BYTES {
+        return true;
+    }
+    let room = MAX_STREAM_BYTES - sink.len();
+    let take = room.min(bytes.len());
+    sink.extend_from_slice(&bytes[..take]);
+    take < bytes.len()
+}
+
+/// Hand a chunk to the watcher, if there is one.
+///
+/// A send failure means nobody is listening — the non-streaming path, or a
+/// cancelled turn — which is not an error worth propagating.
+async fn forward(output: &mpsc::Sender<Chunk>, stream: Stream, bytes: &[u8]) {
+    if output.is_closed() {
+        return;
+    }
+    let _ = output
+        .send(Chunk {
+            stream,
+            text: String::from_utf8_lossy(bytes).into_owned(),
+        })
+        .await;
+}
+
+/// Read a pipe to EOF after the child has exited.
+async fn drain<R>(
+    reader: &mut R,
+    sink: &mut Vec<u8>,
+    output: &mpsc::Sender<Chunk>,
+    stream: Stream,
+) -> Result<bool>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let n = reader.read(&mut buffer).await?;
+        if n == 0 {
+            return Ok(truncated);
         }
-        result = tokio::time::timeout(timeout, collect) => match result {
-            Ok((out, err, a, b, status)) => {
-                let truncated = a.context("reading stdout")? || b.context("reading stderr")?;
-                let status = status.context("waiting for sandboxed command")?;
-                Ok(CommandOutput {
-                    command: script.to_string(),
-                    exit_code: status.code(),
-                    stdout: String::from_utf8_lossy(&out).into_owned(),
-                    stderr: String::from_utf8_lossy(&err).into_owned(),
-                    truncated,
-                    timed_out: false,
-                    cancelled: false,
-                })
-            }
-            Err(_) => {
-                kill_group(pid);
-                Ok(CommandOutput {
-                    command: script.to_string(),
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: format!("command exceeded the {}s timeout", timeout.as_secs()),
-                    truncated: false,
-                    timed_out: true,
-                    cancelled: false,
-                })
-            }
-        }
+        truncated |= record(sink, &buffer[..n]);
+        forward(output, stream, &buffer[..n]).await;
     }
 }
 
@@ -291,34 +493,6 @@ async fn run_program(
             message
         };
         Ok(Err(message))
-    }
-}
-
-/// Read until EOF or the cap. Returns whether output was truncated.
-///
-/// Reading continues past the cap and discards the excess, so the child never
-/// blocks on a full pipe — it just stops being recorded.
-async fn read_capped<R>(reader: &mut R, sink: &mut Vec<u8>) -> Result<bool>
-where
-    R: AsyncReadExt + Unpin,
-{
-    let mut buffer = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        let n = reader.read(&mut buffer).await?;
-        if n == 0 {
-            return Ok(truncated);
-        }
-        if sink.len() < MAX_STREAM_BYTES {
-            let room = MAX_STREAM_BYTES - sink.len();
-            let take = room.min(n);
-            sink.extend_from_slice(&buffer[..take]);
-            if take < n {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
-        }
     }
 }
 
@@ -639,6 +813,176 @@ mod tests {
         let out = run(&sandbox, "cat", secs(5)).await.unwrap();
         assert!(!out.timed_out, "stdin should be /dev/null, not a tty");
         assert!(out.succeeded());
+    }
+
+    /// Run with a watcher attached, returning the outcome and every chunk.
+    async fn run_watched(
+        sandbox: &Sandbox,
+        script: &str,
+        timeout: Duration,
+    ) -> (CommandOutput, Vec<Chunk>) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let collect = tokio::spawn(async move {
+            let mut chunks = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                chunks.push(chunk);
+            }
+            chunks
+        });
+        let out = run_streaming(sandbox, script, timeout, std::future::pending(), tx, None)
+            .await
+            .unwrap();
+        (out, collect.await.unwrap())
+    }
+
+    fn joined(chunks: &[Chunk], stream: Stream) -> String {
+        chunks
+            .iter()
+            .filter(|c| c.stream == stream)
+            .map(|c| c.text.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn output_is_forwarded_as_it_is_produced() {
+        let (sandbox, _dir) = sandbox_in("stream");
+        let (out, chunks) = run_watched(&sandbox, "echo one; echo two >&2", secs(10)).await;
+
+        assert!(out.succeeded(), "{out:?}");
+        assert_eq!(joined(&chunks, Stream::Stdout).trim(), "one");
+        assert_eq!(joined(&chunks, Stream::Stderr).trim(), "two");
+        // The streamed text and the recorded text are the same content by two
+        // routes; the recorded one stays authoritative.
+        assert_eq!(out.stdout.trim(), "one");
+    }
+
+    #[tokio::test]
+    async fn a_chunk_arrives_before_the_command_exits() {
+        // The whole point: a long command must be watchable, not just autopsied.
+        let (sandbox, _dir) = sandbox_in("stream-early");
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let run = tokio::spawn({
+            let sandbox = sandbox.clone();
+            async move {
+                run_streaming(
+                    &sandbox,
+                    "echo first; sleep 5; echo last",
+                    secs(30),
+                    std::future::pending(),
+                    tx,
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        });
+
+        let first = tokio::time::timeout(secs(3), rx.recv())
+            .await
+            .expect("a chunk should arrive long before the command finishes")
+            .expect("the channel should carry it");
+        assert_eq!(first.text.trim(), "first");
+        assert!(!run.is_finished(), "the command is still running");
+
+        let out = run.await.unwrap();
+        assert!(out.stdout.contains("last"));
+    }
+
+    #[tokio::test]
+    async fn a_typed_line_reaches_the_command() {
+        let (sandbox, _dir) = sandbox_in("stdin-line");
+        let (chunks_tx, _chunks_rx) = mpsc::channel(64);
+        let (input_tx, input_rx) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            // Sent after the command is up and blocking on `read`.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = input_tx.send("Forest".to_string()).await;
+        });
+
+        let out = run_streaming(
+            &sandbox,
+            "read name; echo \"hi $name\"",
+            secs(10),
+            std::future::pending(),
+            chunks_tx,
+            Some(input_rx),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.succeeded(), "{out:?}");
+        assert_eq!(out.stdout.trim(), "hi Forest");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_input_channel_closes_stdin() {
+        // Otherwise a command waiting on input the user never sends would sit
+        // there until the idle timeout instead of seeing EOF.
+        let (sandbox, _dir) = sandbox_in("stdin-eof");
+        let (chunks_tx, _chunks_rx) = mpsc::channel(64);
+        let (input_tx, input_rx) = mpsc::channel::<String>(4);
+        drop(input_tx);
+
+        let out = run_streaming(
+            &sandbox,
+            "cat",
+            secs(10),
+            std::future::pending(),
+            chunks_tx,
+            Some(input_rx),
+        )
+        .await
+        .unwrap();
+        assert!(!out.timed_out, "should see EOF, not hang: {out:?}");
+        assert!(out.succeeded());
+    }
+
+    #[tokio::test]
+    async fn the_timeout_is_idle_time_not_total_time() {
+        // A command that keeps talking survives well past the bound; the old
+        // total-budget timeout would have killed this at 2s.
+        let (sandbox, _dir) = sandbox_in("idle-alive");
+        let (out, _) = run_watched(
+            &sandbox,
+            "for i in 1 2 3 4 5 6; do echo $i; sleep 0.5; done",
+            secs(2),
+        )
+        .await;
+
+        assert!(!out.timed_out, "output should keep it alive: {out:?}");
+        assert!(out.succeeded());
+        assert!(out.stdout.contains('6'), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn silence_still_times_out() {
+        let (sandbox, _dir) = sandbox_in("idle-dead");
+        let started = std::time::Instant::now();
+        let (out, _) = run_watched(&sandbox, "sleep 60", secs(1)).await;
+
+        assert!(out.timed_out, "{out:?}");
+        assert!(out.stderr.contains("nothing for"), "{out:?}");
+        assert!(started.elapsed() < secs(10), "should die on schedule");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_never_stops_talking_still_hits_a_ceiling() {
+        // Constant output resets the idle clock forever, so without the hard
+        // bound this would run until the user noticed.
+        let (sandbox, _dir) = sandbox_in("hard-ceiling");
+        let idle = Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let (out, _) = run_watched(&sandbox, "while true; do echo spew; done", idle).await;
+
+        assert!(out.timed_out, "{out:?}");
+        assert!(out.stderr.contains("ceiling"), "{out:?}");
+        assert!(
+            started.elapsed() >= idle * HARD_TIMEOUT_MULTIPLE,
+            "the idle bound must not have fired first"
+        );
+        assert!(started.elapsed() < secs(30), "took {:?}", started.elapsed());
     }
 
     #[tokio::test]

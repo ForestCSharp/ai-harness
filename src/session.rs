@@ -228,6 +228,7 @@ mod tests {
                 truncated: false,
                 timed_out: false,
                 cancelled: false,
+                input: Vec::new(),
             })),
             Entry::FetchResult(Box::new(crate::fetch::FetchOutcome {
                 url: "https://example.com".into(),

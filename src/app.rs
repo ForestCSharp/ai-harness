@@ -113,6 +113,75 @@ pub struct Pending {
     pub diff: Option<Vec<crate::diff::Change>>,
 }
 
+/// Live view of the command currently running.
+///
+/// Display-only, exactly like [`App::streaming`]: the authoritative text is the
+/// [`CommandOutput`] that arrives at the end, so nothing acts on a half-read
+/// buffer. Bounded, because a chatty command would otherwise grow it without
+/// limit for a view only the last screenful of which is ever seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningCommand {
+    pub command: String,
+    /// Recent output lines, oldest first, with the stream each came from.
+    lines: std::collections::VecDeque<(bool, String)>,
+    /// Whether the last line is still being written, so the next chunk appends
+    /// to it rather than starting a new one.
+    open: bool,
+    /// Lines the user sent to the command, kept so the result can carry them.
+    pub input: Vec<String>,
+}
+
+/// Output lines kept for the live view. A few screenfuls: enough to scroll back
+/// a little, far short of a build log.
+const MAX_RUNNING_LINES: usize = 200;
+
+impl RunningCommand {
+    fn new(command: String) -> Self {
+        Self {
+            command,
+            lines: std::collections::VecDeque::new(),
+            open: false,
+            input: Vec::new(),
+        }
+    }
+
+    /// Fold in a chunk, which may begin or end mid-line.
+    fn push(&mut self, stderr: bool, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut pieces: Vec<&str> = text.split('\n').collect();
+        // A trailing newline marks the end of a line, not the start of a blank
+        // one — `split` yields an empty final piece either way.
+        let ends_line = text.ends_with('\n');
+        if ends_line {
+            pieces.pop();
+        }
+
+        for (i, piece) in pieces.iter().enumerate() {
+            // Only the first piece can continue what the last chunk left open;
+            // every later one followed a newline.
+            let continues = i == 0 && self.open;
+            match self.lines.back_mut() {
+                Some((was_stderr, last)) if continues && *was_stderr == stderr => {
+                    last.push_str(piece)
+                }
+                _ => self.lines.push_back((stderr, piece.to_string())),
+            }
+        }
+
+        self.open = !ends_line;
+        while self.lines.len() > MAX_RUNNING_LINES {
+            self.lines.pop_front();
+        }
+    }
+
+    /// The visible lines, as `(is_stderr, text)`.
+    pub fn lines(&self) -> impl Iterator<Item = (bool, &str)> {
+        self.lines.iter().map(|(e, l)| (*e, l.as_str()))
+    }
+}
+
 /// The `/load` session picker overlay. A UI overlay, not a conversation status:
 /// it coexists with `Status::Idle`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +238,15 @@ pub struct App {
     /// because the risks differ: a read is confined to the working directory,
     /// while a fetch is an outbound request to a host the model chose.
     pub confirm_fetches: bool,
+    /// When true, a running command gets a real stdin pipe and the prompt stays
+    /// live so you can answer it.
+    ///
+    /// Off by default: `/dev/null` stdin is what makes an interactive command
+    /// fail fast rather than hang, and that guard is only worth giving up when
+    /// someone is actually watching.
+    pub interactive: bool,
+    /// Live output from the command running now, if any.
+    pub running: Option<RunningCommand>,
     /// When true, an approvable action runs without the modal.
     ///
     /// Read but never acted on here: this type still parks a `Pending` exactly
@@ -263,6 +341,8 @@ impl App {
             sandbox: None,
             confirm_reads: false,
             confirm_fetches: false,
+            interactive: false,
+            running: None,
             auto_approve: false,
             pending_fetch: None,
             ledger: Ledger::default(),
@@ -393,6 +473,9 @@ impl App {
         // Cancelling out of a retry loop abandons the turn, so the failed
         // attempts should leave no more behind than giving up on them does.
         self.roll_back_retries();
+        // The live view goes with the command it was watching; the transcript
+        // still gets a cancelled result from the task's own teardown.
+        self.running = None;
         self.mark_request_done();
         // A fresh generation means any update still queued from the abandoned
         // task will be recognised as stale and dropped.
@@ -494,6 +577,15 @@ impl App {
                     "off — actions wait for approval"
                 };
                 self.push_notice(format!("Auto-approve {state}."));
+            }
+            Command::Interactive => {
+                self.interactive = !self.interactive;
+                let state = if self.interactive {
+                    "on — a running command gets a real stdin; type to answer it"
+                } else {
+                    "off — commands run with stdin closed and cannot prompt you"
+                };
+                self.push_notice(format!("Interactive mode {state}."));
             }
             Command::Help => self.push_notice(crate::command::help_text()),
             Command::Clear => self.reset_conversation(),
@@ -1055,8 +1147,63 @@ impl App {
         Some(self.history.clone())
     }
 
+    /// Begin watching a command that is about to run.
+    pub fn start_running(&mut self, command: String) {
+        self.running = Some(RunningCommand::new(command));
+        self.follow = true;
+    }
+
+    /// Fold a chunk of live output into the running view.
+    pub fn push_command_chunk(&mut self, stderr: bool, text: &str) {
+        if let Some(running) = &mut self.running {
+            running.push(stderr, text);
+            self.follow = true;
+        }
+    }
+
+    /// Record a line the user sent to the running command.
+    ///
+    /// Kept here rather than in `exec` because this is the layer that collected
+    /// it, and the result needs it regardless of how the command ended.
+    pub fn push_command_input(&mut self, line: String) {
+        if let Some(running) = &mut self.running {
+            running.push(false, &format!("{line}\n"));
+            running.input.push(line);
+            self.follow = true;
+        }
+    }
+
+    /// Whether a command is running and able to take input right now.
+    pub fn accepts_input(&self) -> bool {
+        self.interactive && self.running.is_some() && self.status == Status::Running
+    }
+
+    /// Explain why what was typed did not reach the running command.
+    ///
+    /// Whether stdin is a pipe is settled when the command is spawned, and
+    /// `/interactive` cannot be typed mid-run because slash commands need an
+    /// idle prompt. So a user who discovers too late that a command wants input
+    /// has no move — and, without this, no way to find out why. Say it plainly
+    /// rather than letting Enter do nothing.
+    pub fn warn_no_stdin(&mut self) {
+        let advice = if self.interactive {
+            "This command was started before interactive mode was on, so its \
+             stdin is closed. Press Esc and ask for it again."
+        } else {
+            "Interactive mode is off, so this command's stdin is closed and it \
+             cannot be answered. Press Esc, run /interactive, then ask again."
+        };
+        self.push_notice(advice);
+    }
+
     /// Record a finished command and hand the result back to the model.
-    pub fn push_command_result(&mut self, output: CommandOutput) -> Vec<Message> {
+    pub fn push_command_result(&mut self, mut output: CommandOutput) -> Vec<Message> {
+        // Carry across what the user typed: `exec` wrote those bytes to a pipe
+        // but never saw them as lines, and the model has to be told a human
+        // answered or it will invent what the answers were.
+        if let Some(running) = self.running.take() {
+            output.input = running.input;
+        }
         let encoded = protocol::encode_shell_result(&output);
         self.transcript.push(Entry::CommandResult(Box::new(output)));
         self.frame(Direction::Sent, encoded.clone());
@@ -1097,6 +1244,8 @@ impl App {
     }
 
     pub fn push_error(&mut self, message: String) {
+        // Whatever was running is over; the live view must not outlive it.
+        self.running = None;
         // Drop the trailing user turn (a query, or a command result) so a retry
         // does not double-send it.
         if matches!(
@@ -1399,6 +1548,201 @@ mod tests {
             "the cap must stop the action, approved or not"
         );
         assert_eq!(app.status, Status::Idle, "control returns to the user");
+    }
+
+    #[test]
+    fn interactive_mode_is_off_unless_asked_for() {
+        let app = App::new("m".into(), None, 10, std::env::temp_dir());
+        assert!(
+            !app.interactive,
+            "closed stdin is what makes an interactive command fail fast"
+        );
+        assert!(!app.accepts_input(), "nothing is running to type at");
+    }
+
+    #[test]
+    fn the_interactive_command_toggles_and_says_what_it_means() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+
+        app.run_command(Command::Interactive);
+        assert!(app.interactive);
+        match last_visible(&app) {
+            Entry::Notice(text) => assert!(text.contains("stdin"), "{text}"),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+
+        app.run_command(Command::Interactive);
+        assert!(!app.interactive, "the toggle must go both ways");
+    }
+
+    #[test]
+    fn input_is_only_accepted_while_a_command_is_actually_running() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.interactive = true;
+        assert!(!app.accepts_input(), "the mode alone is not enough");
+
+        app.start_running("cat".into());
+        app.status = Status::Running;
+        assert!(app.accepts_input());
+
+        app.interactive = false;
+        assert!(!app.accepts_input(), "the mode still gates it");
+    }
+
+    #[test]
+    fn typing_at_a_command_that_cannot_hear_you_says_so() {
+        // The trap this closes: stdin is settled when the command spawns, and
+        // /interactive cannot be typed mid-run because slash commands need an
+        // idle prompt. Without a notice, Enter just does nothing forever.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.start_running("read name".into());
+        app.status = Status::Running;
+
+        app.warn_no_stdin();
+        match last_visible(&app) {
+            Entry::Notice(text) => {
+                assert!(text.contains("/interactive"), "must say the fix: {text}");
+                assert!(text.contains("Esc"), "and that a restart is needed: {text}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_warning_differs_once_the_mode_is_on() {
+        // Mode on but no pipe means it was turned on too late, and telling the
+        // user to run /interactive would be useless advice.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.interactive = true;
+        app.start_running("read name".into());
+        app.status = Status::Running;
+
+        app.warn_no_stdin();
+        match last_visible(&app) {
+            Entry::Notice(text) => assert!(
+                text.contains("before interactive mode was on"),
+                "should not tell them to enable what is already on: {text}"
+            ),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_output_accumulates_across_chunk_boundaries() {
+        // A chunk can end mid-line; the next one continues it rather than
+        // starting a new line, or every partial read would look like a newline.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.start_running("build".into());
+
+        app.push_command_chunk(false, "compil");
+        app.push_command_chunk(false, "ing\ndone\n");
+
+        let lines: Vec<_> = app
+            .running
+            .as_ref()
+            .unwrap()
+            .lines()
+            .map(|(e, l)| (e, l.to_string()))
+            .collect();
+        assert_eq!(lines[0], (false, "compiling".to_string()));
+        assert_eq!(lines[1], (false, "done".to_string()));
+    }
+
+    #[test]
+    fn stderr_stays_distinguishable_from_stdout() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.start_running("build".into());
+        app.push_command_chunk(false, "fine\n");
+        app.push_command_chunk(true, "broken\n");
+
+        let lines: Vec<_> = app.running.as_ref().unwrap().lines().collect();
+        assert_eq!(lines, vec![(false, "fine"), (true, "broken")]);
+    }
+
+    #[test]
+    fn the_live_view_is_bounded() {
+        // A chatty command must not grow a buffer only the last screenful of
+        // which is ever rendered.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.start_running("spew".into());
+        for i in 0..(MAX_RUNNING_LINES * 3) {
+            app.push_command_chunk(false, &format!("line {i}\n"));
+        }
+
+        let running = app.running.as_ref().unwrap();
+        assert!(running.lines().count() <= MAX_RUNNING_LINES);
+        assert!(
+            running
+                .lines()
+                .any(|(_, l)| l.contains(&format!("line {}", MAX_RUNNING_LINES * 3 - 1))),
+            "the newest output is the part worth keeping"
+        );
+    }
+
+    #[test]
+    fn typed_input_reaches_the_result_and_the_model() {
+        // Piped stdin is not echoed into stdout, so if this is dropped the model
+        // sees a prompt and an answer-shaped hole, and fills it by guessing.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.interactive = true;
+        app.start_running("read name".into());
+        app.push_command_input("Forest".into());
+
+        let messages = app.push_command_result(output_with_stdout("hi Forest"));
+        let result = &messages.last().unwrap().content;
+        assert!(result.contains("Forest"), "{result}");
+        assert!(result.contains("typed by the user"), "{result}");
+
+        match last_visible(&app) {
+            Entry::CommandResult(out) => assert_eq!(out.input, vec!["Forest".to_string()]),
+            other => panic!("expected a command result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_result_with_no_typed_input_says_nothing_about_it() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.start_running("ls".into());
+        let messages = app.push_command_result(output_with_stdout("a"));
+        assert!(!messages.last().unwrap().content.contains("typed by"));
+    }
+
+    #[test]
+    fn finishing_a_command_clears_the_live_view() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.start_running("ls".into());
+        app.push_command_chunk(false, "a\n");
+        app.push_command_result(output_with_stdout("a"));
+        assert!(
+            app.running.is_none(),
+            "the window must not outlive the command"
+        );
+    }
+
+    #[test]
+    fn cancelling_clears_the_live_view() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.start_running("sleep 60".into());
+        app.status = Status::Running;
+
+        app.cancel();
+        assert!(app.running.is_none());
+        assert!(!app.accepts_input(), "nothing left to type at");
+    }
+
+    fn output_with_stdout(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            command: "c".into(),
+            exit_code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+            cancelled: false,
+            input: Vec::new(),
+        }
     }
 
     pub(super) fn last_visible(app: &App) -> &Entry {
@@ -1822,6 +2166,7 @@ mod tests {
             truncated: false,
             timed_out: false,
             cancelled: false,
+            input: Vec::new(),
         }
     }
 

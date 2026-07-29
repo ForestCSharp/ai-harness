@@ -62,6 +62,14 @@ pub struct Args {
     #[arg(long, env = "AI_HARNESS_AUTO_APPROVE")]
     pub auto_approve: bool,
 
+    /// Give a running command a real stdin you can type into. Toggle with /interactive.
+    ///
+    /// Off by default: closed stdin is what makes an interactive command fail
+    /// fast rather than hang. This connects a pipe, not a terminal, so programs
+    /// that read from /dev/tty (sudo, ssh passwords) are unaffected.
+    #[arg(long, env = "AI_HARNESS_INTERACTIVE")]
+    pub interactive: bool,
+
     /// Start with debug mode on, showing raw protocol frames. Toggle with /debug.
     ///
     /// Also enabled by default in non-shipping (`dev`) builds; the flag forces it on
