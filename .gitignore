@@ -9,8 +9,9 @@ secrets/
 
 tmp/
 
-# Saved sessions (default --sessions-dir).
-sessions/
+# Per-project harness state: saved sessions, and whatever else becomes
+# session-scoped. Written under the working directory the harness runs against.
+.ai_harness/
 
 # macOS
 .DS_Store

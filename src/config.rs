@@ -1,12 +1,16 @@
 //! CLI arguments and environment configuration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.2";
+
+/// Everything the harness keeps for a project, under its working directory.
+/// Sessions live here today; per-session plans and the like will join them.
+pub const HARNESS_DIR: &str = ".ai_harness";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -81,9 +85,14 @@ pub struct Args {
     #[arg(long, default_value_t = crate::app::DEFAULT_MAX_RETRIES, env = "AI_HARNESS_MAX_RETRIES")]
     pub max_retries: usize,
 
-    /// Directory for `/save` and `/load` session files.
-    #[arg(long, default_value = "sessions", env = "AI_HARNESS_SESSIONS_DIR")]
-    pub sessions_dir: PathBuf,
+    /// Directory holding session folders.
+    ///
+    /// Defaults to `.ai_harness/sessions` under the sandbox root, so sessions
+    /// belong to the project being worked on rather than to whichever directory
+    /// the harness happened to be launched from. Given explicitly, the path is
+    /// used exactly as written.
+    #[arg(long, env = "AI_HARNESS_SESSIONS_DIR")]
+    pub sessions_dir: Option<PathBuf>,
 
     /// Input price in dollars per million tokens, for the `/cost` estimate.
     ///
@@ -111,6 +120,18 @@ impl Args {
         }
     }
 
+    /// Where session folders live, given the resolved sandbox root.
+    ///
+    /// Takes `root` rather than calling [`Args::root`] itself, so the caller's
+    /// already-canonicalised root is the one used — the sandbox resolves it, and
+    /// two different answers about where the project is would be worse than
+    /// asking for it.
+    pub fn sessions_dir(&self, root: &Path) -> PathBuf {
+        self.sessions_dir
+            .clone()
+            .unwrap_or_else(|| root.join(HARNESS_DIR).join("sessions"))
+    }
+
     /// Read the API key from the environment, with a message that says how to fix it.
     pub fn api_key() -> Result<String> {
         std::env::var("OPENROUTER_API_KEY")
@@ -126,5 +147,52 @@ impl Args {
                 }
                 Ok(key)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Parse args as if typed, with the binary name prepended.
+    fn args(extra: &[&str]) -> Args {
+        let mut argv = vec!["ai-harness"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn sessions_default_to_the_harness_dir_under_the_root() {
+        // Under the root, not the process cwd: sessions belong to the project
+        // being worked on, not to whichever directory this was launched from.
+        let root = Path::new("/projects/thing");
+        assert_eq!(
+            args(&[]).sessions_dir(root),
+            root.join(".ai_harness").join("sessions")
+        );
+    }
+
+    #[test]
+    fn an_explicit_sessions_dir_is_used_verbatim() {
+        let chosen = args(&["--sessions-dir", "/tmp/elsewhere"]);
+        assert_eq!(
+            chosen.sessions_dir(Path::new("/projects/thing")),
+            PathBuf::from("/tmp/elsewhere"),
+            "the escape hatch must not be re-rooted"
+        );
+    }
+
+    #[test]
+    fn the_root_follows_workdir_and_so_do_sessions() {
+        let parsed = args(&["--workdir", "/projects/other"]);
+        let root = parsed.root().unwrap();
+        assert_eq!(root, PathBuf::from("/projects/other"));
+        assert_eq!(
+            parsed.sessions_dir(&root),
+            Path::new("/projects/other")
+                .join(".ai_harness")
+                .join("sessions")
+        );
     }
 }

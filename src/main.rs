@@ -115,7 +115,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         client.model().to_string(),
         args.system.clone(),
         args.max_iterations.max(1),
-        args.sessions_dir.clone(),
+        args.sessions_dir(sandbox.root()),
     );
     app.debug = args.debug || cfg!(debug_assertions);
     app.max_retries = args.max_retries;
@@ -316,9 +316,37 @@ fn handle_event(
                     app.set_choice(Choice::Deny);
                 }
             }
+            // Clicking a choice answers with it; hovering focuses it.
+            MouseEventKind::Down(MouseButton::Left) if app.question().is_some() => {
+                if let Some(i) = row_at(
+                    metrics.question_list,
+                    metrics.question_offset,
+                    mouse.column,
+                    mouse.row,
+                ) && app.question_select(i)
+                    && let Some(messages) = app.answer_question()
+                {
+                    spawn_request(app, ctx, inflight, messages);
+                }
+            }
+            MouseEventKind::Moved if app.question().is_some() => {
+                if let Some(i) = row_at(
+                    metrics.question_list,
+                    metrics.question_offset,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    app.question_select(i);
+                }
+            }
             // Clicking a session row loads it; hovering focuses it.
             MouseEventKind::Down(MouseButton::Left) if app.picker().is_some() => {
-                if let Some(i) = picker_row_at(metrics, mouse.column, mouse.row) {
+                if let Some(i) = row_at(
+                    metrics.picker_list,
+                    metrics.picker_offset,
+                    mouse.column,
+                    mouse.row,
+                ) {
                     // Only load when the click lands on a real row.
                     if app.picker_select(i) {
                         app.picker_confirm();
@@ -326,7 +354,12 @@ fn handle_event(
                 }
             }
             MouseEventKind::Moved if app.picker().is_some() => {
-                if let Some(i) = picker_row_at(metrics, mouse.column, mouse.row) {
+                if let Some(i) = row_at(
+                    metrics.picker_list,
+                    metrics.picker_offset,
+                    mouse.column,
+                    mouse.row,
+                ) {
                     app.picker_select(i);
                 }
             }
@@ -343,14 +376,22 @@ fn handle_event(
     }
 }
 
-/// Which session row a mouse position falls on, using the picker geometry from
-/// the last rendered frame. `None` when the point is outside the list.
-fn picker_row_at(metrics: ui::Metrics, column: u16, row: u16) -> Option<usize> {
-    let list = metrics.picker_list?;
+/// Which list row a mouse position falls on, using the geometry from the last
+/// rendered frame. `None` when the point is outside the list.
+///
+/// Shared by the session picker and the model's question, which are the same
+/// shape: a scrolled window of rows whose first visible index is `offset`.
+fn row_at(
+    list: Option<ratatui::layout::Rect>,
+    offset: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let list = list?;
     if !ui::hit(Some(list), column, row) {
         return None;
     }
-    Some(metrics.picker_offset + (row - list.y) as usize)
+    Some(offset + (row - list.y) as usize)
 }
 
 /// Approve the pending action and start running it — a shell command or a write.
@@ -399,13 +440,15 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
                     .await
                     .map_err(|e| format!("{e:#}")),
             ),
-            // A Response is never approvable, a Read and a Fetch were handled
-            // above, a Shell was handled just now, and an Edit is converted to a
-            // Write by `approve`, so none are reachable.
+            // A Response is never approvable, a question waits in
+            // `AwaitingChoice` rather than becoming pending, a Read and a Fetch
+            // were handled above, a Shell was handled just now, and an Edit is
+            // converted to a Write by `approve`, so none are reachable.
             Action::Shell(_)
             | Action::Read { .. }
             | Action::Fetch { .. }
             | Action::Edit { .. }
+            | Action::Options { .. }
             | Action::Response(_) => return,
         };
         let _ = tx.send(Tagged { generation, update }).await;
@@ -514,6 +557,52 @@ fn handle_key(
             },
             KeyCode::PageUp => app.scroll_up(page),
             KeyCode::PageDown => app.scroll_down(page, max_scroll),
+            _ => {}
+        }
+        return;
+    }
+
+    // The model's question owns the keyboard while it is up, for the same reason
+    // the approval modal does. Placed before the Esc-cancel branch below so Esc
+    // dismisses the question — which the model is told about and can act on —
+    // rather than silently abandoning the turn.
+    if app.question().is_some() {
+        let on_other = app.question().is_some_and(|q| q.on_other());
+        match key.code {
+            KeyCode::Up => app.question_move(-1),
+            KeyCode::Down | KeyCode::Tab => app.question_move(1),
+            KeyCode::BackTab => app.question_move(-1),
+            KeyCode::Esc => {
+                if let Some(messages) = app.decline_question() {
+                    spawn_request(app, ctx, inflight, messages);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(messages) = app.answer_question() {
+                    spawn_request(app, ctx, inflight, messages);
+                }
+            }
+            // A digit picks a choice outright — one keypress is the point of
+            // offering a list. Only while the free-text row is unfocused, or
+            // typing "2 GB" would jump the selection instead of being typed.
+            KeyCode::Char(c) if !on_other && c.is_ascii_digit() && c != '0' => {
+                let index = c.to_digit(10).expect("checked ascii digit") as usize - 1;
+                app.question_select(index);
+            }
+            // Everything else edits the free-text answer, and only when that row
+            // is focused — `question_input` enforces that, so a keystroke aimed
+            // at a highlighted choice cannot vanish into an invisible buffer.
+            KeyCode::Char(c) if !ctrl => app.question_input(|input| input.insert_char(c)),
+            KeyCode::Backspace if alt || ctrl => {
+                app.question_input(|input| input.delete_word_before())
+            }
+            KeyCode::Backspace => app.question_input(|input| input.backspace()),
+            KeyCode::Delete => app.question_input(|input| input.delete()),
+            KeyCode::Left => app.question_input(|input| input.move_left()),
+            KeyCode::Right => app.question_input(|input| input.move_right()),
+            KeyCode::Home => app.question_input(|input| input.move_to_line_start()),
+            KeyCode::End => app.question_input(|input| input.move_to_line_end()),
+            KeyCode::Char('u') if ctrl => app.question_input(|input| input.delete_to_line_start()),
             _ => {}
         }
         return;

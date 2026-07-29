@@ -53,6 +53,14 @@ pub enum Entry {
     WriteResult(WriteOutcome),
     /// A command the user refused.
     Denied(String),
+    /// How the user answered a question from the model.
+    Answer {
+        text: String,
+        /// True when the user typed this rather than picking an offered choice.
+        free: bool,
+    },
+    /// A question the user dismissed without answering.
+    Dismissed,
     /// A raw protocol payload crossing the boundary. Always recorded; shown only
     /// in debug mode, so toggling `/debug` reveals earlier traffic too.
     Frame {
@@ -182,6 +190,59 @@ impl RunningCommand {
     }
 }
 
+/// A question from the model, waiting on the user.
+///
+/// Deliberately **not** a [`Pending`]: an approval is a yes/no about something
+/// the harness will do, while this is a decision only a person can supply. That
+/// separation is what keeps `--auto-approve` from answering it — `App::pending`
+/// returns `None` here, so the event loop's auto-approve hook cannot see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub text: String,
+    pub choices: Vec<String>,
+    /// Index into `choices`, or `choices.len()` for the free-text row.
+    pub selected: usize,
+    /// The answer being typed when the free-text row is focused. Reuses the
+    /// prompt's editor, so it behaves exactly like typing anywhere else.
+    pub other: Input,
+}
+
+impl Question {
+    fn new(text: String, choices: Vec<String>) -> Self {
+        Self {
+            text,
+            choices,
+            selected: 0,
+            other: Input::default(),
+        }
+    }
+
+    /// Rows offered, including the free-text one.
+    pub fn rows(&self) -> usize {
+        self.choices.len() + 1
+    }
+
+    /// Whether the free-text row is focused.
+    pub fn on_other(&self) -> bool {
+        self.selected >= self.choices.len()
+    }
+
+    /// The answer the current selection would send, if it can send one.
+    ///
+    /// `None` when the free-text row is focused but empty — there is nothing to
+    /// send, and treating blank as an answer would tell the model the user
+    /// rejected every choice in favour of saying nothing.
+    fn answer(&self) -> Option<protocol::Answer> {
+        match self.choices.get(self.selected) {
+            Some(choice) => Some(protocol::Answer::Chose(choice.clone())),
+            None => {
+                let typed = self.other.text().trim();
+                (!typed.is_empty()).then(|| protocol::Answer::Wrote(typed.to_string()))
+            }
+        }
+    }
+}
+
 /// The `/load` session picker overlay. A UI overlay, not a conversation status:
 /// it coexists with `Status::Idle`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +261,8 @@ pub enum Status {
     Streaming,
     /// The approval modal is up for a proposed command.
     AwaitingApproval(Pending),
+    /// The model asked a question and is waiting on the answer.
+    AwaitingChoice(Question),
     /// An approved command is executing.
     Running,
 }
@@ -934,6 +997,13 @@ impl App {
                 self.status = Status::Running;
                 self.follow = true;
             }
+            // A question waits on a person. It is not an approval, so it does
+            // not become a `Pending` and auto-approve cannot answer it — which
+            // is the whole point of asking.
+            Action::Options { question, choices } => {
+                self.status = Status::AwaitingChoice(Question::new(question, choices));
+                self.follow = true;
+            }
             // An edit is resolved against the file *before* the modal, so a
             // hopeless one (no match, ambiguous) never bothers the user — it goes
             // straight back to the model to fix.
@@ -1123,6 +1193,77 @@ impl App {
         Some(action)
     }
 
+    /// The question waiting on the user, if any.
+    pub fn question(&self) -> Option<&Question> {
+        match &self.status {
+            Status::AwaitingChoice(question) => Some(question),
+            _ => None,
+        }
+    }
+
+    /// Move the highlight through the choices and the free-text row, wrapping.
+    pub fn question_move(&mut self, delta: isize) {
+        if let Status::AwaitingChoice(question) = &mut self.status {
+            let rows = question.rows() as isize;
+            question.selected = (question.selected as isize + delta).rem_euclid(rows) as usize;
+        }
+    }
+
+    /// Focus a row directly, for a mouse click. Returns whether `i` was a row.
+    pub fn question_select(&mut self, i: usize) -> bool {
+        if let Status::AwaitingChoice(question) = &mut self.status
+            && i < question.rows()
+        {
+            question.selected = i;
+            return true;
+        }
+        false
+    }
+
+    /// Type into the free-text row. A no-op unless it is focused, so keystrokes
+    /// cannot pile up invisibly while a choice is highlighted.
+    pub fn question_input(&mut self, edit: impl FnOnce(&mut Input)) {
+        if let Status::AwaitingChoice(question) = &mut self.status
+            && question.on_other()
+        {
+            edit(&mut question.other);
+        }
+    }
+
+    /// Answer with the current selection. Returns messages to send, or `None`
+    /// when the free-text row is focused and empty.
+    pub fn answer_question(&mut self) -> Option<Vec<Message>> {
+        let answer = self.question()?.answer()?;
+        let (text, free) = match &answer {
+            protocol::Answer::Chose(text) => (text.clone(), false),
+            protocol::Answer::Wrote(text) => (text.clone(), true),
+            protocol::Answer::Declined => unreachable!("answer() never declines"),
+        };
+        self.transcript.push(Entry::Answer { text, free });
+        Some(self.send_answer(&answer))
+    }
+
+    /// Dismiss the question without answering.
+    ///
+    /// Reported to the model rather than abandoning the turn, matching what a
+    /// denial does: the model gets to proceed differently instead of stalling on
+    /// an answer that is never coming.
+    pub fn decline_question(&mut self) -> Option<Vec<Message>> {
+        self.question()?;
+        self.transcript.push(Entry::Dismissed);
+        Some(self.send_answer(&protocol::Answer::Declined))
+    }
+
+    /// Feed an answer back to the model and resume the loop.
+    fn send_answer(&mut self, answer: &protocol::Answer) -> Vec<Message> {
+        let encoded = protocol::encode_option_result(answer);
+        self.frame(Direction::Sent, encoded.clone());
+        self.history.push(Message::user(encoded));
+        self.status = Status::Waiting;
+        self.follow = true;
+        self.history.clone()
+    }
+
     /// Refuse the pending action and tell the model, so it can try something
     /// else rather than assuming it ran. Returns messages to send.
     pub fn deny(&mut self) -> Option<Vec<Message>> {
@@ -1136,7 +1277,9 @@ impl App {
             Action::Fetch { url } => format!("fetch {url}"),
             Action::Write { path, .. } => format!("write {path}"),
             Action::Edit { path, .. } => format!("edit {path}"),
-            Action::Response(_) => String::new(),
+            // Neither is ever approvable: a response ends the turn, and a
+            // question goes to `AwaitingChoice` rather than becoming pending.
+            Action::Options { .. } | Action::Response(_) => String::new(),
         };
         self.transcript.push(Entry::Denied(refused));
         let encoded = protocol::encode_denied();
@@ -1743,6 +1886,158 @@ mod tests {
             cancelled: false,
             input: Vec::new(),
         }
+    }
+
+    fn option_reply(question: &str, choices: &[&str]) -> String {
+        let mut body =
+            format!("<ai-harness-option-question>{question}</ai-harness-option-question>");
+        for choice in choices {
+            body.push_str(&format!(
+                "<ai-harness-option-choice>{choice}</ai-harness-option-choice>"
+            ));
+        }
+        format!("<ai-harness-option>{body}</ai-harness-option>")
+    }
+
+    /// An app sitting on a question from the model.
+    fn asked(choices: &[&str]) -> App {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("build it");
+        app.submit().unwrap();
+        app.push_response(option_reply("Which database?", choices), None);
+        app
+    }
+
+    #[test]
+    fn a_question_waits_rather_than_running_anything() {
+        let app = asked(&["Postgres", "SQLite"]);
+        assert!(app.question().is_some(), "the modal should be up");
+        assert_eq!(
+            app.question().unwrap().choices,
+            vec!["Postgres".to_string(), "SQLite".to_string()]
+        );
+        assert!(app.is_busy(), "the turn is not over");
+    }
+
+    #[test]
+    fn auto_approve_cannot_answer_a_question() {
+        // The property the whole design hangs on. A question is the one thing
+        // that must reach a person, so it deliberately is not a `Pending` —
+        // which is what the event loop's auto-approve hook looks for.
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.auto_approve = true;
+        app.input.insert_str("build it");
+        app.submit().unwrap();
+
+        let sent = app.push_response(option_reply("Which?", &["a", "b"]), None);
+        assert!(sent.is_none(), "nothing goes back until the user answers");
+        assert!(
+            app.pending().is_none(),
+            "a question must never look like an approval, or auto-approve would answer it"
+        );
+        assert!(app.question().is_some());
+    }
+
+    #[test]
+    fn answering_sends_the_choice_and_resumes_the_loop() {
+        let mut app = asked(&["Postgres", "SQLite"]);
+        app.question_move(1);
+
+        let messages = app.answer_question().expect("a choice can be answered");
+        assert_eq!(app.status, Status::Waiting, "the loop continues");
+        let result = &messages.last().unwrap().content;
+        assert!(result.contains("SQLite"), "{result}");
+
+        match last_visible(&app) {
+            Entry::Answer { text, free } => {
+                assert_eq!(text, "SQLite");
+                assert!(!free, "this was one of the offered choices");
+            }
+            other => panic!("expected an answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_highlight_wraps_through_the_free_text_row() {
+        let mut app = asked(&["a", "b"]);
+        assert!(!app.question().unwrap().on_other());
+
+        app.question_move(-1);
+        assert!(
+            app.question().unwrap().on_other(),
+            "up from the first choice reaches the free-text row"
+        );
+        app.question_move(1);
+        assert_eq!(app.question().unwrap().selected, 0, "and wraps back around");
+    }
+
+    #[test]
+    fn a_typed_answer_is_marked_as_the_users_own() {
+        let mut app = asked(&["Postgres", "SQLite"]);
+        app.question_move(-1); // the free-text row
+        app.question_input(|input| input.insert_str("MySQL"));
+
+        let messages = app.answer_question().expect("typed text can be answered");
+        let result = &messages.last().unwrap().content;
+        assert!(result.contains("MySQL"), "{result}");
+        assert!(
+            result.contains("did not pick"),
+            "the model should learn its choices were incomplete: {result}"
+        );
+        match last_visible(&app) {
+            Entry::Answer { free, .. } => assert!(free),
+            other => panic!("expected an answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_free_text_row_cannot_be_sent() {
+        // Blank is not an answer, and sending it would tell the model the user
+        // rejected every choice in favour of saying nothing.
+        let mut app = asked(&["a", "b"]);
+        app.question_move(-1);
+        assert!(app.answer_question().is_none());
+        assert!(app.question().is_some(), "the modal stays up");
+    }
+
+    #[test]
+    fn typing_does_nothing_while_a_choice_is_highlighted() {
+        // Otherwise keystrokes pile up in a buffer nobody can see, and appear
+        // the moment the free-text row is focused.
+        let mut app = asked(&["a", "b"]);
+        app.question_input(|input| input.insert_str("ignored"));
+        assert_eq!(app.question().unwrap().other.text(), "");
+    }
+
+    #[test]
+    fn dismissing_tells_the_model_rather_than_ending_the_turn() {
+        let mut app = asked(&["a", "b"]);
+        let messages = app
+            .decline_question()
+            .expect("dismissal continues the loop");
+
+        assert_eq!(app.status, Status::Waiting, "the model gets to react");
+        let result = &messages.last().unwrap().content;
+        assert!(result.contains("dismissed"), "{result}");
+        assert!(matches!(last_visible(&app), Entry::Dismissed));
+    }
+
+    #[test]
+    fn a_question_past_the_iteration_budget_never_appears() {
+        let mut app = App::new("m".into(), None, 1, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_response(option_reply("Which?", &["a", "b"]), None);
+
+        assert!(app.question().is_none(), "the cap stops it like any action");
+        assert_eq!(app.status, Status::Idle);
+    }
+
+    #[test]
+    fn answering_when_nothing_was_asked_is_a_no_op() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        assert!(app.answer_question().is_none());
+        assert!(app.decline_question().is_none());
     }
 
     pub(super) fn last_visible(app: &App) -> &Entry {
@@ -2866,15 +3161,12 @@ mod tests {
         assert!(files[0].starts_with("session-"), "default per-launch name");
 
         // A second call with no change must not rewrite.
-        let before = std::fs::metadata(dir.join(format!("{files0}.json", files0 = files[0])))
+        let saved = crate::session::dir(&dir, &files[0])
             .unwrap()
-            .modified()
-            .unwrap();
+            .join(crate::session::FILE);
+        let before = std::fs::metadata(&saved).unwrap().modified().unwrap();
         app.maybe_autosave();
-        let after = std::fs::metadata(dir.join(format!("{files0}.json", files0 = files[0])))
-            .unwrap()
-            .modified()
-            .unwrap();
+        let after = std::fs::metadata(&saved).unwrap().modified().unwrap();
         assert_eq!(before, after, "unchanged state must not be rewritten");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2920,15 +3212,17 @@ mod tests {
         submit_prompt(&mut app, "shared history");
         app.maybe_autosave();
         let original = session_files(&dir)[0].clone();
-        let original_before =
-            std::fs::read_to_string(dir.join(format!("{original}.json"))).unwrap();
+        let original_path = crate::session::dir(&dir, &original)
+            .unwrap()
+            .join(crate::session::FILE);
+        let original_before = std::fs::read_to_string(&original_path).unwrap();
 
         app.input.insert_str("/fork branch");
         app.submit();
 
-        // Both files exist; the original is byte-for-byte unchanged.
+        // Both sessions exist; the original is byte-for-byte unchanged.
         assert!(crate::session::exists(&dir, "branch"));
-        let original_after = std::fs::read_to_string(dir.join(format!("{original}.json"))).unwrap();
+        let original_after = std::fs::read_to_string(&original_path).unwrap();
         assert_eq!(
             original_before, original_after,
             "the original must be frozen"

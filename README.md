@@ -11,7 +11,7 @@ Input is not sent as free text. Each prompt goes out wrapped in a single element
 <ai-harness-query>count the rust files in src</ai-harness-query>
 ```
 
-The model must reply with exactly one of six elements, and nothing else:
+The model must reply with exactly one of seven elements, and nothing else:
 
 ```xml
 <ai-harness-shell>ls -1 src/*.rs | wc -l</ai-harness-shell>
@@ -36,6 +36,14 @@ The model must reply with exactly one of six elements, and nothing else:
 <ai-harness-write file=src/hello.rs>
 fn main() { println!("hi"); }
 </ai-harness-write>
+```
+
+```xml
+<ai-harness-option>
+<ai-harness-option-question>Which database should the schema target?</ai-harness-option-question>
+<ai-harness-option-choice>Postgres</ai-harness-option-choice>
+<ai-harness-option-choice>SQLite</ai-harness-option-choice>
+</ai-harness-option>
 ```
 
 ```xml
@@ -110,6 +118,27 @@ apply, and the approval shows a `-`/`+` diff. Under the hood an approved edit
 runs as an ordinary sandboxed write of the whole resolved file, so nothing about
 the confinement changes. `<ai-harness-write>` is still there for creating a new
 file or a deliberate full rewrite.
+
+`<ai-harness-option>` is the model asking *you* something. It could already ask a
+question by putting one in `<ai-harness-response>` — but that **ends the turn**, so
+answering meant typing a fresh prompt and the model resumed from a standing start.
+That cost pushes a model toward guessing on exactly the decisions worth stopping
+for. This makes asking cheap: the question comes up as a modal, `↑`/`↓` or `1`-`9`
+picks an answer, `Enter` sends it, and **the loop carries straight on** — the
+answer goes back as a result like any other.
+
+A final row lets you type an answer that was not offered, and the model is told
+which happened: picking one of its choices and writing your own mean different
+things, and the second says its options were wrong. `Esc` dismisses the question,
+which is also reported, so the model proceeds with a stated assumption rather than
+stalling on an answer that is never coming.
+
+Two properties worth knowing. A question is **never auto-approved**: it is not an
+approval, so `--auto-approve` cannot see it and cannot answer for you — the one
+thing in the protocol that always reaches a person. And an
+`<ai-harness-option-result>` written by the model is rejected as fabrication, the
+same as any other invented result; putting words in your mouth is the version of
+that failure worth guarding hardest.
 
 If a reply fails validation, the harness tells the model exactly what was wrong
 and asks again, up to `--max-retries` (default 3). After that it gives up and
@@ -402,6 +431,19 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | `Ctrl+A` / `Ctrl+E` | Start / end of line |
 | `Ctrl+Home` / `Ctrl+End` | Start / end of the prompt |
 
+While the model's question modal is up, the keyboard belongs to it:
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move between the choices and the free-text row (wraps) |
+| `1`–`9` | Pick that choice outright |
+| `Enter` | Answer with the highlighted choice, or with what you typed |
+| `Esc` | Dismiss the question (reported to the model, which then continues) |
+
+Typing goes to the free-text row **only while it is focused**, so a keystroke
+aimed at a highlighted choice cannot vanish into a buffer you cannot see. Choices
+are clickable too.
+
 Mouse wheel scrolls the transcript. Scrolling up detaches the view; it re-attaches
 to the bottom once you scroll back down (or press `End`).
 
@@ -440,7 +482,7 @@ The prompt box grows downward from a fixed bottom edge as you add lines, up to
 | `src/diff.rs` | Line-by-line diffs of writes and edits, bounded for storage |
 | `src/highlight.rs` | Language detection and tokenising for code blocks |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
-| `src/session.rs` | Saving and loading sessions to disk (`/save`, `/load`) |
+| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
 | `src/ui.rs` | Rendering and layout |
 | `src/app.rs` | Application state: transcript, history, request status |
@@ -497,15 +539,38 @@ corrupting the next turn.
 
 ## Saving and loading sessions
 
-The session **auto-saves after every turn** to `<sessions-dir>/<name>.json`
-(default `sessions/`, set with `--sessions-dir`, gitignored). Until you name it,
-each run writes to a per-launch `session-<timestamp>.json`, so runs never
-overwrite each other.
+The session **auto-saves after every turn**. Each session is a *folder*, under
+`.ai_harness/` in the working directory:
 
-- `/rename <name>` — rename the current session's file (the name it loads under).
-- `/fork [name]` — branch: freeze the current file where it is and keep talking
-  under a new name. Both files start identical and diverge from the fork point;
-  the original is preserved to `/load` back.
+```
+.ai_harness/
+└── sessions/
+    └── <name>/
+        └── session.json
+```
+
+A folder rather than a file because the conversation is only the first thing a
+session owns — per-session plans and the like will sit beside it, and a folder
+means `/rename` and `/fork` carry them along without knowing they exist.
+
+`.ai_harness/` lives under the **sandbox root**, so sessions belong to the project
+rather than to whichever directory you launched from: running against two projects
+from one terminal keeps them apart, and running against one project from two
+terminals finds the same sessions. `--sessions-dir` overrides the location and is
+used exactly as given. The whole directory is gitignored.
+
+Until you name it, each run writes to a per-launch `session-<timestamp>/`, so runs
+never overwrite each other.
+
+> Sessions saved before this layout (loose `sessions/*.json` files) are **not
+> migrated and not read**. Nothing looks there any more; delete the old
+> `sessions/` directory when you no longer want them.
+
+- `/rename <name>` — rename the current session's folder (the name it loads
+  under). Everything in the folder moves with it.
+- `/fork [name]` — branch: freeze the current session where it is and keep talking
+  under a new name. Both start identical and diverge from the fork point; the
+  original is preserved to `/load` back.
 - `/save [name]` — save now and, with a name, adopt it going forward.
 - `/load <name>` — restore a session. `/load` with no name opens a picker: choose
   with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to cancel.
@@ -514,7 +579,7 @@ overwrite each other.
 
 All of these work only when idle.
 
-A session file is pretty-printed JSON holding the model conversation (`history`,
+`session.json` is pretty-printed JSON holding the model conversation (`history`,
 so you can keep talking) and the rendered transcript (so the screen comes back
 exactly — labelled actions, command results, token counts). A `version` field
 guards the format. `/clear` never touches saved files, so `/save`, `/clear`,

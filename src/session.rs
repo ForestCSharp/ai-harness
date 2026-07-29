@@ -1,8 +1,19 @@
 //! Saving and loading conversations to disk.
 //!
 //! A session captures both the model conversation (`history`, needed to
-//! continue) and the rendered transcript (needed to restore the screen). Files
-//! are pretty-printed JSON, one per session, in a sessions directory.
+//! continue) and the rendered transcript (needed to restore the screen), as
+//! pretty-printed JSON.
+//!
+//! Each session is a **directory**, not a file:
+//!
+//! ```text
+//! .ai_harness/sessions/<name>/session.json
+//! ```
+//!
+//! The conversation is only the first thing a session owns — a plan file and
+//! whatever else turns out to be per-session live beside it. Making the session
+//! a directory up front means those follow a [`rename`] for free, rather than
+//! each needing to be moved by name.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,21 +66,39 @@ impl Session {
     }
 }
 
-/// Write `session` to `<dir>/<name>.json`, creating `dir` if needed.
-pub fn save(dir: &Path, name: &str, session: &Session) -> Result<PathBuf> {
-    let name = sanitize(name)?;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating sessions directory {}", dir.display()))?;
-    let path = dir.join(format!("{name}.json"));
+/// The conversation file inside a session's directory.
+pub const FILE: &str = "session.json";
+
+/// The directory holding one session's files.
+///
+/// Public because a session is a directory now: anything else that belongs to
+/// one — a plan, notes — is written here by its own module rather than by this
+/// one, and needs to be able to ask where "here" is.
+pub fn dir(root: &Path, name: &str) -> Result<PathBuf> {
+    Ok(root.join(sanitize(name)?))
+}
+
+/// The conversation file for `name`.
+fn file(root: &Path, name: &str) -> Result<PathBuf> {
+    Ok(dir(root, name)?.join(FILE))
+}
+
+/// Write `session` to `<dir>/<name>/session.json`, creating the folder if needed.
+pub fn save(dir_: &Path, name: &str, session: &Session) -> Result<PathBuf> {
+    let folder = dir(dir_, name)?;
+    std::fs::create_dir_all(&folder)
+        .with_context(|| format!("creating session directory {}", folder.display()))?;
+    let path = folder.join(FILE);
     let json = serde_json::to_string_pretty(session).context("serialising session")?;
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
-/// Read `<dir>/<name>.json`.
+/// Read `<dir>/<name>/session.json`.
 pub fn load(dir: &Path, name: &str) -> Result<Session> {
-    let name = sanitize(name)?;
-    let path = dir.join(format!("{name}.json"));
+    let path = file(dir, name)?;
+    // Named by session rather than by path: `name` is what the user typed, and
+    // it is what they would retype to fix a mistake.
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("no session {name:?} at {}", path.display()))?;
     let session: Session = serde_json::from_str(&text)
@@ -83,7 +112,11 @@ pub fn load(dir: &Path, name: &str) -> Result<Session> {
     Ok(session)
 }
 
-/// Names (without extension) of saved sessions, sorted.
+/// Names of saved sessions, sorted.
+///
+/// Keys on the session file rather than on "is a directory", so a folder that
+/// holds something else cannot appear in the `/load` picker as a session that
+/// then fails to load.
 pub fn list(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -92,11 +125,10 @@ pub fn list(dir: &Path) -> Vec<String> {
         .flatten()
         .filter_map(|e| {
             let path = e.path();
-            if path.extension()?.to_str()? == "json" {
-                path.file_stem()?.to_str().map(str::to_string)
-            } else {
-                None
-            }
+            path.join(FILE)
+                .is_file()
+                .then(|| path.file_name()?.to_str().map(str::to_string))
+                .flatten()
         })
         .collect();
     names.sort();
@@ -108,27 +140,26 @@ pub fn default_name() -> String {
     format!("session-{}", now_secs())
 }
 
-/// Whether a session file exists on disk.
+/// Whether a session has been saved on disk.
 pub fn exists(dir: &Path, name: &str) -> bool {
-    match sanitize(name) {
-        Ok(name) => dir.join(format!("{name}.json")).is_file(),
-        Err(_) => false,
-    }
+    file(dir, name).is_ok_and(|path| path.is_file())
 }
 
-/// Rename a session file `<old>.json` → `<new>.json`.
+/// Rename a session's directory `<old>/` → `<new>/`.
 ///
-/// Refuses to clobber an existing `<new>` file. If nothing is saved under `old`
-/// yet, this succeeds without moving anything — the name simply becomes current
-/// and the next save writes there.
-pub fn rename(dir: &Path, old: &str, new: &str) -> Result<PathBuf> {
-    let old = sanitize(old)?;
-    let new = sanitize(new)?;
-    let new_path = dir.join(format!("{new}.json"));
-    if old != new && new_path.exists() {
+/// The whole directory moves, so a plan file or anything else added beside the
+/// conversation follows the rename without this needing to know it exists —
+/// which is the reason a session is a directory rather than a file.
+///
+/// Refuses to clobber an existing `<new>`. If nothing is saved under `old` yet,
+/// this succeeds without moving anything — the name simply becomes current and
+/// the next save writes there.
+pub fn rename(dir_: &Path, old: &str, new: &str) -> Result<PathBuf> {
+    let old_path = dir(dir_, old)?;
+    let new_path = dir(dir_, new)?;
+    if old_path != new_path && new_path.exists() {
         bail!("a session named {new:?} already exists");
     }
-    let old_path = dir.join(format!("{old}.json"));
     if old_path.exists() {
         std::fs::rename(&old_path, &new_path).with_context(|| {
             format!("renaming {} to {}", old_path.display(), new_path.display())
@@ -190,6 +221,80 @@ mod tests {
             vec!["hi".into()],
             Ledger::default(),
         )
+    }
+
+    #[test]
+    fn a_session_is_a_folder_holding_its_conversation() {
+        let dir = temp_dir("layout");
+        let path = save(&dir, "demo", &sample()).unwrap();
+
+        assert_eq!(path, dir.join("demo").join(FILE));
+        assert!(dir.join("demo").is_dir(), "the session is a directory");
+        assert!(
+            !dir.join("demo.json").exists(),
+            "the flat file layout is gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listing_ignores_folders_that_are_not_sessions() {
+        // Keying on the session file rather than on "is a directory" keeps the
+        // `/load` picker from offering something that then fails to load.
+        let dir = temp_dir("listing");
+        save(&dir, "real", &sample()).unwrap();
+        std::fs::create_dir_all(dir.join("not-a-session")).unwrap();
+        std::fs::write(dir.join("stray.json"), "{}").unwrap();
+
+        assert_eq!(list(&dir), vec!["real".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_exists_only_once_its_conversation_is_written() {
+        let dir = temp_dir("exists");
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        assert!(!exists(&dir, "empty"), "a bare folder is not a session");
+
+        save(&dir, "empty", &sample()).unwrap();
+        assert!(exists(&dir, "empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renaming_carries_the_rest_of_the_session_with_it() {
+        // The whole reason a session is a directory: files added beside the
+        // conversation follow a rename without `rename` knowing they exist.
+        let dir = temp_dir("rename-carries");
+        save(&dir, "before", &sample()).unwrap();
+        std::fs::write(dir.join("before").join("plan.md"), "# the plan").unwrap();
+
+        rename(&dir, "before", "after").unwrap();
+
+        assert!(!dir.join("before").exists(), "the old folder is gone");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("after").join("plan.md")).unwrap(),
+            "# the plan",
+            "a sibling file must travel with the session"
+        );
+        assert!(load(&dir, "after").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_cannot_escape_the_sessions_directory() {
+        // A name is now a directory component rather than a filename stem, so
+        // this boundary matters at least as much as it did.
+        let dir = temp_dir("escape");
+        for bad in ["../escape", "a/b", "..", "."] {
+            assert!(
+                save(&dir, bad, &sample()).is_err(),
+                "{bad} should be refused"
+            );
+            assert!(load(&dir, bad).is_err(), "{bad} should be refused");
+            assert!(!exists(&dir, bad), "{bad} should be refused");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -293,7 +398,8 @@ mod tests {
             r#"{{"version":{VERSION},"saved_at":0,"model":"m","history":[],
                  "transcript":[],"prompt_history":[]}}"#
         );
-        std::fs::write(dir.join("old.json"), json).unwrap();
+        std::fs::create_dir_all(dir.join("old")).unwrap();
+        std::fs::write(dir.join("old").join(FILE), json).unwrap();
 
         let loaded = load(&dir, "old").expect("an older session must still load");
         assert!(loaded.ledger.is_empty());

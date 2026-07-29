@@ -50,6 +50,13 @@ pub const EDIT_TAG: &str = "ai-harness-edit";
 pub const OLD_TAG: &str = "ai-harness-old";
 /// What an edit replaces the old span with. A child of [`EDIT_TAG`].
 pub const NEW_TAG: &str = "ai-harness-new";
+/// A question for the user, with the answers to choose between. The only action
+/// whose outcome comes from a person rather than from the machine.
+pub const OPTION_TAG: &str = "ai-harness-option";
+/// What is being asked. A child of [`OPTION_TAG`].
+pub const OPTION_QUESTION_TAG: &str = "ai-harness-option-question";
+/// One answer to choose between. A child of [`OPTION_TAG`], repeated.
+pub const OPTION_CHOICE_TAG: &str = "ai-harness-option-choice";
 /// Harness → model only. Carries the outcome of a shell action; never parsed.
 pub const RESULT_TAG: &str = "ai-harness-shell-result";
 /// Harness → model only. Carries the outcome of a file write; never parsed.
@@ -58,27 +65,36 @@ pub const WRITE_RESULT_TAG: &str = "ai-harness-write-result";
 pub const READ_RESULT_TAG: &str = "ai-harness-read-result";
 /// Harness → model only. Carries the text of a fetched page; never parsed.
 pub const FETCH_RESULT_TAG: &str = "ai-harness-fetch-result";
+/// Harness → model only. Carries the user's answer to an option; never parsed.
+pub const OPTION_RESULT_TAG: &str = "ai-harness-option-result";
 
-/// Tags the model is allowed to reply with at the top level. The edit children
-/// ([`OLD_TAG`], [`NEW_TAG`]) are not here: they are only valid nested inside an
-/// edit, so at the top level they are correctly rejected as unknown.
-const REPLY_TAGS: [&str; 6] = [
+/// Tags the model is allowed to reply with at the top level. The container
+/// children ([`OLD_TAG`], [`NEW_TAG`], and the option children) are not here:
+/// they are only valid nested inside their parent, so at the top level they are
+/// correctly rejected as unknown.
+const REPLY_TAGS: [&str; 7] = [
     READ_TAG,
     FETCH_TAG,
     SHELL_TAG,
     WRITE_TAG,
     EDIT_TAG,
+    OPTION_TAG,
     RESPONSE_TAG,
 ];
 
 /// Tags only the harness may write. A model that emits one has invented the
 /// outcome of an action that never ran, which is a different failure from an
 /// unknown tag and is worth naming as such — both to the model and in the code.
-const RESULT_TAGS: [&str; 4] = [
+///
+/// [`OPTION_RESULT_TAG`] belongs here most of all: it is the one result whose
+/// content comes from a person, so a model writing its own would not be
+/// inventing a machine's output but putting words in the user's mouth.
+const RESULT_TAGS: [&str; 5] = [
     RESULT_TAG,
     WRITE_RESULT_TAG,
     READ_RESULT_TAG,
     FETCH_RESULT_TAG,
+    OPTION_RESULT_TAG,
 ];
 
 /// A validated model reply.
@@ -99,6 +115,14 @@ pub enum Action {
         old: String,
         new: String,
     },
+    /// A question for the user, and the answers offered.
+    ///
+    /// The only action whose outcome is a person's decision rather than a
+    /// machine's output, which is why it never runs and never auto-approves.
+    Options {
+        question: String,
+        choices: Vec<String>,
+    },
     /// A terminating answer for the user.
     Response(String),
 }
@@ -113,6 +137,7 @@ impl Action {
             Self::Fetch { url } => url,
             Self::Write { contents, .. } => contents,
             Self::Edit { old, .. } => old,
+            Self::Options { question, .. } => question,
         }
     }
 }
@@ -247,7 +272,15 @@ pub enum ProtocolError {
     },
     /// An edit gave `<new>` before `<old>`.
     ChildOutOfOrder,
+    /// An option offered fewer answers than a question needs.
+    NotEnoughChoices {
+        found: usize,
+    },
 }
+
+/// Fewest answers an option may offer. One choice is an approval, not a
+/// question; zero is a statement, which is what `<ai-harness-response>` is for.
+pub const MIN_CHOICES: usize = 2;
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -310,6 +343,12 @@ impl fmt::Display for ProtocolError {
             Self::ChildOutOfOrder => {
                 write!(f, "<{EDIT_TAG}> must give <{OLD_TAG}> before <{NEW_TAG}>")
             }
+            Self::NotEnoughChoices { found } => write!(
+                f,
+                "<{OPTION_TAG}> offered {found} <{OPTION_CHOICE_TAG}> element(s); a question \
+                 needs at least {MIN_CHOICES}. To ask for approval of one thing, propose the \
+                 action itself; to say something without asking, use <{RESPONSE_TAG}>"
+            ),
         }
     }
 }
@@ -439,6 +478,37 @@ pub fn encode_fetch_result(outcome: &crate::fetch::FetchOutcome) -> String {
     format!("<{FETCH_RESULT_TAG}>\n{body}</{FETCH_RESULT_TAG}>")
 }
 
+/// How the user answered an option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// One of the offered choices.
+    Chose(String),
+    /// Something the user typed instead, because none of the choices fit.
+    Wrote(String),
+    /// Dismissed without answering.
+    Declined,
+}
+
+/// Hand the user's answer back to the model.
+///
+/// The three cases are distinguished deliberately. "You picked Postgres" and
+/// "you wrote something I did not offer" mean different things: the second says
+/// the offered choices were wrong, which is worth knowing before asking again.
+pub fn encode_option_result(answer: &Answer) -> String {
+    let body = match answer {
+        Answer::Chose(text) => format!("the user chose:\n{text}\n"),
+        Answer::Wrote(text) => format!(
+            "the user did not pick any of your choices and wrote this instead \
+             (treat it as the answer, and note your options did not cover it):\n{text}\n"
+        ),
+        Answer::Declined => "the user dismissed the question without answering; \
+             do not ask it again unchanged — proceed with a stated assumption, or \
+             explain what you need with <ai-harness-response>\n"
+            .to_string(),
+    };
+    format!("<{OPTION_RESULT_TAG}>\n{body}</{OPTION_RESULT_TAG}>")
+}
+
 /// Tell the model exactly how its last reply broke the contract, so it can try
 /// again. Quotes the specific failure rather than restating the rules in full —
 /// the system prompt already carries those, and a targeted correction is more
@@ -471,7 +541,10 @@ pub fn encode_correction(error: &ProtocolError) -> String {
          <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, \
          <{WRITE_TAG} file=path>…</{WRITE_TAG}> to write a whole file, \
          <{EDIT_TAG} file=path><{OLD_TAG}>…</{OLD_TAG}><{NEW_TAG}>…</{NEW_TAG}></{EDIT_TAG}> \
-         to change part of one, or <{RESPONSE_TAG}>…</{RESPONSE_TAG}> to answer."
+         to change part of one, \
+         <{OPTION_TAG}><{OPTION_QUESTION_TAG}>…</{OPTION_QUESTION_TAG}>\
+         <{OPTION_CHOICE_TAG}>…</{OPTION_CHOICE_TAG}>…</{OPTION_TAG}> to ask the user \
+         a question, or <{RESPONSE_TAG}>…</{RESPONSE_TAG}> to answer."
     )
 }
 
@@ -617,6 +690,11 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         return Ok(Action::Edit { path, old, new });
     }
 
+    if tag == OPTION_TAG {
+        let (question, choices) = parse_option_children(body)?;
+        return Ok(Action::Options { question, choices });
+    }
+
     let body = body.trim();
     if body.is_empty() {
         return Err(ProtocolError::EmptyBody {
@@ -675,8 +753,8 @@ fn parse_edit_children(body: &str) -> Result<(String, String), ProtocolError> {
         return Err(ProtocolError::ChildOutOfOrder);
     }
 
-    let (old_raw, rest) = expect_child(body, OLD_TAG)?;
-    let (new_raw, rest) = expect_child(rest, NEW_TAG)?;
+    let (old_raw, rest) = expect_child(body, EDIT_TAG, OLD_TAG)?;
+    let (new_raw, rest) = expect_child(rest, EDIT_TAG, NEW_TAG)?;
     if !rest.trim().is_empty() {
         return Err(ProtocolError::UnexpectedChildContent {
             parent: EDIT_TAG.to_string(),
@@ -695,13 +773,78 @@ fn parse_edit_children(body: &str) -> Result<(String, String), ProtocolError> {
     Ok((old.to_string(), new.to_string()))
 }
 
+/// Parse the `<question>…</question><choice>…</choice>…` inside an option's body.
+///
+/// The question comes first and must be non-empty, then at least [`MIN_CHOICES`]
+/// choices. Like an edit, anything between or after the children is rejected, so
+/// prose cannot ride along outside a tag where the modal would never show it.
+fn parse_option_children(body: &str) -> Result<(String, Vec<String>), ProtocolError> {
+    let body = body.trim();
+
+    // Clearer than "missing <question>" when the question is simply last.
+    if let (Some(question_at), Some(choice_at)) = (
+        body.find(&format!("<{OPTION_QUESTION_TAG}>")),
+        body.find(&format!("<{OPTION_CHOICE_TAG}>")),
+    ) && question_at > choice_at
+    {
+        return Err(ProtocolError::ChildOutOfOrder);
+    }
+
+    let (question, mut rest) = expect_child(body, OPTION_TAG, OPTION_QUESTION_TAG)?;
+    let question = question.trim();
+    if question.is_empty() {
+        return Err(ProtocolError::EmptyBody {
+            tag: OPTION_QUESTION_TAG.to_string(),
+        });
+    }
+
+    let mut choices = Vec::new();
+    // Take choices until the remainder no longer opens with one; whatever is
+    // left then has to be whitespace, which the check below enforces.
+    while rest
+        .trim_start()
+        .starts_with(&format!("<{OPTION_CHOICE_TAG}>"))
+    {
+        let (choice, after) = expect_child(rest, OPTION_TAG, OPTION_CHOICE_TAG)?;
+        let choice = choice.trim();
+        if choice.is_empty() {
+            return Err(ProtocolError::EmptyBody {
+                tag: OPTION_CHOICE_TAG.to_string(),
+            });
+        }
+        choices.push(choice.to_string());
+        rest = after;
+    }
+
+    if !rest.trim().is_empty() {
+        return Err(ProtocolError::UnexpectedChildContent {
+            parent: OPTION_TAG.to_string(),
+            found: rest.trim().to_string(),
+        });
+    }
+    if choices.len() < MIN_CHOICES {
+        return Err(ProtocolError::NotEnoughChoices {
+            found: choices.len(),
+        });
+    }
+    Ok((question.to_string(), choices))
+}
+
 /// Take the `<child>…</child>` expected at the front of `input` (after leading
 /// whitespace), returning its raw body and whatever follows the closing tag.
 ///
 /// The error tells the model what actually went wrong: the child is genuinely
 /// absent ([`ProtocolError::MissingChildTag`]) versus present but with junk in
 /// front of it ([`ProtocolError::UnexpectedChildContent`]).
-fn expect_child<'a>(input: &'a str, child: &str) -> Result<(&'a str, &'a str), ProtocolError> {
+///
+/// `parent` is passed in rather than assumed: two elements have children now, and
+/// a correction that names the wrong one sends the model looking in the wrong
+/// place.
+fn expect_child<'a>(
+    input: &'a str,
+    parent: &str,
+    child: &str,
+) -> Result<(&'a str, &'a str), ProtocolError> {
     let input = input.trim_start();
     let open = format!("<{child}>");
     match input.strip_prefix(&open) {
@@ -721,11 +864,11 @@ fn expect_child<'a>(input: &'a str, child: &str) -> Result<(&'a str, &'a str), P
         // The tag appears, but something precedes it.
         None => match input.find(&open) {
             Some(at) => Err(ProtocolError::UnexpectedChildContent {
-                parent: EDIT_TAG.to_string(),
+                parent: parent.to_string(),
                 found: input[..at].trim().to_string(),
             }),
             None => Err(ProtocolError::MissingChildTag {
-                parent: EDIT_TAG.to_string(),
+                parent: parent.to_string(),
                 child: child.to_string(),
             }),
         },
@@ -776,7 +919,15 @@ the text to put in its place
 </{NEW_TAG}>
 </{EDIT_TAG}>
 
-6. Give the user a final answer. This ends the current task:
+6. Ask the user a question, offering the answers to pick between:
+
+<{OPTION_TAG}>
+<{OPTION_QUESTION_TAG}>which database should the schema target?</{OPTION_QUESTION_TAG}>
+<{OPTION_CHOICE_TAG}>Postgres</{OPTION_CHOICE_TAG}>
+<{OPTION_CHOICE_TAG}>SQLite</{OPTION_CHOICE_TAG}>
+</{OPTION_TAG}>
+
+7. Give the user a final answer. This ends the current task:
 
 <{RESPONSE_TAG}>your answer to the user</{RESPONSE_TAG}>
 
@@ -814,6 +965,13 @@ After a file write — or an edit, which the harness applies as a write — it s
 status: wrote 128 bytes to path/to/file
 </{WRITE_RESULT_TAG}>
 
+After an option, it sends the user's answer:
+
+<{OPTION_RESULT_TAG}>
+the user chose:
+Postgres
+</{OPTION_RESULT_TAG}>
+
 Reply to a result with another action to keep going, or <{RESPONSE_TAG}> when you \
 have what you need.
 
@@ -827,6 +985,15 @@ the only one you may answer from.
 The user approves every command, write, and edit before it happens. If a result \
 says it was denied, it did NOT run: propose a different approach or explain the \
 problem with <{RESPONSE_TAG}>. Do not simply repeat the same action.
+
+Use <{OPTION_TAG}> when a decision would change the work and you cannot settle it \
+from the code — which library to use, which of two designs, what a requirement \
+means. Answering costs the user one keypress and the task continues, so asking is \
+cheap; guessing wrong is not. Do NOT use it for anything you could find out by \
+reading a file or running a command — look first and ask only what is genuinely \
+the user's call. The user may also answer with something you did not offer, or \
+dismiss the question entirely; the result says which happened, and a dismissal \
+means proceed without asking again rather than asking the same thing twice.
 
 <{READ_TAG}> and <{FETCH_TAG}> are the exceptions: they need no approval and \
 run immediately, so reading a file or a page costs the user nothing. Use them \
@@ -872,6 +1039,9 @@ EXACTLY ONCE in the file, copied character-for-character — whitespace included
 from what you read. If it is not found, re-read the file and copy it again. If it \
 appears more than once, add surrounding lines to <{OLD_TAG}> (and matching lines \
 to <{NEW_TAG}>) until the span is unique. An empty <{NEW_TAG}> deletes the span.
+- An <{OPTION_TAG}> must contain one <{OPTION_QUESTION_TAG}> first, then at least \
+{MIN_CHOICES} <{OPTION_CHOICE_TAG}> elements, and nothing else. Keep each choice \
+short enough to read in a list; put the detail in the question.
 - If you can answer without running anything, reply with <{RESPONSE_TAG}> directly.
 
 A reply that breaks any of these rules is discarded and shown to the user as an \
@@ -1552,6 +1722,216 @@ mod tests {
         // ordinary formatting slip — must come out byte-identical.
         let raw = "Sure, I'll do that! <ai-harness-shell>ls</ai-harness-shell>";
         assert_eq!(elide_results(raw), raw);
+    }
+
+    /// A well-formed option, for tests that vary one part of it.
+    fn option_reply(children: &str) -> String {
+        format!("<{OPTION_TAG}>{children}</{OPTION_TAG}>")
+    }
+
+    fn question(text: &str) -> String {
+        format!("<{OPTION_QUESTION_TAG}>{text}</{OPTION_QUESTION_TAG}>")
+    }
+
+    fn choice(text: &str) -> String {
+        format!("<{OPTION_CHOICE_TAG}>{text}</{OPTION_CHOICE_TAG}>")
+    }
+
+    #[test]
+    fn an_option_parses_into_its_question_and_choices() {
+        let reply = option_reply(&format!(
+            "{}{}{}",
+            question("Which database?"),
+            choice("Postgres"),
+            choice("SQLite")
+        ));
+        assert_eq!(
+            parse_reply(&reply),
+            Ok(Action::Options {
+                question: "Which database?".into(),
+                choices: vec!["Postgres".into(), "SQLite".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn an_option_accepts_more_than_two_choices() {
+        let reply = option_reply(&format!(
+            "{}{}{}{}",
+            question("Which?"),
+            choice("a"),
+            choice("b"),
+            choice("c")
+        ));
+        match parse_reply(&reply).unwrap() {
+            Action::Options { choices, .. } => assert_eq!(choices.len(), 3),
+            other => panic!("expected options, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_option_needs_a_question() {
+        let reply = option_reply(&format!("{}{}", choice("a"), choice("b")));
+        assert_eq!(
+            parse_reply(&reply).unwrap_err(),
+            ProtocolError::MissingChildTag {
+                parent: OPTION_TAG.into(),
+                child: OPTION_QUESTION_TAG.into(),
+            },
+            "the error must name the option, not the edit"
+        );
+    }
+
+    #[test]
+    fn an_option_needs_at_least_two_choices() {
+        // One choice is an approval and none is a statement; neither is a
+        // question, and saying so beats a generic missing-child error.
+        for children in [
+            question("Which?"),
+            format!("{}{}", question("Which?"), choice("only")),
+        ] {
+            let error = parse_reply(&option_reply(&children)).unwrap_err();
+            assert!(
+                matches!(error, ProtocolError::NotEnoughChoices { .. }),
+                "got {error:?}"
+            );
+            assert!(error.to_string().contains("at least 2"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_option_rejects_a_question_after_its_choices() {
+        let reply = option_reply(&format!(
+            "{}{}{}",
+            choice("a"),
+            choice("b"),
+            question("Which?")
+        ));
+        assert_eq!(
+            parse_reply(&reply).unwrap_err(),
+            ProtocolError::ChildOutOfOrder
+        );
+    }
+
+    #[test]
+    fn an_option_rejects_prose_among_its_children() {
+        // Text outside a tag would never reach the modal, so accepting it would
+        // silently drop something the model meant the user to read.
+        let reply = option_reply(&format!(
+            "{}{}{}",
+            question("Which?"),
+            choice("a"),
+            "...and by the way"
+        ));
+        let error = parse_reply(&reply).unwrap_err();
+        assert!(
+            matches!(&error, ProtocolError::UnexpectedChildContent { parent, .. } if parent == OPTION_TAG),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_option_rejects_an_empty_question_or_choice() {
+        let empty_question =
+            option_reply(&format!("{}{}{}", question(""), choice("a"), choice("b")));
+        assert_eq!(
+            parse_reply(&empty_question).unwrap_err(),
+            ProtocolError::EmptyBody {
+                tag: OPTION_QUESTION_TAG.into()
+            }
+        );
+
+        let empty_choice = option_reply(&format!(
+            "{}{}{}",
+            question("Which?"),
+            choice(""),
+            choice("b")
+        ));
+        assert_eq!(
+            parse_reply(&empty_choice).unwrap_err(),
+            ProtocolError::EmptyBody {
+                tag: OPTION_CHOICE_TAG.into()
+            }
+        );
+    }
+
+    #[test]
+    fn option_children_are_not_valid_on_their_own() {
+        for tag in [OPTION_QUESTION_TAG, OPTION_CHOICE_TAG] {
+            assert_eq!(
+                parse_reply(&format!("<{tag}>x</{tag}>")).unwrap_err(),
+                ProtocolError::UnknownTag {
+                    tag: tag.to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_written_answer_is_caught_as_fabrication() {
+        // The most tempting fabrication of all: putting words in the user's
+        // mouth rather than inventing a machine's output.
+        assert_eq!(
+            parse_reply(&format!(
+                "<{OPTION_RESULT_TAG}>the user chose: Postgres</{OPTION_RESULT_TAG}>"
+            ))
+            .unwrap_err(),
+            ProtocolError::FabricatedResult {
+                tag: OPTION_RESULT_TAG.into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_answer_result_distinguishes_how_it_was_given() {
+        let chose = encode_option_result(&Answer::Chose("Postgres".into()));
+        assert!(chose.contains("Postgres"));
+        assert!(chose.contains("chose"), "{chose}");
+
+        // The model must be able to tell "you picked one of mine" from "you
+        // wrote something else" — the second says its options were wrong.
+        let wrote = encode_option_result(&Answer::Wrote("MySQL".into()));
+        assert!(wrote.contains("MySQL"));
+        assert!(wrote.contains("did not pick"), "{wrote}");
+
+        let declined = encode_option_result(&Answer::Declined);
+        assert!(declined.contains("dismissed"), "{declined}");
+        assert!(
+            declined.contains("do not ask it again"),
+            "a dismissal must not invite the same question back: {declined}"
+        );
+    }
+
+    #[test]
+    fn an_edit_error_still_names_the_edit() {
+        // `expect_child` takes its parent as an argument now; this is the
+        // regression that would prove it was threaded through wrongly.
+        let error = parse_reply(&format!(
+            "<{EDIT_TAG} file=x><{NEW_TAG}>b</{NEW_TAG}></{EDIT_TAG}>"
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProtocolError::MissingChildTag {
+                parent: EDIT_TAG.into(),
+                child: OLD_TAG.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_explains_when_to_ask() {
+        let prompt = system_prompt(None);
+        assert!(prompt.contains(OPTION_TAG));
+        assert!(prompt.contains(OPTION_QUESTION_TAG));
+        assert!(prompt.contains(OPTION_CHOICE_TAG));
+        assert!(prompt.contains(OPTION_RESULT_TAG));
+        // Knowing the syntax is not enough; the model has to know it should
+        // look before asking, or it will ask what it could have read.
+        assert!(
+            prompt.contains("reading a file or running a command"),
+            "the prompt should steer away from asking what it can find out"
+        );
     }
 
     #[test]

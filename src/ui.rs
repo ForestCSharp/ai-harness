@@ -30,6 +30,9 @@ pub struct Metrics {
     /// a click can be mapped back to a session. `None` when the picker is closed.
     pub picker_list: Option<Rect>,
     pub picker_offset: usize,
+    /// The same, for the model's question modal.
+    pub question_list: Option<Rect>,
+    pub question_offset: usize,
 }
 
 /// Did `(column, row)` land inside `area`?
@@ -86,6 +89,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Metrics {
         let (allow, deny) = draw_approval(frame, pending, area);
         metrics.allow_button = Some(allow);
         metrics.deny_button = Some(deny);
+    } else if let Some(question) = app.question() {
+        let (list, offset) = draw_question(frame, question, area);
+        metrics.question_list = Some(list);
+        metrics.question_offset = offset;
     } else if let Some(picker) = app.picker() {
         let (list, offset) = draw_picker(frame, picker, area);
         metrics.picker_list = Some(list);
@@ -146,6 +153,82 @@ fn draw_picker(frame: &mut Frame, picker: &crate::app::Picker, area: Rect) -> (R
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "↑/↓ choose · Enter load · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        footer_area,
+    );
+
+    (list_area, offset)
+}
+
+/// The model's question. Returns the row area and the first visible index, so a
+/// click can be mapped back to a choice — the same contract `draw_picker` has.
+fn draw_question(frame: &mut Frame, question: &crate::app::Question, area: Rect) -> (Rect, usize) {
+    let width = area.width.saturating_sub(8).clamp(24, 72);
+    let inner_width = width.saturating_sub(4) as usize;
+
+    let prompt = body_lines(&question.text, Style::default(), inner_width);
+    // Border (2) + question + blank + footer (1), plus one row per choice and
+    // one for the free-text row, all capped to what the screen can hold.
+    let max_rows = (area.height.saturating_sub(6)).max(1) as usize;
+    let list_rows = question.rows().min(max_rows) as u16;
+    let height = (prompt.len() as u16 + list_rows + 4).min(area.height.saturating_sub(2));
+
+    let modal = center(area, width, height);
+    frame.render_widget(Clear, modal);
+    let block = Block::bordered()
+        .title(Line::from(" the model is asking ").bold())
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let [question_area, list_area, footer_area] = Layout::vertical([
+        Constraint::Length(prompt.len() as u16 + 1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new(Text::from(prompt)), question_area);
+
+    // Scroll a window around the selection, so a long list stays usable.
+    let visible = list_area.height as usize;
+    let offset = question
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(question.rows().saturating_sub(visible));
+
+    let mut rows: Vec<Line> = Vec::new();
+    for i in offset..question.rows().min(offset + visible) {
+        let focused = i == question.selected;
+        let style = if focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let marker = if focused { "› " } else { "  " };
+        let label = match question.choices.get(i) {
+            // Numbered so a single keypress can pick one.
+            Some(choice) => format!("{marker}{}. {choice}", i + 1),
+            // The free-text row becomes an editor once focused; before that it
+            // is an invitation, so it has to read as one.
+            None if focused => format!("{marker}{}▌", question.other.text()),
+            None => format!("{marker}something else…"),
+        };
+        rows.push(Line::from(Span::styled(label, style)));
+    }
+    frame.render_widget(Paragraph::new(Text::from(rows)), list_area);
+
+    let hint = if question.on_other() {
+        "type your answer · Enter send · ↑/↓ choose · Esc dismiss"
+    } else {
+        "↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
             Style::default().fg(Color::DarkGray),
         ))),
         footer_area,
@@ -587,6 +670,7 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                 Action::Fetch { .. } => ("fetch", Color::Blue),
                 Action::Write { .. } => ("write", Color::Cyan),
                 Action::Edit { .. } => ("edit", Color::Cyan),
+                Action::Options { .. } => ("question", Color::Yellow),
                 Action::Response(_) => ("response", Color::Green),
             };
             let mut header = vec![Span::styled(
@@ -626,6 +710,18 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                     lines.extend(body_lines(url, Style::default().fg(Color::Blue), width))
                 }
                 Action::Response(text) => lines.extend(body_lines(text, Style::default(), width)),
+                // The question stays in the transcript once answered, so the
+                // answer below it has something to refer to.
+                Action::Options { question, choices } => {
+                    lines.extend(body_lines(question, Style::default(), width));
+                    for (i, choice) in choices.iter().enumerate() {
+                        lines.extend(body_lines(
+                            &format!("{}. {choice}", i + 1),
+                            Style::default().fg(Color::DarkGray),
+                            width,
+                        ));
+                    }
+                }
                 // A diff of what the write changes, when the pre-flight could
                 // read the file it replaces; otherwise a bounded preview of the
                 // new contents, which is all there is to show for a new file.
@@ -761,6 +857,32 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
             if let Some(error) = &outcome.error {
                 lines.extend(body_lines(error, Style::default().fg(Color::Red), width));
             }
+        }
+        Entry::Answer { text, free } => {
+            let mut header = vec![Span::styled(
+                "you",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            // Worth marking: an answer the model never offered is a different
+            // thing from one it did, both to read back and to the model.
+            if *free {
+                header.push(Span::styled(
+                    "  (your own answer)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(Line::from(header));
+            lines.extend(body_lines(text, Style::default(), width));
+        }
+        Entry::Dismissed => {
+            lines.push(Line::from(Span::styled(
+                "dismissed the question",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
         }
         Entry::Denied(command) => {
             lines.push(Line::from(Span::styled(
@@ -1006,6 +1128,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Status::Waiting => (" waiting ", Color::Yellow),
         Status::Streaming => (" streaming ", Color::Cyan),
         Status::AwaitingApproval(_) => (" approve ", Color::Magenta),
+        Status::AwaitingChoice(_) => (" answer ", Color::Yellow),
         Status::Running => (" running ", Color::Blue),
     };
 
@@ -1052,6 +1175,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     }
     let hints = if app.pending().is_some() {
         "  ←/→ choose · Enter confirm · y allow · n/Esc deny"
+    } else if app.question().is_some() {
+        "  ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
     } else if app.accepts_input() {
         "  Enter sends to the command · Esc cancel"
     } else if matches!(
@@ -2115,6 +2240,103 @@ mod tests {
             screen.contains("exit 0"),
             "the result replaces it:\n{screen}"
         );
+    }
+
+    /// An app sitting on a question from the model.
+    fn asked(question: &str, choices: &[&str]) -> App {
+        let mut body =
+            format!("<ai-harness-option-question>{question}</ai-harness-option-question>");
+        for choice in choices {
+            body.push_str(&format!(
+                "<ai-harness-option-choice>{choice}</ai-harness-option-choice>"
+            ));
+        }
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("build it");
+        app.submit().unwrap();
+        app.push_response(
+            format!("<ai-harness-option>{body}</ai-harness-option>"),
+            None,
+        );
+        app
+    }
+
+    #[test]
+    fn a_question_modal_shows_the_question_and_numbered_choices() {
+        let mut app = asked("Which database?", &["Postgres", "SQLite"]);
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("the model is asking"), "{screen}");
+        assert!(screen.contains("Which database?"), "{screen}");
+        assert!(screen.contains("1. Postgres"), "{screen}");
+        assert!(screen.contains("2. SQLite"), "{screen}");
+        assert!(
+            screen.contains("something else"),
+            "the free-text row should be offered:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_question_modal_marks_the_selection_and_moves_it() {
+        let mut app = asked("Which?", &["alpha", "beta"]);
+        let (rows, _) = render(&mut app, 70, 20);
+        let marked =
+            |rows: &[String], text: &str| rows.iter().any(|r| r.contains('›') && r.contains(text));
+        assert!(marked(&rows, "alpha"), "first choice starts focused");
+
+        app.question_move(1);
+        let (rows, _) = render(&mut app, 70, 20);
+        assert!(marked(&rows, "beta"), "the marker follows the selection");
+        assert!(!marked(&rows, "alpha"));
+    }
+
+    #[test]
+    fn the_free_text_row_becomes_an_editor_when_focused() {
+        let mut app = asked("Which?", &["a", "b"]);
+        app.question_move(-1);
+        app.question_input(|input| input.insert_str("something of my own"));
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+        assert!(screen.contains("something of my own"), "{screen}");
+        assert!(
+            screen.contains("type your answer"),
+            "the footer should change with the row:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_question_modal_never_overflows_its_width() {
+        let mut app = asked(
+            &"a really quite long question that will certainly need wrapping ".repeat(3),
+            &["a very long choice ".repeat(6).as_str(), "short"],
+        );
+        for width in [40u16, 60, 90] {
+            let (rows, _) = render(&mut app, width, 30);
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "row overflows {width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_answered_question_stays_in_the_transcript_with_its_answer() {
+        let mut app = asked("Which database?", &["Postgres", "SQLite"]);
+        app.answer_question().unwrap();
+
+        let (rows, _) = render(&mut app, 70, 24);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("question"), "the ask is kept:\n{screen}");
+        assert!(screen.contains("Which database?"), "{screen}");
+        assert!(
+            screen.contains("Postgres"),
+            "the answer is shown:\n{screen}"
+        );
+        assert!(!screen.contains("the model is asking"), "the modal is gone");
     }
 
     #[test]

@@ -141,6 +141,19 @@ contains. Three things about it are deliberate:
   no longer mean what it meant when you needed to see it. Storing it also keeps
   the modal and the scrollback showing one computation rather than two.
 
+**(c″) `<ai-harness-option>`** — the model wants to ask *you* something. It goes
+to `Status::AwaitingChoice(Question)`, which is **not** a `Pending` and that is
+the point: `App::pending` returns `None`, so the auto-approve hook in
+`handle_update` cannot see it and cannot answer on your behalf. A question is the
+one action in the protocol that must always reach a person, and keeping it out of
+the approval state makes that structural rather than a rule to remember.
+
+Answering (or dismissing) appends an `<ai-harness-option-result>` and re-sends,
+exactly like a command result — so unlike `<ai-harness-response>`, asking does not
+end the turn. `OPTION_RESULT_TAG` is in `RESULT_TAGS`, so a model that writes its
+own answer is caught as fabrication; of all the results it could invent, this is
+the one that would put words in the user's mouth.
+
 **(d) `<ai-harness-read>`** — the model wants to see a file. This one never
 reaches the modal. `perform_read` runs `files::read` **synchronously, right
 here**, pushes an `Entry::ReadResult`, appends `<ai-harness-read-result>` to
@@ -322,5 +335,5 @@ cannot be run.
 | `src/diff.rs` | Line-by-line diffs of a write or edit, bounded for storage |
 | `src/highlight.rs` | Language detection and per-line tokenising for code blocks |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
-| `src/session.rs` | Saving and loading sessions (`/save`, `/load`) |
+| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

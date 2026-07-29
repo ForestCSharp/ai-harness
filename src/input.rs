@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::wrap;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Input {
     text: String,
     /// Byte offset into `text`; always on a grapheme boundary.
