@@ -135,8 +135,6 @@ pub struct RunningCommand {
     /// Whether the last line is still being written, so the next chunk appends
     /// to it rather than starting a new one.
     open: bool,
-    /// Lines the user sent to the command, kept so the result can carry them.
-    pub input: Vec<String>,
 }
 
 /// Output lines kept for the live view. A few screenfuls: enough to scroll back
@@ -149,7 +147,6 @@ impl RunningCommand {
             command,
             lines: std::collections::VecDeque::new(),
             open: false,
-            input: Vec::new(),
         }
     }
 
@@ -250,6 +247,13 @@ pub struct Picker {
     /// Saved session names, snapshotted when the picker opened.
     pub sessions: Vec<String>,
     pub selected: usize,
+    /// Each session's last few lines, parallel to `sessions`.
+    ///
+    /// Parallel rather than keyed by name: the picker already indexes by
+    /// position for the selection and for clicks, and one index into two vectors
+    /// is easier to keep right than a lookup that can miss. A session with no
+    /// preview holds an empty slot, so the two stay aligned.
+    pub previews: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,13 +305,6 @@ pub struct App {
     /// because the risks differ: a read is confined to the working directory,
     /// while a fetch is an outbound request to a host the model chose.
     pub confirm_fetches: bool,
-    /// When true, a running command gets a real stdin pipe and the prompt stays
-    /// live so you can answer it.
-    ///
-    /// Off by default: `/dev/null` stdin is what makes an interactive command
-    /// fail fast rather than hang, and that guard is only worth giving up when
-    /// someone is actually watching.
-    pub interactive: bool,
     /// Live output from the command running now, if any.
     pub running: Option<RunningCommand>,
     /// When true, an approvable action runs without the modal.
@@ -404,7 +401,6 @@ impl App {
             sandbox: None,
             confirm_reads: false,
             confirm_fetches: false,
-            interactive: false,
             running: None,
             auto_approve: false,
             pending_fetch: None,
@@ -641,15 +637,6 @@ impl App {
                 };
                 self.push_notice(format!("Auto-approve {state}."));
             }
-            Command::Interactive => {
-                self.interactive = !self.interactive;
-                let state = if self.interactive {
-                    "on — a running command gets a real stdin; type to answer it"
-                } else {
-                    "off — commands run with stdin closed and cannot prompt you"
-                };
-                self.push_notice(format!("Interactive mode {state}."));
-            }
             Command::Help => self.push_notice(crate::command::help_text()),
             Command::Clear => self.reset_conversation(),
             Command::Quit => self.should_quit = true,
@@ -782,9 +769,14 @@ impl App {
         if sessions.is_empty() {
             self.push_notice("No saved sessions. Use /save [name] to create one.");
         } else {
+            let previews = sessions
+                .iter()
+                .map(|name| crate::session::preview(&self.sessions_dir, name))
+                .collect();
             self.picker = Some(Picker {
                 sessions,
                 selected: 0,
+                previews,
             });
         }
     }
@@ -1304,49 +1296,9 @@ impl App {
         }
     }
 
-    /// Record a line the user sent to the running command.
-    ///
-    /// Kept here rather than in `exec` because this is the layer that collected
-    /// it, and the result needs it regardless of how the command ended.
-    pub fn push_command_input(&mut self, line: String) {
-        if let Some(running) = &mut self.running {
-            running.push(false, &format!("{line}\n"));
-            running.input.push(line);
-            self.follow = true;
-        }
-    }
-
-    /// Whether a command is running and able to take input right now.
-    pub fn accepts_input(&self) -> bool {
-        self.interactive && self.running.is_some() && self.status == Status::Running
-    }
-
-    /// Explain why what was typed did not reach the running command.
-    ///
-    /// Whether stdin is a pipe is settled when the command is spawned, and
-    /// `/interactive` cannot be typed mid-run because slash commands need an
-    /// idle prompt. So a user who discovers too late that a command wants input
-    /// has no move — and, without this, no way to find out why. Say it plainly
-    /// rather than letting Enter do nothing.
-    pub fn warn_no_stdin(&mut self) {
-        let advice = if self.interactive {
-            "This command was started before interactive mode was on, so its \
-             stdin is closed. Press Esc and ask for it again."
-        } else {
-            "Interactive mode is off, so this command's stdin is closed and it \
-             cannot be answered. Press Esc, run /interactive, then ask again."
-        };
-        self.push_notice(advice);
-    }
-
     /// Record a finished command and hand the result back to the model.
-    pub fn push_command_result(&mut self, mut output: CommandOutput) -> Vec<Message> {
-        // Carry across what the user typed: `exec` wrote those bytes to a pipe
-        // but never saw them as lines, and the model has to be told a human
-        // answered or it will invent what the answers were.
-        if let Some(running) = self.running.take() {
-            output.input = running.input;
-        }
+    pub fn push_command_result(&mut self, output: CommandOutput) -> Vec<Message> {
+        self.running = None;
         let encoded = protocol::encode_shell_result(&output);
         self.transcript.push(Entry::CommandResult(Box::new(output)));
         self.frame(Direction::Sent, encoded.clone());
@@ -1694,80 +1646,35 @@ mod tests {
     }
 
     #[test]
-    fn interactive_mode_is_off_unless_asked_for() {
-        let app = App::new("m".into(), None, 10, std::env::temp_dir());
+    fn the_picker_carries_a_preview_for_every_session() {
+        // Parallel to `sessions`: a session with no preview holds an empty slot
+        // rather than shifting the ones after it out of alignment.
+        let dir = session_temp_dir("picker-previews");
+        for (name, turns) in [("alpha", vec!["ask alpha"]), ("beta", vec![])] {
+            let transcript = turns.into_iter().map(|t: &str| Entry::User(t.into()));
+            let session = crate::session::Session::new(
+                "m".into(),
+                vec![],
+                transcript.collect(),
+                vec![],
+                Default::default(),
+            );
+            crate::session::save(&dir, name, &session).unwrap();
+        }
+
+        let mut app = App::new("m".into(), None, 10, dir.clone());
+        app.open_load_picker();
+        let picker = app.picker().expect("the picker should open");
+
+        assert_eq!(picker.sessions.len(), picker.previews.len(), "kept aligned");
+        let alpha = picker.sessions.iter().position(|n| n == "alpha").unwrap();
+        let beta = picker.sessions.iter().position(|n| n == "beta").unwrap();
+        assert_eq!(picker.previews[alpha], vec!["you: ask alpha".to_string()]);
         assert!(
-            !app.interactive,
-            "closed stdin is what makes an interactive command fail fast"
+            picker.previews[beta].is_empty(),
+            "a session with nothing to preview holds an empty slot"
         );
-        assert!(!app.accepts_input(), "nothing is running to type at");
-    }
-
-    #[test]
-    fn the_interactive_command_toggles_and_says_what_it_means() {
-        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-
-        app.run_command(Command::Interactive);
-        assert!(app.interactive);
-        match last_visible(&app) {
-            Entry::Notice(text) => assert!(text.contains("stdin"), "{text}"),
-            other => panic!("expected a notice, got {other:?}"),
-        }
-
-        app.run_command(Command::Interactive);
-        assert!(!app.interactive, "the toggle must go both ways");
-    }
-
-    #[test]
-    fn input_is_only_accepted_while_a_command_is_actually_running() {
-        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        app.interactive = true;
-        assert!(!app.accepts_input(), "the mode alone is not enough");
-
-        app.start_running("cat".into());
-        app.status = Status::Running;
-        assert!(app.accepts_input());
-
-        app.interactive = false;
-        assert!(!app.accepts_input(), "the mode still gates it");
-    }
-
-    #[test]
-    fn typing_at_a_command_that_cannot_hear_you_says_so() {
-        // The trap this closes: stdin is settled when the command spawns, and
-        // /interactive cannot be typed mid-run because slash commands need an
-        // idle prompt. Without a notice, Enter just does nothing forever.
-        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        app.start_running("read name".into());
-        app.status = Status::Running;
-
-        app.warn_no_stdin();
-        match last_visible(&app) {
-            Entry::Notice(text) => {
-                assert!(text.contains("/interactive"), "must say the fix: {text}");
-                assert!(text.contains("Esc"), "and that a restart is needed: {text}");
-            }
-            other => panic!("expected a notice, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_warning_differs_once_the_mode_is_on() {
-        // Mode on but no pipe means it was turned on too late, and telling the
-        // user to run /interactive would be useless advice.
-        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        app.interactive = true;
-        app.start_running("read name".into());
-        app.status = Status::Running;
-
-        app.warn_no_stdin();
-        match last_visible(&app) {
-            Entry::Notice(text) => assert!(
-                text.contains("before interactive mode was on"),
-                "should not tell them to enable what is already on: {text}"
-            ),
-            other => panic!("expected a notice, got {other:?}"),
-        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1823,34 +1730,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_input_reaches_the_result_and_the_model() {
-        // Piped stdin is not echoed into stdout, so if this is dropped the model
-        // sees a prompt and an answer-shaped hole, and fills it by guessing.
-        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        app.interactive = true;
-        app.start_running("read name".into());
-        app.push_command_input("Forest".into());
-
-        let messages = app.push_command_result(output_with_stdout("hi Forest"));
-        let result = &messages.last().unwrap().content;
-        assert!(result.contains("Forest"), "{result}");
-        assert!(result.contains("typed by the user"), "{result}");
-
-        match last_visible(&app) {
-            Entry::CommandResult(out) => assert_eq!(out.input, vec!["Forest".to_string()]),
-            other => panic!("expected a command result, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_result_with_no_typed_input_says_nothing_about_it() {
-        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        app.start_running("ls".into());
-        let messages = app.push_command_result(output_with_stdout("a"));
-        assert!(!messages.last().unwrap().content.contains("typed by"));
-    }
-
-    #[test]
     fn finishing_a_command_clears_the_live_view() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
         app.start_running("ls".into());
@@ -1872,7 +1751,6 @@ mod tests {
 
         app.cancel();
         assert!(app.running.is_none());
-        assert!(!app.accepts_input(), "nothing left to type at");
     }
 
     fn output_with_stdout(stdout: &str) -> CommandOutput {
@@ -1884,7 +1762,6 @@ mod tests {
             truncated: false,
             timed_out: false,
             cancelled: false,
-            input: Vec::new(),
         }
     }
 
@@ -2461,7 +2338,6 @@ mod tests {
             truncated: false,
             timed_out: false,
             cancelled: false,
-            input: Vec::new(),
         }
     }
 

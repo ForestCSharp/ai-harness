@@ -69,6 +69,22 @@ impl Session {
 /// The conversation file inside a session's directory.
 pub const FILE: &str = "session.json";
 
+/// A few lines of the session's tail, for the `/load` picker.
+///
+/// Kept as its own small file rather than read out of [`FILE`], which runs to
+/// hundreds of kilobytes: the picker opens every session at once, and parsing
+/// them all to show three lines each would cost more the longer you use the
+/// harness. Derived data — a save regenerates it, and losing it costs a nicer
+/// picker and nothing else.
+pub const PREVIEW_FILE: &str = "preview.txt";
+
+/// Lines kept in a preview, which is also what the picker shows.
+pub const PREVIEW_LINES: usize = 3;
+
+/// Longest a preview line may be. Enough to recognise a session by, short
+/// enough that one cannot make the file large or the picker row tall.
+const PREVIEW_WIDTH: usize = 120;
+
 /// The directory holding one session's files.
 ///
 /// Public because a session is a directory now: anything else that belongs to
@@ -91,7 +107,67 @@ pub fn save(dir_: &Path, name: &str, session: &Session) -> Result<PathBuf> {
     let path = folder.join(FILE);
     let json = serde_json::to_string_pretty(session).context("serialising session")?;
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+
+    // Best effort, deliberately: the preview is a convenience, and failing the
+    // save of a conversation because a cosmetic file could not be written would
+    // be the wrong trade. The next save regenerates it.
+    let _ = std::fs::write(folder.join(PREVIEW_FILE), preview_lines(session).join("\n"));
     Ok(path)
+}
+
+/// The lines shown under a session's name in the picker.
+///
+/// Empty when the session has none, and when it was saved before previews
+/// existed — those are not backfilled, since reading every `session.json` to do
+/// it is the cost this file exists to avoid.
+pub fn preview(dir_: &Path, name: &str) -> Vec<String> {
+    let Ok(folder) = dir(dir_, name) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(folder.join(PREVIEW_FILE))
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Summarise a session by its last few lines of prose.
+///
+/// Only what the user typed and what the model answered: a trailing shell result
+/// or a debug frame says nothing about what the session was *about*, which is
+/// the one question the picker has to answer.
+fn preview_lines(session: &Session) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for entry in session.transcript.iter().rev() {
+        let text = match entry {
+            Entry::User(text) => format!("you: {text}"),
+            Entry::Action {
+                action: crate::protocol::Action::Response(text),
+                ..
+            } => text.clone(),
+            _ => continue,
+        };
+        // First line only: a long answer must not make the row tall.
+        let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines.push(truncate(line.trim(), PREVIEW_WIDTH));
+        if lines.len() == PREVIEW_LINES {
+            break;
+        }
+    }
+    // Walked backwards to find the tail; shown in the order it happened.
+    lines.reverse();
+    lines
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 /// Read `<dir>/<name>/session.json`.
@@ -197,8 +273,20 @@ mod tests {
     use crate::openrouter::Usage;
     use crate::protocol::Action;
 
+    /// A directory of this test's own.
+    ///
+    /// Counted, not timestamped: tests run in parallel and finish inside the
+    /// same second, so two sharing a tag would share a directory — and each ends
+    /// by deleting it, pulling the ground from under the other. That failed
+    /// perhaps one run in three before the counter.
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ai-harness-session-{name}-{}", now_secs()));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let unique = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ai-harness-session-{name}-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -238,6 +326,41 @@ mod tests {
     }
 
     #[test]
+    fn a_session_saved_before_a_field_was_dropped_still_loads() {
+        // Command results once carried the lines a user typed to a running
+        // command. That went away with the mode that produced them, but sessions
+        // holding the field are on disk — an unknown field must be ignored, not
+        // refused, or `/load` would fail on a user's own history.
+        let dir = temp_dir("legacy-field");
+        let mut session = sample();
+        session
+            .transcript
+            .push(Entry::CommandResult(Box::new(CommandOutput {
+                command: "read name".into(),
+                exit_code: Some(0),
+                stdout: "hi Forest".into(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                cancelled: false,
+            })));
+        save(&dir, "old", &session).unwrap();
+
+        let path = file(&dir, "old").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let with_field = text.replace(
+            "\"cancelled\": false",
+            "\"cancelled\": false,\n        \"input\": [\"Forest\"]",
+        );
+        assert_ne!(text, with_field, "the fixture must contain a shell result");
+        std::fs::write(&path, with_field).unwrap();
+
+        let loaded = load(&dir, "old").expect("an unknown field must not fail the load");
+        assert_eq!(loaded.transcript.len(), session.transcript.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn listing_ignores_folders_that_are_not_sessions() {
         // Keying on the session file rather than on "is a directory" keeps the
         // `/load` picker from offering something that then fails to load.
@@ -261,12 +384,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A session whose transcript is the given alternating prompts and answers.
+    fn conversation(turns: &[&str]) -> Session {
+        let transcript = turns
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                if i % 2 == 0 {
+                    Entry::User((*text).into())
+                } else {
+                    Entry::Action {
+                        action: Action::Response((*text).into()),
+                        usage: None,
+                        diff: None,
+                    }
+                }
+            })
+            .collect();
+        Session::new("m".into(), vec![], transcript, vec![], Ledger::default())
+    }
+
+    #[test]
+    fn saving_writes_a_preview_beside_the_conversation() {
+        let dir = temp_dir("preview-write");
+        save(
+            &dir,
+            "demo",
+            &conversation(&["add a cache", "I added an LRU."]),
+        )
+        .unwrap();
+
+        assert!(dir.join("demo").join(PREVIEW_FILE).is_file());
+        assert_eq!(
+            preview(&dir, "demo"),
+            vec![
+                "you: add a cache".to_string(),
+                "I added an LRU.".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preview_is_the_tail_of_the_prose_in_order() {
+        // Bounded to the last few, and shown as it happened rather than
+        // backwards, which is how it was gathered.
+        let dir = temp_dir("preview-tail");
+        save(
+            &dir,
+            "demo",
+            &conversation(&["first", "second", "third", "fourth", "fifth"]),
+        )
+        .unwrap();
+
+        let lines = preview(&dir, "demo");
+        assert_eq!(lines.len(), PREVIEW_LINES);
+        // Alternating, so the odd ones are the model's and carry no prefix.
+        assert_eq!(lines, vec!["you: third", "fourth", "you: fifth"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preview_ignores_everything_that_is_not_prose() {
+        // A trailing command result says nothing about what a session was about,
+        // which is the only question the picker has to answer.
+        let dir = temp_dir("preview-prose");
+        let mut session = conversation(&["what changed?", "Two files."]);
+        session.transcript.push(Entry::Notice("saved".into()));
+        session
+            .transcript
+            .push(Entry::CommandResult(Box::new(crate::exec::CommandOutput {
+                command: "ls".into(),
+                exit_code: Some(0),
+                stdout: "a.txt".into(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                cancelled: false,
+            })));
+        save(&dir, "demo", &session).unwrap();
+
+        assert_eq!(
+            preview(&dir, "demo"),
+            vec!["you: what changed?", "Two files."]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preview_line_is_one_line_and_bounded() {
+        let dir = temp_dir("preview-bounds");
+        let long = "x".repeat(500);
+        save(
+            &dir,
+            "demo",
+            &conversation(&[&format!("{long}\nand a second line")]),
+        )
+        .unwrap();
+
+        let lines = preview(&dir, "demo");
+        assert_eq!(lines.len(), 1, "only the first line of an entry");
+        assert!(
+            lines[0].chars().count() <= PREVIEW_WIDTH,
+            "a long entry must not make a long file: {} chars",
+            lines[0].chars().count()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_with_no_prose_has_an_empty_preview() {
+        let dir = temp_dir("preview-empty");
+        save(&dir, "demo", &sample_without_prose()).unwrap();
+        assert!(preview(&dir, "demo").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_saved_before_previews_reads_as_empty() {
+        // Not backfilled: parsing every session.json to do it is the cost this
+        // file exists to avoid. The next save writes one.
+        let dir = temp_dir("preview-absent");
+        save(&dir, "demo", &conversation(&["hi"])).unwrap();
+        std::fs::remove_file(dir.join("demo").join(PREVIEW_FILE)).unwrap();
+
+        assert!(preview(&dir, "demo").is_empty());
+        assert!(load(&dir, "demo").is_ok(), "the session still loads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preview_that_cannot_be_written_does_not_fail_the_save() {
+        // The conversation is the thing that matters; the preview is a
+        // convenience the next save regenerates.
+        let dir = temp_dir("preview-blocked");
+        let folder = dir.join("demo");
+        std::fs::create_dir_all(&folder).unwrap();
+        // A directory where the file should go: writing it cannot succeed.
+        std::fs::create_dir_all(folder.join(PREVIEW_FILE)).unwrap();
+
+        assert!(save(&dir, "demo", &conversation(&["hi"])).is_ok());
+        assert!(load(&dir, "demo").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_without_prose() -> Session {
+        Session::new(
+            "m".into(),
+            vec![],
+            vec![Entry::Notice("nothing said".into())],
+            vec![],
+            Ledger::default(),
+        )
+    }
+
     #[test]
     fn renaming_carries_the_rest_of_the_session_with_it() {
         // The whole reason a session is a directory: files added beside the
         // conversation follow a rename without `rename` knowing they exist.
         let dir = temp_dir("rename-carries");
-        save(&dir, "before", &sample()).unwrap();
+        save(&dir, "before", &conversation(&["a question", "an answer"])).unwrap();
         std::fs::write(dir.join("before").join("plan.md"), "# the plan").unwrap();
 
         rename(&dir, "before", "after").unwrap();
@@ -276,6 +553,13 @@ mod tests {
             std::fs::read_to_string(dir.join("after").join("plan.md")).unwrap(),
             "# the plan",
             "a sibling file must travel with the session"
+        );
+        // The preview is the first real second file this promises anything
+        // about, rather than one written by the test to prove the point.
+        assert_eq!(
+            preview(&dir, "after"),
+            vec!["you: a question".to_string(), "an answer".to_string()],
+            "the preview must travel too, without `rename` knowing it exists"
         );
         assert!(load(&dir, "after").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
@@ -333,7 +617,6 @@ mod tests {
                 truncated: false,
                 timed_out: false,
                 cancelled: false,
-                input: Vec::new(),
             })),
             Entry::FetchResult(Box::new(crate::fetch::FetchOutcome {
                 url: "https://example.com".into(),

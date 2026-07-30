@@ -14,11 +14,19 @@ use crate::wrap;
 
 /// Prompt box grows with the text, up to this many rows of content.
 const MAX_INPUT_ROWS: u16 = 10;
+/// Rows of transcript the bottom panel must leave behind.
+///
+/// The point of docking the modals rather than floating them is that you can
+/// still read what you are deciding about, so a tall one gives way rather than
+/// squeezing the conversation to nothing.
+const MIN_TRANSCRIPT_ROWS: u16 = 6;
+/// Smallest usable panel: borders, one row of content, one of footer.
+const MIN_PANEL_ROWS: u16 = 4;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// How the last frame was laid out. The event loop needs this to clamp
 /// scrolling to the content that was actually rendered.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct Metrics {
     pub transcript_height: u16,
     pub content_height: u16,
@@ -26,10 +34,14 @@ pub struct Metrics {
     /// the modal is not up.
     pub allow_button: Option<Rect>,
     pub deny_button: Option<Rect>,
-    /// The session picker's row area and the index of its first visible row, so
-    /// a click can be mapped back to a session. `None` when the picker is closed.
+    /// The session picker's row area, and which session each rendered row
+    /// belongs to. `None` when the picker is closed.
+    ///
+    /// A table rather than an offset because a picker entry spans several rows:
+    /// a click on a preview line or a divider has to select that entry, which
+    /// adding a first-visible-index to a row number cannot express.
     pub picker_list: Option<Rect>,
-    pub picker_offset: usize,
+    pub picker_rows: Vec<usize>,
     /// The same, for the model's question modal.
     pub question_list: Option<Rect>,
     pub question_offset: usize,
@@ -68,11 +80,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Metrics {
         (completions.len() as u16 + 2).min(area.height / 2)
     };
 
-    let [transcript_area, menu_area, status_area, input_area] = Layout::vertical([
+    // Whatever the harness needs from you takes the prompt's place rather than
+    // floating over the transcript: it is the same slot because it is the same
+    // thing — where you answer. Built before the split, since the layout needs
+    // its height, and the height comes from its contents.
+    //
+    // The menu and a panel never coexist: the menu only opens while typing a
+    // slash command, and every panel owns the keyboard.
+    let panel = prepare_panel(app, area);
+    let panel_rows = panel.as_ref().map_or(input_rows + 2, |p| p.height);
+
+    let [transcript_area, menu_area, status_area, panel_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(menu_rows),
         Constraint::Length(1),
-        Constraint::Length(input_rows + 2),
+        Constraint::Length(panel_rows),
     ])
     .areas(area);
 
@@ -81,123 +103,328 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Metrics {
         draw_completions(frame, &completions, app.completion_index(), menu_area);
     }
     draw_status(frame, app, status_area);
-    draw_input(frame, app, input_area, &input_layout, input_rows);
 
-    // Drawn last so it sits above everything else. The two modals are mutually
-    // exclusive; approval takes precedence if both were ever set.
-    if let Some(pending) = app.pending() {
-        let (allow, deny) = draw_approval(frame, pending, area);
-        metrics.allow_button = Some(allow);
-        metrics.deny_button = Some(deny);
-    } else if let Some(question) = app.question() {
-        let (list, offset) = draw_question(frame, question, area);
-        metrics.question_list = Some(list);
-        metrics.question_offset = offset;
-    } else if let Some(picker) = app.picker() {
-        let (list, offset) = draw_picker(frame, picker, area);
-        metrics.picker_list = Some(list);
-        metrics.picker_offset = offset;
+    match panel {
+        Some(panel) => draw_prepared_panel(frame, app, panel, panel_area, &mut metrics),
+        None => draw_input(frame, app, panel_area, &input_layout, input_rows),
     }
     metrics
 }
 
-/// The `/load` session picker. Returns the inner row area and the index of the
-/// first visible row, so a click can be mapped back to a session.
-fn draw_picker(frame: &mut Frame, picker: &crate::app::Picker, area: Rect) -> (Rect, usize) {
-    let width = area.width.saturating_sub(8).clamp(20, 60);
-    // Border (2) + footer (1) + a blank (1), plus one row per session, capped.
-    let max_list = (area.height.saturating_sub(2) / 2).max(1);
-    let list_rows = (picker.sessions.len() as u16).clamp(1, max_list);
-    let height = list_rows + 4;
+/// Which panel is showing, for the geometry each one reports back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelKind {
+    Approval,
+    Question,
+    Picker,
+}
 
-    let modal = center(area, width, height);
-    frame.render_widget(Clear, modal);
+/// A panel measured and laid out, ready to be drawn into the bottom slot.
+struct Panel {
+    kind: PanelKind,
+    title: &'static str,
+    colour: Color,
+    body: Vec<Line<'static>>,
+    /// The footer line. `None` leaves it to the caller, which is how the
+    /// approval panel puts its buttons there.
+    hint: Option<&'static str>,
+    height: u16,
+    /// Rows of `body` before the selectable list starts, so a click can be
+    /// mapped back to a row.
+    header: u16,
+    /// Index of the first visible list row, for uniform-height lists.
+    offset: usize,
+    /// For the picker, which session each rendered row belongs to. Empty for
+    /// panels whose rows map to entries one-for-one.
+    owners: Vec<usize>,
+}
+
+/// Build the bottom panel, or `None` when the prompt has the slot.
+///
+/// Heights are derived from content and then capped, the same way the prompt
+/// grows to fit and stops at [`MAX_INPUT_ROWS`]. A list that no longer fits
+/// scrolls a window around the selection rather than pushing the transcript out.
+fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
+    // Borders take two columns, and the content is padded by one either side.
+    let inner_width = area.width.saturating_sub(4).max(1) as usize;
+    let max = area
+        .height
+        .saturating_sub(MIN_TRANSCRIPT_ROWS + 1)
+        .max(MIN_PANEL_ROWS);
+
+    if let Some(pending) = app.pending() {
+        let (prompt, title, body) = approval_body(pending, inner_width);
+        let mut lines = vec![
+            Line::from(Span::styled(prompt, Style::default().fg(Color::Gray))),
+            Line::default(),
+        ];
+        lines.extend(body);
+        // A blank before the footer, so the buttons are not flush against what
+        // they are deciding about. The old centred box got this from its slack.
+        lines.push(Line::default());
+        // Borders (2) + footer (1).
+        let height = (lines.len() as u16 + 3).min(max).max(MIN_PANEL_ROWS);
+        return Some(Panel {
+            kind: PanelKind::Approval,
+            title,
+            colour: Color::Yellow,
+            body: lines,
+            hint: None,
+            height,
+            header: 0,
+            offset: 0,
+            owners: Vec::new(),
+        });
+    }
+
+    if let Some(question) = app.question() {
+        let asked = body_lines(&question.text, Style::default(), inner_width);
+        // Borders (2) + footer (1) + the question + a blank after it.
+        let chrome = asked.len() as u16 + 4;
+        let height = (chrome + question.rows() as u16)
+            .min(max)
+            .max(chrome + 1)
+            .max(MIN_PANEL_ROWS);
+        let visible = height.saturating_sub(chrome).max(1) as usize;
+        let offset = question
+            .selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(question.rows().saturating_sub(visible));
+
+        let header = asked.len() as u16 + 1;
+        let mut body = asked;
+        body.push(Line::default());
+        body.extend(question_rows(question, offset, visible));
+
+        return Some(Panel {
+            kind: PanelKind::Question,
+            title: " the model is asking ",
+            colour: Color::Yellow,
+            body,
+            hint: Some(if question.on_other() {
+                "type your answer · Enter send · ↑/↓ choose · Esc dismiss"
+            } else {
+                "↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
+            }),
+            height,
+            header,
+            offset,
+            owners: Vec::new(),
+        });
+    }
+
+    if let Some(picker) = app.picker() {
+        // Borders (2) + footer (1).
+        let chrome = 3u16;
+        // An entry is a name, a rule, its preview, and a trailing blank, so the
+        // natural height is a sum rather than a count.
+        let wanted: usize = (0..picker.sessions.len())
+            .map(|i| {
+                let lines = picker.previews.get(i).map_or(0, Vec::len);
+                if lines == 0 { 2 } else { lines + 3 }
+            })
+            .sum();
+        let height = (chrome + wanted as u16).min(max).max(MIN_PANEL_ROWS);
+        let visible = height.saturating_sub(chrome).max(1) as usize;
+        let (body, owners) = picker_rows(picker, visible, inner_width);
+
+        return Some(Panel {
+            kind: PanelKind::Picker,
+            title: " load session ",
+            colour: Color::Blue,
+            body,
+            hint: Some("↑/↓ choose · Enter load · Esc cancel"),
+            height,
+            header: 0,
+            offset: 0,
+            owners,
+        });
+    }
+
+    None
+}
+
+/// Draw a prepared panel and record the geometry its clicks need.
+fn draw_prepared_panel(
+    frame: &mut Frame,
+    app: &App,
+    mut panel: Panel,
+    area: Rect,
+    metrics: &mut Metrics,
+) {
+    let kind = panel.kind;
+    let header = panel.header;
+    let offset = panel.offset;
+    let owners = std::mem::take(&mut panel.owners);
+    let (content, footer) = draw_panel(frame, area, panel);
+
+    // The list starts below whatever header the body carries.
+    let list = Rect::new(
+        content.x,
+        content.y + header,
+        content.width,
+        content.height.saturating_sub(header),
+    );
+
+    match kind {
+        PanelKind::Approval => {
+            if let Some(pending) = app.pending() {
+                let (allow, deny) = draw_buttons(frame, footer, pending.selected);
+                metrics.allow_button = Some(allow);
+                metrics.deny_button = Some(deny);
+            }
+        }
+        PanelKind::Question => {
+            metrics.question_list = Some(list);
+            metrics.question_offset = offset;
+            // A real cursor, the same call `draw_input` makes. A panel in the
+            // prompt's slot with the terminal cursor sitting in it reads as the
+            // prompt having grown, which is the whole point.
+            if let Some(question) = app.question()
+                && question.on_other()
+            {
+                let row = question.selected.saturating_sub(offset) as u16;
+                if row < list.height {
+                    let col = question.other.layout(list.width.saturating_sub(2)).cursor.1;
+                    frame.set_cursor_position(Position::new(list.x + 2 + col, list.y + row));
+                }
+            }
+        }
+        PanelKind::Picker => {
+            metrics.picker_list = Some(list);
+            metrics.picker_rows = owners;
+        }
+    }
+}
+
+/// Draw the bottom panel: the input box grown, not a window opened.
+///
+/// Same bordered block in the same slot, with nothing centred and nothing
+/// cleared behind it — the transcript above stays readable, which is the reason
+/// these are not overlays. Returns the content and footer rects.
+fn draw_panel(frame: &mut Frame, area: Rect, panel: Panel) -> (Rect, Rect) {
     let block = Block::bordered()
-        .title(Line::from(" load session ").bold())
-        .border_style(Style::default().fg(Color::Blue));
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+        .title(Line::from(panel.title).bold())
+        .border_style(Style::default().fg(panel.colour));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let [list_area, footer_area] =
+    let [content, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(Text::from(panel.body)), content);
 
-    // Scroll a window around the selection so it stays visible in a long list.
-    let visible = list_area.height as usize;
-    let offset = picker
-        .selected
-        .saturating_sub(visible.saturating_sub(1))
-        .min(picker.sessions.len().saturating_sub(visible));
+    if let Some(hint) = panel.hint {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            footer,
+        );
+    }
+    (content, footer)
+}
 
-    let rows: Vec<Line> = picker
+/// Rendered rows for one session: its name, a rule, and its last few lines.
+///
+/// A blank row trails each entry, because with three lines under every name a
+/// flat run of rows stops being scannable — the gap is what makes an entry read
+/// as one thing.
+fn picker_entry(name: &str, lines: &[String], focused: bool, width: usize) -> Vec<Line<'static>> {
+    let title = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD)
+    };
+    let marker = if focused { "› " } else { "  " };
+
+    let mut rows = vec![Line::from(Span::styled(format!("{marker}{name}"), title))];
+    if !lines.is_empty() {
+        rows.push(Line::from(Span::styled(
+            format!("  {}", "─".repeat(width.saturating_sub(2))),
+            Style::default().fg(Color::DarkGray),
+        )));
+        // Dimmer than the name throughout, so the eye lands on names first and
+        // the previews read as detail under them.
+        let body = if focused {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        };
+        for line in lines {
+            // Truncated to the panel, not just to what the file stores: one is
+            // bounded for size and the other for the screen, and they are
+            // different numbers — without this a long line runs into the border.
+            rows.push(Line::from(Span::styled(
+                format!("  {}", truncate(line, width.saturating_sub(2))),
+                Style::default().fg(body),
+            )));
+        }
+    }
+    rows.push(Line::default());
+    rows
+}
+
+/// Lay out the picker to fit `visible` rows, keeping the selection on screen.
+///
+/// Returns the rows and, for each of them, the session it belongs to — entries
+/// are no longer one row tall, so a click has to be mapped back through a table
+/// rather than by adding an offset.
+fn picker_rows(
+    picker: &crate::app::Picker,
+    visible: usize,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let entries: Vec<Vec<Line<'static>>> = picker
         .sessions
         .iter()
         .enumerate()
-        .skip(offset)
-        .take(visible)
         .map(|(i, name)| {
-            let focused = i == picker.selected;
-            let style = if focused {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let marker = if focused { "› " } else { "  " };
-            Line::from(Span::styled(format!("{marker}{name}"), style))
+            let lines = picker.previews.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            picker_entry(name, lines, i == picker.selected, width)
         })
         .collect();
-    frame.render_widget(Paragraph::new(Text::from(rows)), list_area);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "↑/↓ choose · Enter load · Esc cancel",
-            Style::default().fg(Color::DarkGray),
-        ))),
-        footer_area,
-    );
+    // Walk back from the selection while the entries still fit, so the selection
+    // is visible by construction rather than by arithmetic that assumed every
+    // entry was the same height.
+    let mut first = picker.selected;
+    let mut used = entries[picker.selected].len();
+    while first > 0 {
+        let next = used + entries[first - 1].len();
+        if next > visible {
+            break;
+        }
+        used = next;
+        first -= 1;
+    }
 
-    (list_area, offset)
+    let mut rows = Vec::new();
+    let mut owners = Vec::new();
+    for (i, entry) in entries.iter().enumerate().skip(first) {
+        for line in entry {
+            if rows.len() == visible {
+                return (rows, owners);
+            }
+            rows.push(line.clone());
+            owners.push(i);
+        }
+    }
+    (rows, owners)
 }
 
-/// The model's question. Returns the row area and the first visible index, so a
-/// click can be mapped back to a choice — the same contract `draw_picker` has.
-fn draw_question(frame: &mut Frame, question: &crate::app::Question, area: Rect) -> (Rect, usize) {
-    let width = area.width.saturating_sub(8).clamp(24, 72);
-    let inner_width = width.saturating_sub(4) as usize;
-
-    let prompt = body_lines(&question.text, Style::default(), inner_width);
-    // Border (2) + question + blank + footer (1), plus one row per choice and
-    // one for the free-text row, all capped to what the screen can hold.
-    let max_rows = (area.height.saturating_sub(6)).max(1) as usize;
-    let list_rows = question.rows().min(max_rows) as u16;
-    let height = (prompt.len() as u16 + list_rows + 4).min(area.height.saturating_sub(2));
-
-    let modal = center(area, width, height);
-    frame.render_widget(Clear, modal);
-    let block = Block::bordered()
-        .title(Line::from(" the model is asking ").bold())
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
-
-    let [question_area, list_area, footer_area] = Layout::vertical([
-        Constraint::Length(prompt.len() as u16 + 1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-    frame.render_widget(Paragraph::new(Text::from(prompt)), question_area);
-
-    // Scroll a window around the selection, so a long list stays usable.
-    let visible = list_area.height as usize;
-    let offset = question
-        .selected
-        .saturating_sub(visible.saturating_sub(1))
-        .min(question.rows().saturating_sub(visible));
-
-    let mut rows: Vec<Line> = Vec::new();
+/// One row per visible choice, plus the free-text row at the end.
+fn question_rows(
+    question: &crate::app::Question,
+    offset: usize,
+    visible: usize,
+) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
     for i in offset..question.rows().min(offset + visible) {
         let focused = i == question.selected;
         let style = if focused {
@@ -212,29 +439,14 @@ fn draw_question(frame: &mut Frame, question: &crate::app::Question, area: Rect)
         let label = match question.choices.get(i) {
             // Numbered so a single keypress can pick one.
             Some(choice) => format!("{marker}{}. {choice}", i + 1),
-            // The free-text row becomes an editor once focused; before that it
-            // is an invitation, so it has to read as one.
-            None if focused => format!("{marker}{}▌", question.other.text()),
+            // Focused, this row is an editor and the terminal cursor sits in
+            // it; unfocused it has to read as an invitation.
+            None if focused => format!("{marker}{}", question.other.text()),
             None => format!("{marker}something else…"),
         };
         rows.push(Line::from(Span::styled(label, style)));
     }
-    frame.render_widget(Paragraph::new(Text::from(rows)), list_area);
-
-    let hint = if question.on_other() {
-        "type your answer · Enter send · ↑/↓ choose · Esc dismiss"
-    } else {
-        "↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        footer_area,
-    );
-
-    (list_area, offset)
+    rows
 }
 
 /// The slash-command completion menu, shown above the status line.
@@ -304,15 +516,16 @@ fn path_then(path: &str, rest: Vec<Line<'static>>) -> Vec<Line<'static>> {
     .collect()
 }
 
-/// The approval modal. Returns the Allow and Deny button areas so the event
-/// loop can hit-test mouse clicks against them.
-fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rect) {
-    let width = area.width.saturating_sub(8).clamp(24, 76);
-
-    // Build the body: a command shown in full, or a write shown as path + a
-    // bounded preview so a large file never blows up the box.
-    let inner_width = width.saturating_sub(4) as usize;
-    let (prompt, title, mut body): (&str, &str, Vec<Line>) = match &pending.action {
+/// What is being approved: the lead-in line, the panel title, and the body.
+///
+/// A command is shown in full; a write or edit as its path plus the same diff
+/// the transcript will show, so what you approve and what you scroll back to
+/// cannot differ.
+fn approval_body(
+    pending: &Pending,
+    inner_width: usize,
+) -> (&'static str, &'static str, Vec<Line<'static>>) {
+    let (prompt, title, body): (&str, &str, Vec<Line>) = match &pending.action {
         // Only reachable under `--confirm-reads`; reads are otherwise silent.
         Action::Read { path } => (
             "The model wants to read:",
@@ -377,30 +590,12 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
         ),
     };
 
-    // Border + prompt + blank + body + blank + buttons.
-    let height = (body.len() as u16 + 7)
-        .min(area.height.saturating_sub(2))
-        .max(7);
-    let modal = center(area, width, height);
-    frame.render_widget(Clear, modal);
+    (prompt, title, body)
+}
 
-    let block = Block::bordered()
-        .title(Line::from(title).bold())
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
-
-    let [text_area, button_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-
-    let mut lines = vec![Line::from(Span::styled(
-        prompt,
-        Style::default().fg(Color::Gray),
-    ))];
-    lines.push(Line::default());
-    lines.append(&mut body);
-    frame.render_widget(Paragraph::new(Text::from(lines)), text_area);
-
+/// Allow and Deny on the panel's footer row. Returns their areas so the event
+/// loop can hit-test mouse clicks against them.
+fn draw_buttons(frame: &mut Frame, button_area: Rect, selected: Choice) -> (Rect, Rect) {
     // Two fixed-width buttons, centred as a pair.
     const BUTTON: u16 = 11;
     let gap = 2;
@@ -413,7 +608,7 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
         (allow, "  Allow  ", Choice::Allow, Color::Green),
         (deny, "  Deny  ", Choice::Deny, Color::Red),
     ] {
-        let focused = pending.selected == choice;
+        let focused = selected == choice;
         let style = if focused {
             Style::default()
                 .fg(Color::Black)
@@ -431,18 +626,6 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
     }
 
     (allow, deny)
-}
-
-/// Centre a `width` x `height` box inside `area`.
-fn center(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    )
 }
 
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) -> Metrics {
@@ -606,15 +789,10 @@ fn running_window(
     }
     lines.append(&mut body);
 
-    let hint = if app.accepts_input() {
-        "type to answer · Enter sends · Esc cancels"
-    } else {
-        "Esc cancels"
-    };
     lines.push(rule(
         vec![
             Span::styled("└─ ", edge),
-            Span::styled(hint.to_string(), dim),
+            Span::styled("Esc cancels".to_string(), dim),
             Span::styled(" ", edge),
         ],
         width,
@@ -1318,12 +1496,6 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
-    if app.interactive {
-        spans.push(Span::styled(
-            "  interactive",
-            Style::default().fg(Color::Cyan),
-        ));
-    }
     if !app.follow {
         spans.push(Span::styled(
             "  scrolled — End to resume",
@@ -1334,8 +1506,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         "  ←/→ choose · Enter confirm · y allow · n/Esc deny"
     } else if app.question().is_some() {
         "  ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
-    } else if app.accepts_input() {
-        "  Enter sends to the command · Esc cancel"
+    } else if app.picker().is_some() {
+        // The picker coexists with `Idle`, so without this the bar offers to
+        // send a prompt while the panel below it is asking you to choose.
+        "  ↑/↓ choose · Enter load · Esc cancel"
     } else if matches!(
         app.status,
         Status::Waiting | Status::Streaming | Status::Running
@@ -2453,21 +2627,6 @@ mod tests {
     }
 
     #[test]
-    fn the_window_hint_changes_when_input_is_accepted() {
-        let mut app = running("read name");
-        let (rows, _) = render(&mut app, 70, 16);
-        assert!(!transcript_only(&rows).contains("type to answer"));
-
-        app.interactive = true;
-        let (rows, _) = render(&mut app, 70, 16);
-        let screen = transcript_only(&rows);
-        assert!(
-            screen.contains("type to answer"),
-            "the window should say it is waiting on you:\n{screen}"
-        );
-    }
-
-    #[test]
     fn the_window_keeps_the_newest_output_and_says_what_it_dropped() {
         let mut app = running("spew");
         for i in 0..60 {
@@ -2515,7 +2674,6 @@ mod tests {
             truncated: false,
             timed_out: false,
             cancelled: false,
-            input: Vec::new(),
         });
 
         let (rows, _) = render(&mut app, 60, 20);
@@ -2551,6 +2709,77 @@ mod tests {
             None,
         );
         app
+    }
+
+    /// The row index of the panel's top border, and of the transcript's bottom.
+    fn panel_top(rows: &[String], title: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(title))
+            .unwrap_or_else(|| panic!("no panel titled {title:?} in:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn every_panel_sits_at_the_bottom_in_the_prompts_place() {
+        let cases: Vec<(App, &str)> = vec![
+            (asked("Which?", &["a", "b"]), "the model is asking"),
+            (awaiting_approval("ls -la"), "run this command?"),
+        ];
+        for (mut app, title) in cases {
+            let (rows, _) = render(&mut app, 70, 20);
+            let top = panel_top(&rows, title);
+            let transcript_bottom = rows
+                .iter()
+                .position(|r| r.starts_with('└'))
+                .expect("the transcript closes");
+            assert!(
+                top > transcript_bottom,
+                "{title} should be below the transcript:\n{}",
+                rows.join("\n")
+            );
+            // And in the prompt's slot: nothing after it but its own border.
+            assert!(
+                top >= rows.len() - 10,
+                "{title} should be near the bottom:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn the_transcript_gives_up_rows_to_a_panel_rather_than_being_covered() {
+        let mut idle = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let (_, plain) = render(&mut idle, 70, 22);
+
+        let mut app = asked("Which?", &["a", "b", "c"]);
+        let (_, with_panel) = render(&mut app, 70, 22);
+
+        assert!(
+            with_panel.transcript_height < plain.transcript_height,
+            "the transcript should shrink: {} vs {}",
+            with_panel.transcript_height,
+            plain.transcript_height
+        );
+    }
+
+    #[test]
+    fn a_long_panel_caps_rather_than_filling_the_screen() {
+        // 25 choices on a short terminal: the panel gives way, the list scrolls.
+        let many: Vec<String> = (1..=25).map(|i| format!("choice {i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let mut app = asked("Which?", &refs);
+
+        let (rows, metrics) = render(&mut app, 60, 16);
+        assert!(
+            metrics.transcript_height >= MIN_TRANSCRIPT_ROWS.saturating_sub(2),
+            "the transcript kept {} rows:\n{}",
+            metrics.transcript_height,
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("choice 1")),
+            "the selection stays visible:\n{}",
+            rows.join("\n")
+        );
     }
 
     #[test]
@@ -2632,21 +2861,6 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_the_interactive_marker() {
-        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
-        let (rows, _) = render(&mut app, 70, 12);
-        assert!(!rows.join("\n").contains("interactive"));
-
-        app.interactive = true;
-        let (rows, _) = render(&mut app, 70, 12);
-        assert!(
-            rows.join("\n").contains("interactive"),
-            "{}",
-            rows.join("\n")
-        );
-    }
-
-    #[test]
     fn status_bar_shows_the_auto_approve_marker() {
         // With no modal to interrupt you, the status bar is the only standing
         // signal that the harness will act on its own.
@@ -2697,6 +2911,122 @@ mod tests {
         (app, dir)
     }
 
+    /// A picker over sessions that each have a one-line preview.
+    fn app_with_previews(names: &[&str]) -> (App, std::path::PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ai-harness-ui-preview-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in names {
+            let session = crate::session::Session::new(
+                "m".into(),
+                vec![],
+                vec![Entry::User(format!("what {name} was about"))],
+                vec![],
+                Default::default(),
+            );
+            crate::session::save(&dir, name, &session).unwrap();
+        }
+        let mut app = App::new("test/model".into(), None, 10, dir.clone());
+        app.open_load_picker();
+        (app, dir)
+    }
+
+    #[test]
+    fn a_picker_entry_shows_its_name_a_rule_and_its_last_lines() {
+        let (mut app, dir) = app_with_previews(&["alpha", "beta"]);
+        let (rows, _) = render(&mut app, 70, 24);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("alpha"), "{screen}");
+        assert!(screen.contains("what alpha was about"), "{screen}");
+        assert!(screen.contains('─'), "a rule under the name:\n{screen}");
+        // The gap is what makes each entry read as one thing.
+        assert!(
+            screen.contains("what alpha was about"),
+            "entries should be separated:\n{screen}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_anywhere_in_an_entry_selects_that_entry() {
+        // The regression the row map exists to prevent: an entry spans a name, a
+        // rule, its lines, and a gap, so a click on any of them means that
+        // entry — not the neighbour an offset would have computed.
+        let (mut app, dir) = app_with_previews(&["alpha", "beta", "gamma"]);
+        let (_, metrics) = render(&mut app, 70, 30);
+        let rows = &metrics.picker_rows;
+
+        // Checked at two entries, so an off-by-one in the map cannot pass.
+        for target in [1usize, 2] {
+            let owned: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, owner)| **owner == target)
+                .map(|(row, _)| row)
+                .collect();
+            assert!(
+                owned.len() > 1,
+                "entry {target} should span several rows, got {owned:?}"
+            );
+            for row in owned {
+                assert_eq!(
+                    rows[row], target,
+                    "row {row} should belong to entry {target}: {rows:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_without_a_preview_renders_as_a_bare_name() {
+        // Sessions saved before previews existed are not backfilled; they must
+        // not break the layout.
+        let (mut app, dir) = app_with_previews(&["alpha"]);
+        std::fs::remove_file(dir.join("alpha").join(crate::session::PREVIEW_FILE)).unwrap();
+        app.open_load_picker();
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+        assert!(screen.contains("alpha"), "{screen}");
+        assert!(
+            !screen.contains("what alpha was about"),
+            "no stale preview:\n{screen}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_previewed_picker_caps_with_the_selection_still_visible() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut app, dir) = app_with_previews(&refs);
+        for _ in 0..11 {
+            app.picker_move(1);
+        }
+
+        let (rows, metrics) = render(&mut app, 60, 20);
+        assert!(
+            rows.iter().any(|r| r.contains("s11")),
+            "the deep selection must be in view:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            metrics.transcript_height >= MIN_TRANSCRIPT_ROWS.saturating_sub(2),
+            "the transcript kept {} rows",
+            metrics.transcript_height
+        );
+        for row in &rows {
+            assert!(row.chars().count() <= 60, "row overflows: {row:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn picker_lists_sessions_and_reports_its_geometry() {
         let (mut app, dir) = app_with_picker(&["alpha", "beta", "gamma"]);
@@ -2709,7 +3039,11 @@ mod tests {
         }
         assert!(screen.contains("Enter load"), "missing footer:\n{screen}");
         assert!(metrics.picker_list.is_some(), "list rect must be reported");
-        assert_eq!(metrics.picker_offset, 0);
+        assert_eq!(
+            metrics.picker_rows.first().copied(),
+            Some(0),
+            "the first rendered row belongs to the first session"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2726,10 +3060,16 @@ mod tests {
             rows.join("\n")
         );
 
-        // A click on that row maps back to index 1 via the reported geometry.
-        let list = metrics.picker_list.unwrap();
-        let clicked = metrics.picker_offset + (list.y + 1 - list.y) as usize;
-        assert_eq!(clicked, 1, "click math recovers the row index");
+        // A click anywhere in that entry maps back to index 1 via the row map.
+        let row = metrics
+            .picker_rows
+            .iter()
+            .position(|owner| *owner == 1)
+            .expect("the selected entry should own some rows");
+        assert_eq!(
+            metrics.picker_rows[row], 1,
+            "the row map recovers the index"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2747,7 +3087,10 @@ mod tests {
             "the deep selection must be scrolled into view:\n{}",
             rows.join("\n")
         );
-        assert!(metrics.picker_offset > 0, "a long list must scroll");
+        assert!(
+            metrics.picker_rows.first().copied().unwrap_or(0) > 0,
+            "a long list must scroll past the first session"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2774,7 +3117,6 @@ mod tests {
             truncated: false,
             timed_out: false,
             cancelled: false,
-            input: Vec::new(),
         });
 
         let (rows, _) = render(&mut app, 60, 20);

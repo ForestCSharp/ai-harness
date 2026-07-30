@@ -376,17 +376,6 @@ pub fn encode_shell_result(output: &CommandOutput) -> String {
         body.push_str("note: output was truncated because it exceeded the size limit\n");
     }
 
-    // Piped stdin is not echoed into stdout, so without this the model would see
-    // a prompt, then output that depends on an answer it never saw — and fill
-    // the gap by guessing. Named as the user's, not the command's, since it is
-    // the one part of a result a human wrote.
-    if !output.input.is_empty() {
-        body.push_str(&section(
-            "input typed by the user while it ran",
-            &output.input.join("\n"),
-        ));
-    }
-
     body.push_str(&section("stdout", &output.stdout));
     body.push_str(&section("stderr", &output.stderr));
 
@@ -1157,43 +1146,6 @@ mod tests {
                 tag: FETCH_TAG.into()
             })
         );
-    }
-
-    #[test]
-    fn a_shell_result_reports_input_the_user_typed() {
-        // Piped stdin is not echoed into stdout, so this is the only route by
-        // which the model learns a human answered its command's question.
-        let encoded = encode_shell_result(&CommandOutput {
-            command: "read name".into(),
-            exit_code: Some(0),
-            stdout: "name: hi Forest".into(),
-            stderr: String::new(),
-            truncated: false,
-            timed_out: false,
-            cancelled: false,
-            input: vec!["Forest".into()],
-        });
-        assert!(encoded.contains("Forest"), "{encoded}");
-        assert!(
-            encoded.contains("typed by the user"),
-            "the model must know a human supplied it: {encoded}"
-        );
-    }
-
-    #[test]
-    fn a_shell_result_with_no_typed_input_is_unchanged() {
-        let encoded = encode_shell_result(&CommandOutput {
-            command: "ls".into(),
-            exit_code: Some(0),
-            stdout: "a".into(),
-            stderr: String::new(),
-            truncated: false,
-            timed_out: false,
-            cancelled: false,
-            input: Vec::new(),
-        });
-        assert!(!encoded.contains("input"), "{encoded}");
-        assert!(encoded.contains("exit code: 0"), "{encoded}");
     }
 
     #[test]

@@ -233,21 +233,16 @@ authoritative text is the `CommandOutput` at the end, so nothing acts on a
 half-read pipe and the window can be bounded without losing anything the model
 needs.
 
-Two consequences of reading incrementally, both deliberate:
+One consequence of reading incrementally, deliberate: **the timeout is an idle
+bound.** It resets on every read, so a command is killed after that long producing
+nothing rather than that long running. `HARD_TIMEOUT_MULTIPLE` bounds the total
+anyway, since a command that prints forever would otherwise reset the clock
+forever.
 
-- **The timeout is an idle bound.** It resets on every read and every line
-  written, so a command is killed after that long producing nothing rather than
-  that long running. `HARD_TIMEOUT_MULTIPLE` bounds the total anyway, since a
-  command that prints forever would otherwise reset the clock forever.
-- **stdin can be a pipe.** `run_streaming` takes an optional receiver of lines;
-  with `None` stdin stays `/dev/null` and an interactive command fails fast as it
-  always has. Under `--interactive` the event loop holds the sender in
-  `InFlight.stdin`, and `Enter` routes the prompt line there instead of to the
-  model. What was typed is collected by `App` — `exec` wrote bytes to a pipe and
-  never saw lines — and attached to the `CommandOutput`, so `encode_shell_result`
-  can tell the model a human answered. Without that the model would see a prompt
-  in stdout, output that depends on the answer, and no answer: a gap it would
-  fill by guessing.
+stdin stays `/dev/null` throughout, so a command that waits to be answered fails
+fast instead of hanging, and the live window is read-only. When an answer is
+genuinely needed it comes from the model asking with `<ai-harness-option>`, not
+from typing at a running process.
 
 `handle_update` takes that output and calls `push_command_result`
 ([src/app.rs](../src/app.rs)) — which wraps stdout/exit code as

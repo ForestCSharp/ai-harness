@@ -166,7 +166,6 @@ Commands are handled locally and never sent to the model.
 | --- | --- |
 | `/debug` | Toggle showing the raw protocol sent and received |
 | `/auto` | Toggle running actions without the approval modal (see [Sandboxing](#sandboxing)) |
-| `/interactive` | Toggle typing into a running command's stdin (see [Sandboxing](#sandboxing)) |
 | `/clear` | Clear the conversation, keeping the system prompt |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -287,28 +286,16 @@ the window is replaced by the ordinary result entry when the command exits. The
 live view is display-only — the text sent to the model is the complete output
 captured at the end, the same split streamed replies use.
 
-`--interactive` (or `/interactive`) gives the command a real stdin: the prompt
-stays live while it runs, and `Enter` sends a line to the command instead of to
-the model. What you type is recorded in the result, so the model knows a human
-answered rather than inventing what the answer must have been.
-
-**This connects a pipe, not a terminal, and the difference is bigger than it
-sounds.** It serves shell prompts (`printf "name: "; read n`), y/n confirms, and
-anything reading stdin line by line. It does **not** serve a REPL or console:
-`python3`, `node`, and `sqlite3` all check whether stdin is a tty, and under a
-pipe they print no prompt, echo nothing, and just consume input as a script.
-`sudo` and `ssh` read passwords from `/dev/tty` and bypass the pipe entirely.
-Making those work needs a real PTY, which this does not allocate.
-
-Two things follow from stdin being decided when a command **spawns**: turn the
-mode on *before* asking for something interactive, and note that `/interactive`
-cannot be typed while a command is running, because slash commands need an idle
-prompt. If you press Enter at a command that cannot hear you, the harness says
-so rather than doing nothing — press `Esc`, run `/interactive`, and ask again.
+A command's stdin is `/dev/null`, so there is nothing to type at while one runs:
+anything waiting to be answered hits EOF and fails immediately rather than
+sitting there. A command that needs an answer should be given it upfront — `yes |`,
+`--yes`, or a heredoc — and when the *model* needs an answer it asks with
+`<ai-harness-option>` instead, which works at any point rather than only while a
+command happens to be running.
 
 `--command-timeout` is an **idle** bound, not a total one: it resets whenever the
-command produces output or you send it a line, so a command is killed after that
-long doing nothing rather than that long running. A build that prints progress
+command produces output, so a command is killed after that long doing nothing
+rather than that long running. A build that prints progress
 for two minutes survives; a silent one still dies on schedule. A separate ceiling
 of twenty times the timeout (ten minutes by default) stops a command that prints
 forever from running forever.
@@ -321,13 +308,6 @@ determined attacker.** Network is on, so any command you approve can send
 anything it can read. Command output is also sent to OpenRouter, which means
 reading a secret leaks it even with no network in the command itself — the `.env`
 deny closes the obvious case, and the denylist is not exhaustive.
-
-Interactive mode gives up one of the smaller guards here. Closed stdin is what
-makes a command that wants a terminal die immediately instead of sitting there;
-with a pipe attached it will wait instead, and a command that would have failed
-in a second can now occupy the loop until the idle timeout. Nothing about the
-filesystem confinement changes — but leave the mode off unless you are watching,
-which is the same rule `--auto-approve` follows.
 
 Two things `<ai-harness-fetch>` specifically does **not** do, both worth knowing
 before you leave it auto-approved:
@@ -419,9 +399,8 @@ Other flags: `--workdir` sets the sandbox root (default: cwd),
 `--command-timeout` the per-command limit in seconds, `--max-iterations` the
 agentic loop bound, `--confirm-reads` puts file reads behind the approval modal
 along with everything else, and `--confirm-fetch` does the same for URL fetches.
-`--auto-approve` goes the other way and removes the modal entirely, and
-`--interactive` lets you type to a running command — read
-[Sandboxing](#sandboxing) before using either. Every flag also has an environment
+`--auto-approve` goes the other way and removes the modal entirely — read
+[Sandboxing](#sandboxing) before using it. Every flag also has an environment
 variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 
 ## Keys
@@ -481,6 +460,28 @@ session's typed prompts and survives `/clear`.
 The prompt box grows downward from a fixed bottom edge as you add lines, up to
 10 rows, after which it scrolls internally.
 
+When the harness needs something from you — an approval, a question, the `/load`
+picker — it takes the prompt's place rather than floating over the conversation,
+because it is the same thing: where you answer.
+
+```
+┌ ai-harness ──────────────────┐
+│ conversation, still readable │
+└──────────────────────────────┘
+ approve  model  key hints
+┌ run this command? ───────────┐
+│ The model wants to run:      │
+│                              │
+│ cargo build --release        │
+│                              │
+│      [  Allow  ]    Deny     │
+└──────────────────────────────┘
+```
+
+The panel sizes itself to its contents on the same rule the prompt follows, and
+gives way before the transcript does: past its cap it scrolls internally rather
+than squeezing the conversation out of view.
+
 ## Layout of the code
 
 | File | Role |
@@ -489,7 +490,7 @@ The prompt box grows downward from a fixed bottom edge as you add lines, up to
 | `src/protocol.rs` | Query encoding, the system prompt, and strict reply parsing |
 | `src/command.rs` | Slash-command parsing, the command table, and completion |
 | `src/sandbox.rs` | Seatbelt profile generation and the sandboxed command |
-| `src/exec.rs` | Running commands: streamed output, stdin, idle timeout, output caps |
+| `src/exec.rs` | Running commands: streamed output, idle timeout, output caps |
 | `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
 | `src/fetch.rs` | URL policy, fetching, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/diff.rs` | Line-by-line diffs of writes and edits, bounded for storage |
@@ -560,12 +561,20 @@ The session **auto-saves after every turn**. Each session is a *folder*, under
 .ai_harness/
 └── sessions/
     └── <name>/
-        └── session.json
+        ├── session.json
+        └── preview.txt
 ```
 
 A folder rather than a file because the conversation is only the first thing a
 session owns — per-session plans and the like will sit beside it, and a folder
 means `/rename` and `/fork` carry them along without knowing they exist.
+
+`preview.txt` is the session's last few lines of prose, written on every save so
+the `/load` picker can show what each session was about. It exists as its own file
+because `session.json` runs to hundreds of kilobytes and the picker opens every
+session at once — parsing them all to show three lines each would get slower the
+longer you use the harness. It is derived data: delete it and the next save writes
+it again.
 
 `.ai_harness/` lives under the **sandbox root**, so sessions belong to the project
 rather than to whichever directory you launched from: running against two projects
@@ -587,7 +596,11 @@ never overwrite each other.
   original is preserved to `/load` back.
 - `/save [name]` — save now and, with a name, adopt it going forward.
 - `/load <name>` — restore a session. `/load` with no name opens a picker: choose
-  with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to cancel.
+  with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to cancel. Each entry
+  shows its name and the session's last few lines, so the list can be read rather
+  than navigated — names are timestamps until you `/rename` them, and a timestamp
+  says nothing about what a session was. Sessions saved before previews existed
+  show a bare name until their next save.
 - `/clear` — wipe the conversation, **including its saved file** (it is
   overwritten to the cleared state). Use `/fork` first if you want to keep it.
 

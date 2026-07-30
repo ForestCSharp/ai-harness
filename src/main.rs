@@ -67,17 +67,11 @@ struct Tagged {
 /// resolves the task's cancel future, stopping its work cleanly.
 struct InFlight {
     cancel: oneshot::Sender<()>,
-    /// Lines typed to the running command's stdin. `Some` only for a command
-    /// started in interactive mode; dropping it closes the child's stdin.
-    stdin: Option<mpsc::Sender<String>>,
 }
 
 impl InFlight {
     fn new(cancel: oneshot::Sender<()>) -> Self {
-        Self {
-            cancel,
-            stdin: None,
-        }
+        Self { cancel }
     }
 }
 
@@ -126,7 +120,6 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     app.confirm_reads = args.confirm_reads;
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
-    app.interactive = args.interactive;
     app.price_in = args.price_in;
     app.price_out = args.price_out;
     app.push_notice(format!(
@@ -140,16 +133,6 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         app.push_notice(
             "Auto-approve is on — commands, writes, and edits run without asking, \
              inside the sandbox. Esc cancels; /auto turns it off.",
-        );
-    }
-    // Said here for the same reason as auto-approve, plus one of its own: the
-    // mode has to be on *before* a command starts, since whether stdin is a pipe
-    // is settled when it spawns and /interactive cannot be typed mid-run.
-    if app.interactive {
-        app.push_notice(
-            "Interactive mode is on — a running command gets a real stdin, and Enter \
-             sends a line to it. This is a pipe, not a terminal: shell prompts and \
-             `read` work, but REPLs and anything wanting a tty will not.",
         );
     }
 
@@ -176,7 +159,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             // Terminal input.
             Some(event) = events.next() => {
                 match event {
-                    Ok(event) => handle_event(event, &mut app, &ctx, &mut inflight, metrics),
+                    Ok(event) => handle_event(event, &mut app, &ctx, &mut inflight, &metrics),
                     // A read error means the terminal is gone; exit rather than spin.
                     Err(err) => {
                         app.push_error(format!("terminal input error: {err}"));
@@ -294,7 +277,7 @@ fn handle_event(
     app: &mut App,
     ctx: &Ctx,
     inflight: &mut Option<InFlight>,
-    metrics: ui::Metrics,
+    metrics: &ui::Metrics,
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -342,12 +325,9 @@ fn handle_event(
             }
             // Clicking a session row loads it; hovering focuses it.
             MouseEventKind::Down(MouseButton::Left) if app.picker().is_some() => {
-                if let Some(i) = row_at(
-                    metrics.picker_list,
-                    metrics.picker_offset,
-                    mouse.column,
-                    mouse.row,
-                ) {
+                // Through the row map: a picker entry spans several rows, so
+                // a click on its preview or its divider still means that entry.
+                if let Some(i) = picker_row_at(metrics, mouse.column, mouse.row) {
                     // Only load when the click lands on a real row.
                     if app.picker_select(i) {
                         app.picker_confirm();
@@ -355,12 +335,7 @@ fn handle_event(
                 }
             }
             MouseEventKind::Moved if app.picker().is_some() => {
-                if let Some(i) = row_at(
-                    metrics.picker_list,
-                    metrics.picker_offset,
-                    mouse.column,
-                    mouse.row,
-                ) {
+                if let Some(i) = picker_row_at(metrics, mouse.column, mouse.row) {
                     app.picker_select(i);
                 }
             }
@@ -375,6 +350,19 @@ fn handle_event(
         }
         _ => {}
     }
+}
+
+/// Which session a mouse position falls on, through the picker's row map.
+///
+/// Unlike the question panel's uniform rows, a picker entry is a name, a rule,
+/// its preview lines, and a gap — so the row a click lands on has to be looked
+/// up rather than derived by adding a scroll offset.
+fn picker_row_at(metrics: &ui::Metrics, column: u16, row: u16) -> Option<usize> {
+    let list = metrics.picker_list?;
+    if !ui::hit(Some(list), column, row) {
+        return None;
+    }
+    metrics.picker_rows.get((row - list.y) as usize).copied()
 }
 
 /// Which list row a mouse position falls on, using the geometry from the last
@@ -459,11 +447,10 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
 
 /// Run a shell command, forwarding its output as it arrives.
 ///
-/// Two channels beyond the usual cancel: one carrying output chunks back for the
-/// live window, and — in interactive mode — one carrying typed lines to the
-/// child's stdin. The forwarder relays chunks onto the single `Tagged` channel
-/// the event loop drains, so live output is generation-tagged and dropped on
-/// cancel exactly like every other update.
+/// One channel beyond the usual cancel, carrying output chunks back for the live
+/// window. The forwarder relays them onto the single `Tagged` channel the event
+/// loop drains, so live output is generation-tagged and dropped on cancel exactly
+/// like every other update.
 fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, command: String) {
     let generation = app.next_generation();
     app.start_running(command.clone());
@@ -473,14 +460,6 @@ fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, comman
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<exec::Chunk>(32);
-    // Only in interactive mode: with no receiver, `run_streaming` leaves stdin
-    // at /dev/null and an interactive command fails fast as it always has.
-    let (stdin_tx, stdin_rx) = if app.interactive {
-        let (tx, rx) = mpsc::channel::<String>(8);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
 
     tokio::spawn(async move {
         let cancel = async {
@@ -501,7 +480,7 @@ fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, comman
         };
         // Both at once: the relay ends when `run_streaming` drops its sender.
         let (result, ()) = tokio::join!(
-            exec::run_streaming(&sandbox, &command, timeout, cancel, chunk_tx, stdin_rx),
+            exec::run_streaming(&sandbox, &command, timeout, cancel, chunk_tx),
             relay,
         );
         let _ = tx
@@ -511,10 +490,7 @@ fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, comman
             })
             .await;
     });
-    *inflight = Some(InFlight {
-        cancel: cancel_tx,
-        stdin: stdin_tx,
-    });
+    *inflight = Some(InFlight::new(cancel_tx));
 }
 
 /// Refuse the pending command and let the model know.
@@ -529,7 +505,7 @@ fn handle_key(
     app: &mut App,
     ctx: &Ctx,
     inflight: &mut Option<InFlight>,
-    metrics: ui::Metrics,
+    metrics: &ui::Metrics,
 ) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -624,34 +600,11 @@ fn handle_key(
     }
 
     // While a stream or command is in flight (no modal), Esc interrupts it.
-    // Checked before the interactive branch below, so Esc always cancels rather
-    // than becoming a character the running command swallows.
     if app.is_busy() && key.code == KeyCode::Esc {
         if let Some(handle) = inflight.take() {
             let _ = handle.cancel.send(());
         }
         app.cancel();
-        return;
-    }
-
-    // Enter while a command runs never reaches the model — the turn is not over.
-    // Either it goes to the command's stdin, or we say why it cannot, because
-    // a keypress that silently does nothing is the worst of the three.
-    if app.status == app::Status::Running && key.code == KeyCode::Enter && !alt && !shift {
-        match inflight.as_ref().and_then(|f| f.stdin.clone()) {
-            Some(sender) if app.accepts_input() => {
-                let line = app.input.take();
-                // `try_send` rather than awaiting: this is the event loop, and a
-                // full channel means the command is not keeping up, which is not
-                // worth freezing the UI over.
-                if sender.try_send(line.clone()).is_ok() {
-                    app.push_command_input(line);
-                }
-            }
-            // No pipe: the mode was off when this command was spawned.
-            _ if !app.input.is_blank() => app.warn_no_stdin(),
-            _ => {}
-        }
         return;
     }
 
@@ -690,9 +643,7 @@ fn handle_key(
             }
         }
 
-        // Editing is frozen while work is in flight — except while a command is
-        // waiting to be typed at, which is the whole point of interactive mode.
-        _ if app.is_busy() && !app.accepts_input() => {}
+        _ if app.is_busy() => {} // editing is frozen while work is in flight
 
         // --- Editing ---
         KeyCode::Char('l') if ctrl => app.reset_conversation(),

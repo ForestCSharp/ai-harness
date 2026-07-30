@@ -3,8 +3,8 @@
 //! The sandbox confines the filesystem; it does not bound time, output, or
 //! process count. Those limits live here:
 //!
-//! - stdin is `/dev/null` unless the caller supplies a channel, so by default an
-//!   interactive command fails fast instead of hanging,
+//! - stdin is `/dev/null`, so a command that wants to be typed at fails fast
+//!   instead of hanging,
 //! - the child gets its own process group, killed wholesale on timeout,
 //! - combined output is capped, since a runaway command would otherwise exhaust
 //!   memory and the model's token budget alike.
@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::sandbox::Sandbox;
@@ -63,13 +63,6 @@ pub struct CommandOutput {
     pub timed_out: bool,
     /// The user interrupted the command before it finished.
     pub cancelled: bool,
-    /// Lines the user typed to the command while it ran.
-    ///
-    /// Piped stdin is not echoed into stdout, so without this the answers would
-    /// exist nowhere: the transcript would show a prompt and an answer-shaped
-    /// gap, and the model would see output depending on input it never saw.
-    #[serde(default)]
-    pub input: Vec<String>,
 }
 
 impl CommandOutput {
@@ -150,8 +143,8 @@ pub async fn run(sandbox: &Sandbox, script: &str, timeout: Duration) -> Result<C
 /// process group is killed — reusing the same clean teardown as the timeout, so
 /// grandchildren are reaped rather than orphaned.
 ///
-/// Non-streaming and non-interactive: the convenience shape for callers that
-/// only want the finished output. [`run_streaming`] does the work.
+/// Non-streaming: the convenience shape for callers that only want the finished
+/// output. [`run_streaming`] does the work.
 pub async fn run_cancellable(
     sandbox: &Sandbox,
     script: &str,
@@ -161,36 +154,29 @@ pub async fn run_cancellable(
     // A sender whose receiver is dropped immediately: sends fail and are
     // ignored, which is exactly "nobody is watching".
     let (tx, _) = mpsc::channel(1);
-    run_streaming(sandbox, script, timeout, cancel, tx, None).await
+    run_streaming(sandbox, script, timeout, cancel, tx).await
 }
 
-/// Run `script`, forwarding output as it arrives and optionally feeding stdin.
+/// Run `script`, forwarding output as it arrives.
 ///
-/// `timeout` is an **idle** bound: it resets whenever output is read or input is
-/// written, so a command is killed after that long doing nothing rather than
-/// that long in total. A build that prints progress for two minutes survives; a
-/// silent one still dies on schedule. [`HARD_TIMEOUT_MULTIPLE`] bounds the total
-/// regardless, so a command that prints forever cannot run forever.
+/// `timeout` is an **idle** bound: it resets whenever output is read, so a
+/// command is killed after that long doing nothing rather than that long in
+/// total. A build that prints progress for two minutes survives; a silent one
+/// still dies on schedule. [`HARD_TIMEOUT_MULTIPLE`] bounds the total regardless,
+/// so a command that prints forever cannot run forever.
 ///
-/// `stdin` is a pipe only when a receiver is given. With `None` it stays
-/// `/dev/null`, so an interactive command fails fast instead of hanging — the
-/// default this module was built around.
+/// stdin is `/dev/null`, so a command that wants to be typed at fails fast
+/// instead of hanging.
 pub async fn run_streaming(
     sandbox: &Sandbox,
     script: &str,
     timeout: Duration,
     cancel: impl std::future::Future<Output = ()>,
     output: mpsc::Sender<Chunk>,
-    mut stdin: Option<mpsc::Receiver<String>>,
 ) -> Result<CommandOutput> {
-    let interactive = stdin.is_some();
     let mut command = sandbox.command(script);
     command
-        .stdin(if interactive {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -207,7 +193,6 @@ pub async fn run_streaming(
 
     let mut stdout_pipe = child.stdout.take().expect("stdout piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr piped");
-    let mut stdin_pipe = child.stdin.take();
 
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -285,25 +270,6 @@ pub async fn run_streaming(
                 }
             }
 
-            // A line to answer the command with. `None` means the sender was
-            // dropped: close the pipe so the child sees EOF rather than waiting
-            // on input that will never come.
-            line = async { stdin.as_mut().expect("guarded by the condition").recv().await },
-                if stdin.is_some() =>
-            {
-                match (line, stdin_pipe.as_mut()) {
-                    (Some(line), Some(pipe)) => {
-                        let _ = pipe.write_all(format!("{line}\n").as_bytes()).await;
-                        let _ = pipe.flush().await;
-                        idle.as_mut().reset(tokio::time::Instant::now() + timeout);
-                    }
-                    _ => {
-                        stdin = None;
-                        stdin_pipe = None;
-                    }
-                }
-            }
-
             status = child.wait() => break status.context("waiting for sandboxed command")?,
         }
     };
@@ -325,7 +291,6 @@ pub async fn run_streaming(
         truncated,
         timed_out: false,
         cancelled: false,
-        input: Vec::new(),
     })
 }
 
@@ -339,7 +304,6 @@ fn empty(script: &str) -> CommandOutput {
         truncated: false,
         timed_out: false,
         cancelled: false,
-        input: Vec::new(),
     }
 }
 
@@ -807,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdin_is_closed_so_interactive_commands_do_not_hang() {
+    async fn stdin_is_closed_so_a_command_wanting_input_does_not_hang() {
         let (sandbox, _dir) = sandbox_in("stdin");
         // Would block forever on a terminal; with /dev/null it hits EOF at once.
         let out = run(&sandbox, "cat", secs(5)).await.unwrap();
@@ -829,7 +793,7 @@ mod tests {
             }
             chunks
         });
-        let out = run_streaming(sandbox, script, timeout, std::future::pending(), tx, None)
+        let out = run_streaming(sandbox, script, timeout, std::future::pending(), tx)
             .await
             .unwrap();
         (out, collect.await.unwrap())
@@ -871,7 +835,6 @@ mod tests {
                     secs(30),
                     std::future::pending(),
                     tx,
-                    None,
                 )
                 .await
                 .unwrap()
@@ -887,56 +850,6 @@ mod tests {
 
         let out = run.await.unwrap();
         assert!(out.stdout.contains("last"));
-    }
-
-    #[tokio::test]
-    async fn a_typed_line_reaches_the_command() {
-        let (sandbox, _dir) = sandbox_in("stdin-line");
-        let (chunks_tx, _chunks_rx) = mpsc::channel(64);
-        let (input_tx, input_rx) = mpsc::channel(4);
-
-        tokio::spawn(async move {
-            // Sent after the command is up and blocking on `read`.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let _ = input_tx.send("Forest".to_string()).await;
-        });
-
-        let out = run_streaming(
-            &sandbox,
-            "read name; echo \"hi $name\"",
-            secs(10),
-            std::future::pending(),
-            chunks_tx,
-            Some(input_rx),
-        )
-        .await
-        .unwrap();
-
-        assert!(out.succeeded(), "{out:?}");
-        assert_eq!(out.stdout.trim(), "hi Forest");
-    }
-
-    #[tokio::test]
-    async fn dropping_the_input_channel_closes_stdin() {
-        // Otherwise a command waiting on input the user never sends would sit
-        // there until the idle timeout instead of seeing EOF.
-        let (sandbox, _dir) = sandbox_in("stdin-eof");
-        let (chunks_tx, _chunks_rx) = mpsc::channel(64);
-        let (input_tx, input_rx) = mpsc::channel::<String>(4);
-        drop(input_tx);
-
-        let out = run_streaming(
-            &sandbox,
-            "cat",
-            secs(10),
-            std::future::pending(),
-            chunks_tx,
-            Some(input_rx),
-        )
-        .await
-        .unwrap();
-        assert!(!out.timed_out, "should see EOF, not hang: {out:?}");
-        assert!(out.succeeded());
     }
 
     #[tokio::test]

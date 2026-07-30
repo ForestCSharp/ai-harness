@@ -11,8 +11,6 @@ pub enum Command {
     Debug,
     /// Toggle running actions without the approval modal.
     Auto,
-    /// Toggle giving a running command a real stdin you can type into.
-    Interactive,
     Help,
     Clear,
     Quit,
@@ -63,7 +61,6 @@ pub fn parse(input: &str) -> Input {
     Input::Command(match name.to_ascii_lowercase().as_str() {
         "debug" => Command::Debug,
         "auto" | "auto-approve" => Command::Auto,
-        "interactive" | "input" => Command::Interactive,
         "help" | "h" | "?" => Command::Help,
         "clear" | "reset" => Command::Clear,
         "quit" | "exit" | "q" => Command::Quit,
@@ -96,10 +93,6 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "auto",
         description: "toggle running actions without the approval modal",
-    },
-    Spec {
-        name: "interactive",
-        description: "toggle typing into a running command's stdin",
     },
     Spec {
         name: "clear",
@@ -202,8 +195,6 @@ mod tests {
         assert_eq!(command("/debug"), Command::Debug);
         assert_eq!(command("/auto"), Command::Auto);
         assert_eq!(command("/auto-approve"), Command::Auto);
-        assert_eq!(command("/interactive"), Command::Interactive);
-        assert_eq!(command("/input"), Command::Interactive);
         assert_eq!(command("/help"), Command::Help);
         assert_eq!(command("/clear"), Command::Clear);
         assert_eq!(command("/quit"), Command::Quit);
