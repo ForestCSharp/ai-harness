@@ -8,6 +8,7 @@ mod files;
 mod highlight;
 mod input;
 mod ledger;
+mod markdown;
 mod openrouter;
 mod protocol;
 mod sandbox;

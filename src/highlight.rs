@@ -89,6 +89,24 @@ pub fn detect(path: &str) -> Language {
     }
 }
 
+/// The language named by a fenced code block's info string.
+///
+/// Separate from [`detect`], which keys on file extensions: a fence says `rust`,
+/// not `rs`. Both spellings are accepted, since models write either.
+pub fn from_fence(info: &str) -> Language {
+    match info.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rs" => Language::Rust,
+        "python" | "py" => Language::Python,
+        "javascript" | "js" | "typescript" | "ts" | "jsx" | "tsx" => Language::JavaScript,
+        "go" | "golang" => Language::Go,
+        "json" => Language::Json,
+        "toml" => Language::Toml,
+        "shell" | "sh" | "bash" | "zsh" | "console" => Language::Shell,
+        "markdown" | "md" => Language::Markdown,
+        _ => Language::Plain,
+    }
+}
+
 /// The lexical rules for one language.
 struct Syntax {
     /// Prefixes that comment out the rest of the line.
@@ -398,6 +416,22 @@ mod tests {
     fn files_that_carry_their_type_in_the_name_are_recognised() {
         assert_eq!(detect("Makefile"), Language::Shell);
         assert_eq!(detect("build/Dockerfile"), Language::Shell);
+    }
+
+    #[test]
+    fn a_fence_names_its_language_either_way() {
+        // Models write both spellings; `detect` would only know the extension.
+        assert_eq!(from_fence("rust"), Language::Rust);
+        assert_eq!(from_fence("rs"), Language::Rust);
+        assert_eq!(from_fence("bash"), Language::Shell);
+        assert_eq!(from_fence("TypeScript"), Language::JavaScript);
+        assert_eq!(from_fence(" json "), Language::Json);
+    }
+
+    #[test]
+    fn an_unlabelled_fence_is_not_highlighted() {
+        assert_eq!(from_fence(""), Language::Plain);
+        assert_eq!(from_fence("mermaid"), Language::Plain);
     }
 
     #[test]

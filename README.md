@@ -140,6 +140,19 @@ thing in the protocol that always reaches a person. And an
 same as any other invented result; putting words in your mouth is the version of
 that failure worth guarding hardest.
 
+A `<ai-harness-response>` renders as **markdown** — headings, bullet and numbered
+lists, blockquotes, rules, inline code, bold and italic, links, and fenced code
+blocks, which get the same syntax highlighting a write or an edit does. Models
+write markdown whether or not anything renders it, so the alternative was leaving
+`##` and `**` on screen as punctuation.
+
+It is a subset, hand-rolled like the wrapping and highlighting: nested emphasis,
+reference links, setext headings, tables, and HTML are not parsed and render as
+literal text rather than breaking. Only responses go through it — a read or a
+fetch stays verbatim, because when you ask to see a file you want its source. The
+raw reply is always available in the `/debug` frames, which are recorded whether
+or not debug is on.
+
 If a reply fails validation, the harness tells the model exactly what was wrong
 and asks again, up to `--max-retries` (default 3). After that it gives up and
 rolls the failed exchange out of context, so a bad reply is not left behind as an
@@ -481,6 +494,7 @@ The prompt box grows downward from a fixed bottom edge as you add lines, up to
 | `src/fetch.rs` | URL policy, fetching, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/diff.rs` | Line-by-line diffs of writes and edits, bounded for storage |
 | `src/highlight.rs` | Language detection and tokenising for code blocks |
+| `src/markdown.rs` | Markdown subset for rendering model responses |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |

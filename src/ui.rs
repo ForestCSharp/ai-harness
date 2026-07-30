@@ -343,7 +343,7 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
             path_then(
                 path,
                 code_block(
-                    path,
+                    highlight::detect(path),
                     match &pending.diff {
                         Some(changes) => CodeBody::Diff(changes),
                         None => CodeBody::Contents(contents),
@@ -361,7 +361,7 @@ fn draw_approval(frame: &mut Frame, pending: &Pending, area: Rect) -> (Rect, Rec
             (
                 "The model wants to edit:",
                 " apply this edit? ",
-                path_then(path, code_block(path, body, inner_width)),
+                path_then(path, code_block(highlight::detect(path), body, inner_width)),
             )
         }
         action => (
@@ -709,7 +709,9 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                 Action::Fetch { url } => {
                     lines.extend(body_lines(url, Style::default().fg(Color::Blue), width))
                 }
-                Action::Response(text) => lines.extend(body_lines(text, Style::default(), width)),
+                // The one place markdown is rendered: this is the model writing
+                // prose for a person, and prose is what it formats.
+                Action::Response(text) => lines.extend(render_markdown(text, width)),
                 // The question stays in the transcript once answered, so the
                 // answer below it has something to refer to.
                 Action::Options { question, choices } => {
@@ -730,7 +732,7 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                         Some(changes) => CodeBody::Diff(changes),
                         None => CodeBody::Contents(contents),
                     };
-                    lines.extend(code_block(path, body, width));
+                    lines.extend(code_block(highlight::detect(path), body, width));
                 }
                 // An edit's diff comes from the spans in the action, so it needs
                 // nothing stored and nothing read.
@@ -740,7 +742,7 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                         Some(changes) => CodeBody::Diff(changes),
                         None => CodeBody::Contents(new),
                     };
-                    lines.extend(code_block(path, body, width));
+                    lines.extend(code_block(highlight::detect(path), body, width));
                 }
             }
         }
@@ -960,11 +962,138 @@ fn preview_body(contents: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Render a model response as markdown.
+///
+/// Only responses go through here. A read or a fetch stays literal: when you ask
+/// to see a file you want its source, not a rendering of it.
+fn render_markdown(source: &str, width: usize) -> Vec<Line<'static>> {
+    let blocks = crate::markdown::parse(source);
+    let mut lines = Vec::new();
+
+    for (i, block) in blocks.iter().enumerate() {
+        // Separate blocks, except between consecutive list items — a list reads
+        // as one thing, and double-spacing it would break it apart.
+        let tight = matches!(
+            (blocks.get(i.wrapping_sub(1)), block),
+            (
+                Some(crate::markdown::Block::Item { .. }),
+                crate::markdown::Block::Item { .. }
+            )
+        );
+        if i > 0 && !tight {
+            lines.push(Line::default());
+        }
+        let block = block.clone();
+        match block {
+            crate::markdown::Block::Heading { level, text } => {
+                // The weight carries the level, so the `#` does not have to.
+                let style = Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(match level {
+                        1 => Color::White,
+                        2 => Color::Cyan,
+                        _ => Color::Blue,
+                    });
+                lines.extend(inline_lines(&text, style, 0, width));
+            }
+            crate::markdown::Block::Paragraph(text) => {
+                lines.extend(inline_lines(&text, Style::default(), 0, width));
+            }
+            crate::markdown::Block::Code { language, text } => {
+                let lang = highlight::from_fence(language.as_deref().unwrap_or(""));
+                // Full, not a preview: the model chose to include exactly this
+                // much, so eliding it would cut off the answer.
+                lines.extend(code_block(lang, CodeBody::Full(&text), width));
+            }
+            crate::markdown::Block::Item {
+                depth,
+                ordinal,
+                text,
+            } => {
+                let indent = depth * 2;
+                let marker = match ordinal {
+                    Some(n) => format!("{n}. "),
+                    None => "• ".to_string(),
+                };
+                let mut rows = inline_lines(
+                    &text,
+                    Style::default(),
+                    indent + marker.chars().count(),
+                    width,
+                );
+                // Overwrite the first row's indent with the marker, so wrapped
+                // continuations line up under the text rather than the bullet.
+                if let Some(first) = rows.first_mut() {
+                    first.spans[0] = Span::styled(
+                        format!("{}{marker}", " ".repeat(indent)),
+                        Style::default().fg(Color::DarkGray),
+                    );
+                }
+                lines.extend(rows);
+            }
+            crate::markdown::Block::Quote(text) => {
+                for line in inline_lines(&text, Style::default().fg(Color::Gray), 2, width) {
+                    let mut spans = line.spans;
+                    spans[0] = Span::styled("│ ", Style::default().fg(Color::DarkGray));
+                    lines.push(Line::from(spans));
+                }
+            }
+            crate::markdown::Block::Rule => {
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+    lines
+}
+
+/// Wrap and style one run of inline markdown, indented by `indent` cells.
+///
+/// Every row opens with an indent span the caller may overwrite — that is how a
+/// list marker sits on the first row while continuations align under the text.
+fn inline_lines(source: &str, base: Style, indent: usize, width: usize) -> Vec<Line<'static>> {
+    let parsed = crate::markdown::inline(source);
+    let inner = width.saturating_sub(indent).max(1);
+    let pad = " ".repeat(indent);
+
+    wrap::line(&parsed.text, inner)
+        .into_iter()
+        .map(|row| {
+            let mut spans = vec![Span::raw(pad.clone())];
+            spans.extend(slice_runs(
+                &row.text,
+                row.start,
+                &parsed.runs,
+                base,
+                emphasis_style,
+            ));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// How each inline style looks. Code borrows the syntax palette's string colour
+/// so an inline snippet and a fenced one do not read as different things.
+fn emphasis_style(emphasis: crate::markdown::Emphasis, base: Style) -> Style {
+    match emphasis {
+        crate::markdown::Emphasis::Plain => base,
+        crate::markdown::Emphasis::Strong => base.add_modifier(Modifier::BOLD),
+        crate::markdown::Emphasis::Italic => base.add_modifier(Modifier::ITALIC),
+        crate::markdown::Emphasis::Code => base.fg(Color::Yellow),
+        crate::markdown::Emphasis::Link => base.fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
+    }
+}
+
 /// What a code block is showing.
 enum CodeBody<'a> {
     /// File contents with nothing to compare against — a new file, or one that
     /// could not be read. Bounded, so a large write never floods the transcript.
     Contents(&'a str),
+    /// Contents shown in full. For a fenced block in a response: the model chose
+    /// to include exactly this much, so eliding it would cut off the answer.
+    Full(&'a str),
     Diff(&'a [Change]),
 }
 
@@ -977,15 +1106,17 @@ const GUTTER: usize = 2;
 
 /// Render file contents or a diff as a labelled, syntax-highlighted block.
 ///
-/// The language comes from the path, so the same function serves the modal and
-/// the transcript and they cannot drift apart.
-fn code_block(path: &str, body: CodeBody<'_>, width: usize) -> Vec<Line<'static>> {
-    let lang = highlight::detect(path);
+/// Takes the language rather than deriving it: a file has a path to detect from,
+/// a fenced code block in a response has only its info string. One renderer
+/// serves both, so a snippet looks the same wherever it appears.
+fn code_block(lang: highlight::Language, body: CodeBody<'_>, width: usize) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines = Vec::new();
 
     let summary = match &body {
-        CodeBody::Contents(contents) => format!("{} line(s)", contents.lines().count()),
+        CodeBody::Contents(contents) | CodeBody::Full(contents) => {
+            format!("{} line(s)", contents.lines().count())
+        }
         CodeBody::Diff(changes) => {
             let (added, removed) = crate::diff::summary(changes);
             format!("+{added} -{removed}")
@@ -1004,6 +1135,11 @@ fn code_block(path: &str, body: CodeBody<'_>, width: usize) -> Vec<Line<'static>
             }
             if total > MAX_PREVIEW {
                 lines.push(elision(total - MAX_PREVIEW, "more"));
+            }
+        }
+        CodeBody::Full(contents) => {
+            for line in contents.lines() {
+                lines.extend(code_line(line, lang, ' ', None, width));
             }
         }
         CodeBody::Diff(changes) => {
@@ -1080,18 +1216,39 @@ fn highlighted(
     spans: &[(std::ops::Range<usize>, highlight::Token)],
     tint: Option<Style>,
 ) -> Vec<Span<'static>> {
+    slice_runs(
+        row,
+        start,
+        spans,
+        tint.unwrap_or_default(),
+        |token, base| base.fg(token_colour(token)),
+    )
+}
+
+/// Cut styled runs down to the piece of the line this wrapped row holds.
+///
+/// Shared by syntax highlighting and inline markdown, which face the same
+/// problem: both style runs over a whole logical line, and both need a run split
+/// by a wrap to keep its style on either side of the break. `start` is the row's
+/// byte offset into that line, which is what [`wrap::line`] returns it for.
+fn slice_runs<T: Copy>(
+    row: &str,
+    start: usize,
+    runs: &[(std::ops::Range<usize>, T)],
+    base: Style,
+    style_of: impl Fn(T, Style) -> Style,
+) -> Vec<Span<'static>> {
     let end = start + row.len();
-    let base = tint.unwrap_or_default();
     let mut out = Vec::new();
-    for (range, token) in spans {
-        // The overlap between this run and this row, in source coordinates.
+    for (range, token) in runs {
+        // The overlap between this run and this row, in line coordinates.
         let (from, to) = (range.start.max(start), range.end.min(end));
         if from >= to {
             continue;
         }
         out.push(Span::styled(
             row[from - start..to - start].to_string(),
-            base.fg(token_colour(*token)),
+            style_of(*token, base),
         ));
     }
     // A blank row still has to occupy its line, and a tinted one has to show its
@@ -1635,6 +1792,141 @@ mod tests {
             screen.contains("+ let x = 2;"),
             "missing added line:\n{screen}"
         );
+    }
+
+    /// An app showing one model response.
+    fn responded(text: &str) -> App {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("explain");
+        app.submit().unwrap();
+        app.push_response(
+            format!("<ai-harness-response>{text}</ai-harness-response>"),
+            None,
+        );
+        app
+    }
+
+    #[test]
+    fn a_response_renders_markdown_without_leaving_markers() {
+        let mut app = responded(
+            "# Title\n\nSome **bold** and `code` here.\n\n- first\n- second\n\n\
+             ```rust\nfn main() {}\n```",
+        );
+        let (rows, _) = render(&mut app, 70, 26);
+        let screen = transcript_only(&rows);
+
+        assert!(screen.contains("Title"), "{screen}");
+        assert!(screen.contains("bold"), "{screen}");
+        assert!(screen.contains("• first"), "bullets render:\n{screen}");
+        assert!(screen.contains("fn main"), "the fence renders:\n{screen}");
+        assert!(screen.contains("rust"), "the fence is labelled:\n{screen}");
+
+        // The point of rendering at all: no syntax left on screen.
+        for marker in ["# Title", "**bold**", "`code`", "```"] {
+            assert!(!screen.contains(marker), "{marker:?} survived:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn blocks_are_separated_but_list_items_stay_tight() {
+        // Without separation everything runs together and the structure markdown
+        // was expressing is lost; with it between every item, a list falls apart.
+        let mut app = responded("A paragraph.\n\n- one\n- two\n\nAnother paragraph.");
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = transcript_only(&rows);
+        let body: Vec<&str> = screen
+            .lines()
+            .skip_while(|l| !l.contains("A paragraph"))
+            .take(5)
+            // Strip the transcript's own border before comparing.
+            .map(|l| l.trim().trim_matches('│').trim())
+            .collect();
+
+        assert_eq!(
+            body,
+            vec!["A paragraph.", "", "• one", "• two", ""],
+            "blocks separated, items adjacent"
+        );
+    }
+
+    #[test]
+    fn a_fenced_block_in_a_response_is_not_truncated() {
+        // The file-preview cap is right for a write, where the file could be
+        // huge; here the model chose exactly this much and eliding it would cut
+        // off the answer.
+        let body: String = (1..=20).map(|i| format!("let x{i} = {i};\n")).collect();
+        let mut app = responded(&format!("```rust\n{body}```"));
+
+        let (rows, _) = render(&mut app, 60, 40);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("let x1 ="), "{screen}");
+        assert!(
+            screen.contains("let x20 ="),
+            "the tail must survive:\n{screen}"
+        );
+        assert!(
+            !screen.contains("more line(s)"),
+            "nothing elided:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn plain_prose_renders_exactly_as_before() {
+        // Most responses have no markdown in them; they must not change.
+        let mut app = responded("There are 8 Rust source files.");
+        let (rows, _) = render(&mut app, 70, 12);
+        assert!(transcript_only(&rows).contains("There are 8 Rust source files."));
+    }
+
+    #[test]
+    fn a_numbered_list_keeps_its_numbers_and_aligns_continuations() {
+        let mut app = responded(
+            "1. a short one\n2. a much longer item that will certainly need to wrap \
+             across more than one row of the terminal",
+        );
+        let (rows, _) = render(&mut app, 46, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("1. a short one"), "{screen}");
+        assert!(screen.contains("2. a much longer"), "{screen}");
+
+        // The wrapped remainder sits under the text, not under the marker.
+        let wrapped = rows
+            .iter()
+            .find(|r| r.contains("terminal"))
+            .expect("the long item should wrap");
+        assert!(
+            wrapped.trim_start_matches('│').starts_with("   "),
+            "continuation should be indented: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn a_quote_and_a_rule_are_marked() {
+        let mut app = responded("> quoted advice\n\n---\n\nafter");
+        let (rows, _) = render(&mut app, 60, 16);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("│ quoted advice"), "{screen}");
+        assert!(screen.contains("──────"), "the rule renders:\n{screen}");
+    }
+
+    #[test]
+    fn rendered_markdown_never_overflows_its_width() {
+        let mut app = responded(
+            "# A heading long enough to need wrapping on a narrow terminal\n\n\
+             A paragraph with **bold that goes on** and `some_inline_code_here` \
+             and a [link](https://example.com/a/fairly/long/path) in it.\n\n\
+             - an item that is also long enough to wrap more than once in a narrow view\n\n\
+             ```rust\nlet x = \"a very long string literal that will not fit\";\n```",
+        );
+        for width in [40u16, 55, 80] {
+            let (rows, _) = render(&mut app, width, 40);
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "row overflows {width}: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]

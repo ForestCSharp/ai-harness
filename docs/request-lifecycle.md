@@ -110,6 +110,12 @@ model answers from, which is the failure the rejection exists to prevent.
 **(b) `<ai-harness-response>`** — a final answer. Status → `Idle`. **This is where
 the journey ends**: the answer sits in the transcript, the prompt is live again.
 
+A response is the one thing rendered as markdown (`ui::render_markdown`, over
+`crate::markdown`). It is also the only place that would make sense: a read or a
+fetch stays verbatim, because asking to see a file means wanting its source. The
+raw reply survives in the `Direction::Received` frame either way, so `/debug`
+still shows exactly what came back.
+
 **(c) `<ai-harness-shell>`** or **`<ai-harness-write>`** — the model wants to
 change something. Status → `AwaitingApproval`, which raises the modal. Nothing
 runs yet.
@@ -334,6 +340,7 @@ cannot be run.
 | `src/files.rs` | Path resolution and bounded reads for `<ai-harness-read>` |
 | `src/diff.rs` | Line-by-line diffs of a write or edit, bounded for storage |
 | `src/highlight.rs` | Language detection and per-line tokenising for code blocks |
+| `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |
