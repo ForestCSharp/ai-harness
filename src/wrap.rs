@@ -37,10 +37,12 @@ pub fn line(text: &str, width: usize) -> Vec<Row> {
     let mut current_width = 0usize;
     // The word being built up. Held back so it can move to the next row whole.
     let mut pending: Vec<(usize, &str, usize)> = Vec::new();
+    // Tracked alongside `pending` rather than summed per grapheme, which made
+    // wrapping quadratic in word length.
+    let mut pending_width = 0usize;
 
     for (i, grapheme) in text.grapheme_indices(true) {
         let w = cell_width(grapheme);
-        let pending_width: usize = pending.iter().map(|(_, _, w)| *w).sum();
 
         if current_width + pending_width + w > width {
             if !current.is_empty() && !pending.is_empty() {
@@ -49,9 +51,9 @@ pub fn line(text: &str, width: usize) -> Vec<Row> {
                 rows.push(Row::new(std::mem::take(&mut current), current_start));
                 current_start = carry_start;
                 current_width = 0;
-                flush(&mut current, &mut current_width, &mut pending);
+                flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
             } else {
-                flush(&mut current, &mut current_width, &mut pending);
+                flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
                 if current.is_empty() {
                     // One grapheme wider than the whole row; give it its own row.
                     rows.push(Row::new(grapheme.to_string(), i));
@@ -67,15 +69,16 @@ pub fn line(text: &str, width: usize) -> Vec<Row> {
 
         if grapheme == " " || grapheme == "\t" {
             // Whitespace terminates the pending word, so commit it.
-            flush(&mut current, &mut current_width, &mut pending);
+            flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
             current.push_str(grapheme);
             current_width += w;
         } else {
             pending.push((i, grapheme, w));
+            pending_width += w;
         }
     }
 
-    flush(&mut current, &mut current_width, &mut pending);
+    flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
     // Only emit a trailing row if it holds something. The overlong-grapheme
     // path above emits its row directly, which would otherwise leave a blank
     // row here and inflate the rendered height.
@@ -93,11 +96,17 @@ pub fn text(input: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn flush(current: &mut String, current_width: &mut usize, pending: &mut Vec<(usize, &str, usize)>) {
+fn flush(
+    current: &mut String,
+    current_width: &mut usize,
+    pending: &mut Vec<(usize, &str, usize)>,
+    pending_width: &mut usize,
+) {
     for (_, grapheme, w) in pending.drain(..) {
         current.push_str(grapheme);
         *current_width += w;
     }
+    *pending_width = 0;
 }
 
 /// Display width of a grapheme, treating unknown/zero-width non-controls as 1

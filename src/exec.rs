@@ -515,6 +515,39 @@ mod tests {
             .unwrap()
     }
 
+    /// Plan mode's guarantee, checked against the kernel rather than the profile
+    /// text: with writes narrowed to one file, a shell command cannot change
+    /// anything else — and the plan file itself still writes.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_narrowed_sandbox_lets_only_the_one_file_be_written() {
+        let (sandbox, dir) = sandbox_in("plan-only-exec");
+        let plan = dir.join("plan.md");
+        let other = dir.join("elsewhere.txt");
+        let _ = std::fs::remove_file(&plan);
+        let _ = std::fs::remove_file(&other);
+        let planning = sandbox.writes_limited_to(&plan);
+
+        // A shell command aimed at the tree: refused by Seatbelt, not by us.
+        let out = run(&planning, "echo nope > elsewhere.txt", secs(10))
+            .await
+            .unwrap();
+        assert!(!out.succeeded(), "the write should have failed: {out:?}");
+        assert!(!other.exists(), "and nothing should be on disk");
+
+        // The plan file is the exception, through the ordinary write path.
+        let written = write(&planning, "plan.md", "# Plan\n").await;
+        assert!(written.succeeded(), "{written:?}");
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), "# Plan\n");
+
+        // Reading is untouched — it is how the planning gets done.
+        let read = run(&planning, "cat plan.md", secs(10)).await.unwrap();
+        assert!(read.succeeded(), "{read:?}");
+        assert!(read.stdout.contains("# Plan"));
+
+        let _ = std::fs::remove_file(&plan);
+    }
+
     #[tokio::test]
     async fn write_file_creates_a_file_with_exact_contents() {
         let (sandbox, dir) = sandbox_in("write-file");

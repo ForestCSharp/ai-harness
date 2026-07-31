@@ -110,6 +110,37 @@ pub fn resolve(sandbox: &Sandbox, path: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+/// Resolve a path that need not exist yet, for comparing where a write would go.
+///
+/// [`resolve`] proves the file exists, which a write's target often does not, so
+/// this canonicalises the *parent* and appends the file name. That keeps the
+/// property that matters for a comparison: `./a/../plan.md` and a symlinked
+/// directory both collapse to the same answer, so neither can masquerade as
+/// another file. The parent must exist — a path whose directory is absent is not
+/// the file we are looking for anyway.
+///
+/// This is for deciding what to *tell* the model, not for confinement. The kernel
+/// is the boundary: see [`crate::sandbox`].
+pub fn resolve_target(sandbox: &Sandbox, path: &str) -> Result<PathBuf, String> {
+    if path.trim().is_empty() {
+        return Err("no path was given".to_string());
+    }
+    let requested = Path::new(path);
+    let joined = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        sandbox.root().join(requested)
+    };
+    let name = joined
+        .file_name()
+        .ok_or_else(|| format!("{path}: not a file path"))?
+        .to_os_string();
+    let parent = joined.parent().unwrap_or(Path::new("/"));
+    let parent =
+        std::fs::canonicalize(parent).map_err(|e| format!("{}: {e}", parent.to_string_lossy()))?;
+    Ok(parent.join(name))
+}
+
 /// Read a file for the model, bounded by [`MAX_READ_BYTES`].
 ///
 /// Every failure mode comes back as a `ReadOutcome` carrying an error the model

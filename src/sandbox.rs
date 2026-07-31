@@ -8,7 +8,8 @@
 //!
 //! The policy is:
 //!
-//! - writes confined to the working-directory subtree,
+//! - writes confined to the working-directory subtree — or, under
+//!   [`Sandbox::writes_limited_to`], to a single file,
 //! - reads open, minus an explicit denylist of secret locations,
 //! - network allowed (the approval prompt is the control point).
 //!
@@ -47,6 +48,9 @@ pub struct Sandbox {
     /// Canonical working directory. Writes are confined to this subtree.
     root: PathBuf,
     home: Option<PathBuf>,
+    /// When set, the one path writes may touch — the subtree allowance below is
+    /// replaced by this single file. See [`Sandbox::writes_limited_to`].
+    write_only: Option<PathBuf>,
 }
 
 impl Sandbox {
@@ -81,11 +85,33 @@ impl Sandbox {
             .and_then(|h| std::fs::canonicalize(h).ok())
             .filter(|h| check_profile_safe(h).is_ok());
 
-        Ok(Self { root, home })
+        Ok(Self {
+            root,
+            home,
+            write_only: None,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// A clone whose only writable path is `path`.
+    ///
+    /// This is how plan mode holds still: while a plan is being written, the plan
+    /// file is the only thing any command can change, so researching a codebase
+    /// cannot modify it. Enforced by the kernel like every other rule here, which
+    /// is why it covers a shell command as well as an `<ai-harness-write>` — no
+    /// inspection of the command string is involved.
+    ///
+    /// `path` need not exist yet; Seatbelt matches the path, not an inode. It is
+    /// caller's business to keep it representable — see [`check_profile_safe`],
+    /// which the caller runs before offering the mode.
+    pub fn writes_limited_to(&self, path: impl AsRef<Path>) -> Self {
+        Self {
+            write_only: Some(path.as_ref().to_path_buf()),
+            ..self.clone()
+        }
     }
 
     /// Whether an already-resolved path falls under the read denylist.
@@ -113,7 +139,21 @@ impl Sandbox {
     ///
     /// Deny rules come last so they take precedence over the broad `allow`.
     pub fn profile(&self) -> String {
-        let root = escape(&self.root.to_string_lossy());
+        // Plan mode's narrowing: one file in place of the whole subtree. Phrased
+        // as a comment the reader of a leaked profile can understand, since this
+        // is the rule that will surprise someone whose build suddenly fails.
+        let writes = match &self.write_only {
+            Some(path) => format!(
+                ";; Plan mode: this file is the only writable path.\n\
+                 (allow file-write* (literal \"{}\"))",
+                escape(&path.to_string_lossy())
+            ),
+            None => format!(
+                ";; Writes are confined to the working-directory subtree.\n\
+                 (allow file-write* (subpath \"{}\"))",
+                escape(&self.root.to_string_lossy())
+            ),
+        };
 
         let mut denies = String::new();
         if let Some(home) = &self.home {
@@ -137,9 +177,8 @@ impl Sandbox {
             r#"(version 1)
 (allow default)
 
-;; Writes are confined to the working-directory subtree.
 (deny file-write*)
-(allow file-write* (subpath "{root}"))
+{writes}
 
 ;; Terminal and null sinks, so ordinary commands can still emit output.
 (allow file-write-data
@@ -179,6 +218,14 @@ impl Sandbox {
         command.args(args).current_dir(&self.root);
         command
     }
+}
+
+/// Whether `path` can appear in a profile at all.
+///
+/// Public so a caller can decline to offer a mode whose confinement it could not
+/// express, rather than discovering it when the first command fails.
+pub fn path_is_safe(path: &Path) -> bool {
+    check_profile_safe(path).is_ok()
 }
 
 /// Escape a path for an SBPL string literal.
@@ -244,6 +291,48 @@ mod tests {
             "(allow file-write* (subpath \"{}\"))",
             root.to_string_lossy()
         )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_narrowed_profile_allows_one_file_and_not_the_tree() {
+        // Plan mode's guarantee. The subtree allowance must be *replaced*, not
+        // added to, or researching a codebase could still rewrite it.
+        let root = temp_root("plan-only");
+        let plan = root.join("plan.md");
+        let profile = Sandbox::new(&root)
+            .unwrap()
+            .writes_limited_to(&plan)
+            .profile();
+
+        assert!(profile.contains(&format!(
+            "(allow file-write* (literal \"{}\"))",
+            plan.to_string_lossy()
+        )));
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                root.to_string_lossy()
+            )),
+            "the root subtree must not stay writable:\n{profile}"
+        );
+        assert!(profile.contains("(deny file-write*)"));
+        // Output still has to go somewhere, or every command breaks.
+        assert!(profile.contains("/dev/null"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn narrowing_keeps_the_secret_denies_last() {
+        let root = temp_root("plan-secrets");
+        let profile = Sandbox::new(&root)
+            .unwrap()
+            .writes_limited_to(root.join("plan.md"))
+            .profile();
+        let allow_at = profile.find("(allow default)").unwrap();
+        let deny_at = profile.find("(deny file-read* file-write*").unwrap();
+        assert!(deny_at > allow_at, "deny rules must still come last");
+        assert!(profile.contains(".ssh"));
     }
 
     #[cfg(target_os = "macos")]

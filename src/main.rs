@@ -35,7 +35,8 @@ use openrouter::{Client, Completion, Message};
 use protocol::Action;
 use sandbox::Sandbox;
 
-/// Spinner animation rate; also bounds how long we go without redrawing.
+/// Spinner animation rate. Only paced the spinner: an idle harness has nothing
+/// to animate, so a tick that finds nothing running redraws nothing.
 const TICK: Duration = Duration::from_millis(80);
 
 /// Something happened in the background and the UI needs to react.
@@ -151,9 +152,22 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     let mut inflight: Option<InFlight> = None;
     let mut ticker = tokio::time::interval(TICK);
     let mut metrics = ui::Metrics::default();
+    // Lives across frames on purpose: it is what keeps a long conversation from
+    // being re-rendered from the beginning every time anything happens.
+    let mut cache = ui::TranscriptCache::default();
+
+    // Nothing has been drawn yet, so the first pass through always draws.
+    let mut dirty = true;
 
     loop {
-        terminal.draw(|frame| metrics = ui::draw(frame, &mut app))?;
+        // Drawing is the expensive part of the loop, so it happens once per
+        // batch of work rather than once per wake-up: a tick with nothing
+        // running changes nothing on screen, and a burst of stream deltas is
+        // one visible change, not thirty.
+        if dirty {
+            terminal.draw(|frame| metrics = ui::draw(frame, &mut app, &mut cache))?;
+            dirty = false;
+        }
 
         tokio::select! {
             // Terminal input.
@@ -166,20 +180,34 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                         app.should_quit = true;
                     }
                 }
+                dirty = true;
             }
 
             // Background work finished.
-            Some(tagged) = rx.recv() => handle_update(tagged, &mut app, &ctx, &mut inflight),
+            Some(tagged) = rx.recv() => {
+                handle_update(tagged, &mut app, &ctx, &mut inflight);
+                dirty = true;
+            }
 
-            // Idle redraw, so the spinner animates while we wait.
+            // Animate the spinner while we wait. An idle harness has nothing to
+            // animate, so this is the one wake-up that can leave the screen
+            // alone — which is what keeps an idle session off the CPU.
             _ = ticker.tick() => {
                 if matches!(
                     app.status,
                     app::Status::Waiting | app::Status::Streaming | app::Status::Running
                 ) {
                     app.tick = app.tick.wrapping_add(1);
+                    dirty = true;
                 }
             }
+        }
+
+        // Take whatever else is already waiting before drawing. Streamed deltas
+        // and command output arrive far faster than a person can read them, and
+        // rendering each one in turn is what made a fast reply feel slow.
+        while let Ok(tagged) = rx.try_recv() {
+            handle_update(tagged, &mut app, &ctx, &mut inflight);
         }
 
         // Persist a completed turn. A cheap no-op unless the conversation just
@@ -292,8 +320,17 @@ fn handle_event(
                     deny(app, ctx, inflight);
                 }
             }
+            // The execute panel shares the approval panel's footer, so it shares
+            // the button rects too; only what they do differs.
+            MouseEventKind::Down(MouseButton::Left) if app.executing().is_some() => {
+                if ui::hit(metrics.allow_button, mouse.column, mouse.row) {
+                    execute_plan(app, ctx, inflight);
+                } else if ui::hit(metrics.deny_button, mouse.column, mouse.row) {
+                    app.keep_planning();
+                }
+            }
             // Hovering a button focuses it, so click and keyboard agree.
-            MouseEventKind::Moved if app.pending().is_some() => {
+            MouseEventKind::Moved if app.pending().is_some() || app.executing().is_some() => {
                 if ui::hit(metrics.allow_button, mouse.column, mouse.row) {
                     app.set_choice(Choice::Allow);
                 } else if ui::hit(metrics.deny_button, mouse.column, mouse.row) {
@@ -413,7 +450,7 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     }
 
     let generation = app.next_generation();
-    let sandbox = ctx.sandbox.clone();
+    let sandbox = action_sandbox(app, ctx);
     let timeout = ctx.timeout;
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -455,7 +492,7 @@ fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, comman
     let generation = app.next_generation();
     app.start_running(command.clone());
 
-    let sandbox = ctx.sandbox.clone();
+    let sandbox = action_sandbox(app, ctx);
     let timeout = ctx.timeout;
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -500,6 +537,26 @@ fn deny(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     }
 }
 
+/// The sandbox a model-authored action runs under.
+///
+/// Ordinarily the one `main` built. In plan mode it is narrowed to the session's
+/// plan file, so nothing a command does can change the tree being planned about —
+/// the guarantee is the kernel's, which is why it holds for a shell command and
+/// not only for a write the harness can inspect.
+fn action_sandbox(app: &App, ctx: &Ctx) -> Sandbox {
+    match app.plan_path().filter(|_| app.planning()) {
+        Some(plan) => ctx.sandbox.writes_limited_to(plan),
+        None => ctx.sandbox.clone(),
+    }
+}
+
+/// Accept a finished plan: leave plan mode and start the work.
+fn execute_plan(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+    if let Some(messages) = app.execute_plan() {
+        spawn_request(app, ctx, inflight, messages);
+    }
+}
+
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
@@ -539,6 +596,24 @@ fn handle_key(
         return;
     }
 
+    // The execute-the-plan panel, on the approval panel's pattern: it owns the
+    // keyboard, and Esc means "not yet" rather than cancelling anything — there is
+    // nothing in flight to cancel, and the plan stays on disk either way.
+    if app.executing().is_some() {
+        match key.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
+            KeyCode::Enter => match app.executing() {
+                Some(Choice::Allow) => execute_plan(app, ctx, inflight),
+                _ => app.keep_planning(),
+            },
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.keep_planning(),
+            KeyCode::PageUp => app.scroll_up(page),
+            KeyCode::PageDown => app.scroll_down(page, max_scroll),
+            _ => {}
+        }
+        return;
+    }
+
     // The model's question owns the keyboard while it is up, for the same reason
     // the approval modal does. Placed before the Esc-cancel branch below so Esc
     // dismisses the question — which the model is told about and can act on —
@@ -570,16 +645,27 @@ fn handle_key(
             // is focused — `question_input` enforces that, so a keystroke aimed
             // at a highlighted choice cannot vanish into an invisible buffer.
             KeyCode::Char(c) if !ctrl => app.question_input(|input| input.insert_char(c)),
+            // Word-wise editing matches the prompt's, so the free-text row
+            // behaves like the box it stands in for.
             KeyCode::Backspace if alt || ctrl => {
                 app.question_input(|input| input.delete_word_before())
             }
             KeyCode::Backspace => app.question_input(|input| input.backspace()),
+            KeyCode::Delete if alt || ctrl => {
+                app.question_input(|input| input.delete_word_after())
+            }
             KeyCode::Delete => app.question_input(|input| input.delete()),
+            KeyCode::Left if alt || ctrl => app.question_input(|input| input.move_word_left()),
+            KeyCode::Right if alt || ctrl => app.question_input(|input| input.move_word_right()),
             KeyCode::Left => app.question_input(|input| input.move_left()),
             KeyCode::Right => app.question_input(|input| input.move_right()),
             KeyCode::Home => app.question_input(|input| input.move_to_line_start()),
             KeyCode::End => app.question_input(|input| input.move_to_line_end()),
             KeyCode::Char('u') if ctrl => app.question_input(|input| input.delete_to_line_start()),
+            // See the prompt's handler: off the kitty protocol, Ctrl+Backspace
+            // reaches us as Ctrl+H.
+            KeyCode::Char('h') if ctrl => app.question_input(|input| input.delete_word_before()),
+            KeyCode::Char('w') if ctrl => app.question_input(|input| input.delete_word_before()),
             _ => {}
         }
         return;
@@ -649,11 +735,18 @@ fn handle_key(
         KeyCode::Char('l') if ctrl => app.reset_conversation(),
         KeyCode::Char('u') if ctrl => app.input.delete_to_line_start(),
         KeyCode::Char('w') if ctrl => app.input.delete_word_before(),
+        // Ctrl+Backspace only arrives *as* Ctrl+Backspace under the kitty
+        // keyboard protocol. Everywhere else the terminal sends 0x08, which is
+        // Ctrl+H — so binding it is what makes the chord work off kitty. Nothing
+        // else wants Ctrl+H, and readline's meaning for it (delete one char) is
+        // already on Backspace.
+        KeyCode::Char('h') if ctrl => app.input.delete_word_before(),
         KeyCode::Char('a') if ctrl => app.input.move_to_line_start(),
         KeyCode::Char('e') if ctrl => app.input.move_to_line_end(),
         KeyCode::Char('k') if ctrl => app.input.clear(),
         KeyCode::Backspace if alt || ctrl => app.input.delete_word_before(),
         KeyCode::Backspace => app.input.backspace(),
+        KeyCode::Delete if alt || ctrl => app.input.delete_word_after(),
         KeyCode::Delete => app.input.delete(),
         KeyCode::Left if alt || ctrl => app.input.move_word_left(),
         KeyCode::Right if alt || ctrl => app.input.move_word_right(),

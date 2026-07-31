@@ -272,6 +272,30 @@ nothing for the mode to approve. `Esc` also still cancels, since an auto-approve
 command is `Running` like any other. Those two are the only brakes left, which is
 the trade the mode makes.
 
+### Under plan mode, the sandbox is narrowed and the exit changes
+
+Plan mode reaches the lifecycle in three places, all small:
+
+- **What runs.** `action_sandbox` in [src/main.rs](../src/main.rs) hands every
+  spawned command and write a `Sandbox::writes_limited_to(plan)` instead of the
+  ordinary one, so the profile the kernel enforces allows exactly one writable
+  path. That is why the guarantee covers a shell command and not just the actions
+  `App` can inspect — nothing here parses what a command intends to do.
+- **What is asked.** A `Write` or `Edit` aimed elsewhere is turned into a write
+  *result* by an arm ahead of the approval arms in `push_response`, so the model
+  gets a reason and the user is never asked to approve something the kernel would
+  refuse anyway. The check is for the message; the profile is the boundary.
+- **How the turn ends.** `<ai-harness-response>` normally means `Idle`. In plan
+  mode, with a non-empty plan file on disk, it means
+  `Status::AwaitingExecute` — the fourth panel, on the approval panel's footer, so
+  the same button rects carry the clicks. `execute_plan` clears the mode, rebuilds
+  the contract, and calls `send_prompt`, which is why the work begins as an
+  ordinary turn with a fresh `iterations` budget rather than as a special case.
+
+The contract itself is `history[0]`, rewritten by `App::refresh_contract` whenever
+the mode or the session name changes — the plan path is embedded in the text, so a
+`/rename` mid-plan has to update it.
+
 ## The loop closes
 
 A single prompt can bounce through **query → reply → read → result → reply →

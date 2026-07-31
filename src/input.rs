@@ -76,6 +76,17 @@ impl Input {
         }
     }
 
+    /// Delete from the cursor forward to the end of the next word.
+    ///
+    /// The mirror of [`Input::delete_word_before`], and it leaves the cursor
+    /// where it is: the text closes up from the right, the way `Delete` does.
+    pub fn delete_word_after(&mut self) {
+        let end = self.word_end_after(self.cursor);
+        if end > self.cursor {
+            self.text.replace_range(self.cursor..end, "");
+        }
+    }
+
     /// Delete from the start of the current line up to the cursor.
     pub fn delete_to_line_start(&mut self) {
         let start = self.line_start(self.cursor);
@@ -306,6 +317,70 @@ mod tests {
         assert_eq!(input.text(), "hello ");
         input.delete_word_before();
         assert_eq!(input.text(), "");
+    }
+
+    #[test]
+    fn forward_word_deletion_takes_the_word_and_its_leading_space() {
+        let mut input = Input::default();
+        input.insert_str("hello world again");
+        input.move_to_start();
+        input.delete_word_after();
+        assert_eq!(input.text(), " world again");
+        input.delete_word_after();
+        assert_eq!(input.text(), " again");
+    }
+
+    #[test]
+    fn forward_word_deletion_leaves_the_cursor_put() {
+        let mut input = Input::default();
+        input.insert_str("keep drop rest");
+        input.move_to_start();
+        input.move_word_right();
+        let before = input.layout(40).cursor;
+        input.delete_word_after();
+        assert_eq!(input.text(), "keep rest");
+        assert_eq!(input.layout(40).cursor, before, "cursor should not move");
+    }
+
+    #[test]
+    fn forward_word_deletion_at_the_end_does_nothing() {
+        let mut input = Input::default();
+        input.insert_str("done");
+        input.move_to_end();
+        input.delete_word_after();
+        assert_eq!(input.text(), "done");
+    }
+
+    #[test]
+    fn word_motions_step_over_one_word_at_a_time() {
+        let mut input = Input::default();
+        input.insert_str("alpha beta gamma");
+        input.move_to_start();
+
+        input.move_word_right();
+        assert_eq!(input.layout(40).cursor, (0, 5), "end of `alpha`");
+        input.move_word_right();
+        assert_eq!(input.layout(40).cursor, (0, 10), "end of `beta`");
+
+        input.move_word_left();
+        assert_eq!(input.layout(40).cursor, (0, 6), "start of `beta`");
+        input.move_word_left();
+        assert_eq!(input.layout(40).cursor, (0, 0), "start of `alpha`");
+    }
+
+    #[test]
+    fn word_motions_stop_at_the_ends_of_the_buffer() {
+        let mut input = Input::default();
+        input.insert_str("one two");
+        input.move_to_start();
+        for _ in 0..5 {
+            input.move_word_left();
+        }
+        assert_eq!(input.layout(40).cursor, (0, 0));
+        for _ in 0..5 {
+            input.move_word_right();
+        }
+        assert_eq!(input.layout(40).cursor, (0, 7));
     }
 
     #[test]

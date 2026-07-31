@@ -23,13 +23,16 @@ pub enum Entry {
     Action {
         action: Action,
         usage: Option<Usage>,
-        /// For a write, the diff against the file as it was beforehand.
+        /// The diff this action displays: for a write, against the file as it
+        /// was beforehand; for an edit, between the two spans it carries.
         ///
         /// Stored rather than computed at render time because rendering is pure
-        /// and repeats every frame, and because by the time this is re-rendered
-        /// the write has landed — "diff against the file" no longer means what
-        /// it meant when the user needed to see it. An edit needs nothing here:
-        /// its diff comes from the two spans in the action itself.
+        /// and repeats every frame, and because by the time a write is
+        /// re-rendered it has landed — "diff against the file" no longer means
+        /// what it meant when the user needed to see it. An edit could be
+        /// recomputed from the action alone, and once was; but the diff is an
+        /// LCS over the two spans, and paying it per edit per frame is what
+        /// made long transcripts crawl.
         ///
         /// `serde(default)` and no `session::VERSION` bump, the same way
         /// `Session::ledger` was added: absent in older files, ignored by older
@@ -267,6 +270,13 @@ pub enum Status {
     AwaitingApproval(Pending),
     /// The model asked a question and is waiting on the answer.
     AwaitingChoice(Question),
+    /// A plan is written and the user is being asked whether to carry it out.
+    ///
+    /// Reuses [`Choice`] rather than introducing a second two-way enum: the panel
+    /// has the same shape as an approval, and so does the key handling.
+    AwaitingExecute {
+        selected: Choice,
+    },
     /// An approved command is executing.
     Running,
 }
@@ -307,6 +317,16 @@ pub struct App {
     pub confirm_fetches: bool,
     /// Live output from the command running now, if any.
     pub running: Option<RunningCommand>,
+    /// When true, the model is planning rather than working: the plan file is
+    /// the only writable path and the contract says so.
+    ///
+    /// A flag rather than a stored path, so `/rename`, `/fork`, and `/load` carry
+    /// the plan with the session instead of leaving this pointing at the folder
+    /// the conversation used to live in. [`App::plan_path`] derives it.
+    planning: bool,
+    /// Operator guidance from `--system`, kept so the contract can be rebuilt
+    /// when plan mode changes what it says.
+    extra_system: Option<String>,
     /// When true, an approvable action runs without the modal.
     ///
     /// Read but never acted on here: this type still parks a `Pending` exactly
@@ -385,6 +405,8 @@ impl App {
         let history = vec![Message::system(protocol::system_prompt(
             extra_system.as_deref(),
         ))];
+        // `extra_system` is moved into the struct below, so the contract can be
+        // rebuilt when plan mode is toggled.
         Self {
             input: Input::default(),
             transcript: Vec::new(),
@@ -402,6 +424,8 @@ impl App {
             confirm_reads: false,
             confirm_fetches: false,
             running: None,
+            planning: false,
+            extra_system,
             auto_approve: false,
             pending_fetch: None,
             ledger: Ledger::default(),
@@ -617,8 +641,18 @@ impl App {
         });
     }
 
-    /// Handle a locally-executed slash command. Nothing here reaches the model.
-    pub fn run_command(&mut self, command: Command) {
+    /// Handle a locally-executed slash command.
+    ///
+    /// Returns messages to send, which only `/plan <task>` does — a command that
+    /// both changes a mode and starts the first turn under it. Everything else is
+    /// local and returns `None`, which is the whole point of a slash command.
+    pub fn run_command(&mut self, command: Command) -> Option<Vec<Message>> {
+        let messages = self.dispatch_command(command);
+        self.follow = true;
+        messages
+    }
+
+    fn dispatch_command(&mut self, command: Command) -> Option<Vec<Message>> {
         match command {
             Command::Debug => {
                 self.debug = !self.debug;
@@ -637,6 +671,9 @@ impl App {
                 };
                 self.push_notice(format!("Auto-approve {state}."));
             }
+            // The one command that can start a turn: entering the mode with a
+            // task in hand means the user has already said what to plan.
+            Command::Plan(task) => return self.toggle_plan_mode(task),
             Command::Help => self.push_notice(crate::command::help_text()),
             Command::Clear => self.reset_conversation(),
             Command::Quit => self.should_quit = true,
@@ -649,7 +686,130 @@ impl App {
                 "Unknown command /{name}. Type /help to see what is available."
             )),
         }
-        self.follow = true;
+        None
+    }
+
+    /// Whether the model is planning rather than working.
+    pub fn planning(&self) -> bool {
+        self.planning
+    }
+
+    /// Where this session's plan lives, whether or not it exists yet.
+    ///
+    /// Derived from the current session name every time rather than stored, so a
+    /// `/rename` or `/fork` mid-plan lands on the file that moved with it.
+    pub fn plan_path(&self) -> Option<PathBuf> {
+        crate::session::plan_file(&self.sessions_dir, &self.current_session).ok()
+    }
+
+    /// A written, non-empty plan — the thing an Execute button would act on.
+    ///
+    /// Emptiness counts as absent: a `tee` that failed halfway or a model that
+    /// announced a plan it never wrote should not produce a button offering to
+    /// carry out nothing.
+    fn plan_is_written(&self) -> bool {
+        self.plan_path()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .is_some_and(|meta| meta.is_file() && meta.len() > 0)
+    }
+
+    /// Whether a write to `path` would land on this session's plan file.
+    ///
+    /// Compared as resolved paths, so `./plan.md` written from the session folder
+    /// and a symlinked directory both answer correctly. Without a sandbox — tests
+    /// — nothing can be resolved, so nothing counts as the plan file.
+    fn targets_plan_file(&self, path: &str) -> bool {
+        let Some(plan) = self.plan_path() else {
+            return false;
+        };
+        let Some(sandbox) = &self.sandbox else {
+            return false;
+        };
+        match (
+            crate::files::resolve_target(sandbox, path),
+            std::fs::canonicalize(plan.parent().unwrap_or(&plan)),
+        ) {
+            (Ok(target), Ok(folder)) => target == folder.join(crate::session::PLAN_FILE),
+            _ => false,
+        }
+    }
+
+    /// Turn plan mode on or off, optionally starting the first turn with `task`.
+    fn toggle_plan_mode(&mut self, task: Option<String>) -> Option<Vec<Message>> {
+        if self.planning {
+            self.planning = false;
+            self.refresh_contract();
+            self.push_notice("Plan mode off — writes are unrestricted again, inside the sandbox.");
+            return None;
+        }
+
+        // The folder has to exist before the sandbox is narrowed to a file inside
+        // it, and the path has to be expressible in a Seatbelt profile at all.
+        // Both are checked now: refusing here is a notice, whereas discovering it
+        // later is a command that fails for no visible reason.
+        let Some(path) = self.plan_path() else {
+            self.push_notice("Cannot work out where this session's plan would live.");
+            return None;
+        };
+        if !crate::sandbox::path_is_safe(&path) {
+            self.push_notice(format!(
+                "Cannot confine writes to {} — the path cannot be expressed in a \
+                 sandbox profile. Rename the session and try again.",
+                path.display()
+            ));
+            return None;
+        }
+        if let Err(e) = crate::session::ensure_folder(&self.sessions_dir, &self.current_session) {
+            self.push_notice(format!("Cannot create the session directory: {e:#}"));
+            return None;
+        }
+
+        self.planning = true;
+        self.refresh_contract();
+        self.push_notice(format!(
+            "Plan mode on — the plan goes to {}, and that file is the only thing \
+             any command can write until you leave. /plan turns it off.",
+            path.display()
+        ));
+        // A sessions directory outside the working tree (--sessions-dir) leaves a
+        // usable but lopsided mode: writes reach the plan, since the profile
+        // allows that exact path, while reads and edits are confined to the tree
+        // and cannot. Say so rather than letting it look like a bug.
+        if let Some(sandbox) = &self.sandbox
+            && !path.starts_with(sandbox.root())
+        {
+            self.push_notice(format!(
+                "Note: {} is outside the working directory, so the model can write \
+                 the plan but cannot read or edit it — it will rewrite the file \
+                 whole each time.",
+                path.display()
+            ));
+        }
+        task.and_then(|task| self.send_prompt(task))
+    }
+
+    /// Rebuild the system prompt in place, so the contract matches the mode.
+    ///
+    /// `history[0]` is the contract and always has been; rewriting it is how the
+    /// model learns the rules changed. Cheaper and less confusing than appending
+    /// a second system message, which `/clear` would then have to know to keep or
+    /// drop.
+    fn refresh_contract(&mut self) {
+        let mut contract = protocol::system_prompt(self.extra_system.as_deref());
+        if self.planning
+            && let Some(path) = self.plan_path()
+        {
+            contract.push_str("\n\n");
+            contract.push_str(&protocol::plan_contract(&path.to_string_lossy()));
+        }
+        match self.history.first_mut() {
+            Some(first) if first.role == crate::openrouter::Role::System => {
+                *first = Message::system(contract);
+            }
+            // No contract to replace should be impossible, but inserting one is a
+            // better answer than dropping the rules on the floor.
+            _ => self.history.insert(0, Message::system(contract)),
+        }
     }
 
     /// Snapshot the current session for persistence. Pure.
@@ -727,6 +887,9 @@ impl App {
     fn save_session(&mut self, name: Option<String>) {
         if let Some(name) = name {
             self.current_session = name;
+            // The plan file lives in the session's folder and the contract names
+            // it, so a new name means a new path to tell the model about.
+            self.refresh_contract();
         }
         let session = self.to_session();
         match crate::session::save(&self.sessions_dir, &self.current_session, &session) {
@@ -756,6 +919,13 @@ impl App {
                 self.apply_session(session);
                 // Auto-save now continues to the loaded session's file.
                 self.current_session = name.clone();
+                // The loaded history carries the contract that was saved with it,
+                // which may name another session's plan file — or none, while plan
+                // mode is on now. The contract is derived from this process's
+                // configuration and the current mode, never restored, so rebuild
+                // it rather than inherit it. Ordered after the name change, since
+                // that is what the plan path is derived from.
+                self.refresh_contract();
                 self.last_saved = self.fingerprint();
                 self.push_notice(format!("Loaded session {name:?}."));
             }
@@ -829,6 +999,8 @@ impl App {
         match crate::session::rename(&self.sessions_dir, &self.current_session, &new) {
             Ok(_) => {
                 self.current_session = new.clone();
+                // The folder moved, plan file and all; the contract has to follow.
+                self.refresh_contract();
                 self.last_saved = self.fingerprint();
                 self.push_notice(format!(
                     "Renamed session to {new:?} (load with /load {new})."
@@ -851,6 +1023,8 @@ impl App {
         let original = self.current_session.clone();
         self.persist_current();
         self.current_session = new.clone();
+        // Before the fork is written, so its copy names its own plan file.
+        self.refresh_contract();
         self.persist_current();
         self.push_notice(format!(
             "Forked to session {new:?}; original preserved as {original:?}."
@@ -876,19 +1050,56 @@ impl App {
         }
     }
 
+    /// The highlighted button while the execute-the-plan panel is up.
+    pub fn executing(&self) -> Option<Choice> {
+        match &self.status {
+            Status::AwaitingExecute { selected } => Some(*selected),
+            _ => None,
+        }
+    }
+
+    /// Accept the plan: leave plan mode and start the work.
+    ///
+    /// The go-ahead is sent as an ordinary prompt, so the turn begins exactly as a
+    /// typed one does — a fresh iteration budget, a visible transcript entry
+    /// saying why work started. The model is told to read the plan rather than
+    /// having it pasted in: it is on disk, it may be long, and re-reading it is
+    /// one cheap round-trip that cannot go stale.
+    pub fn execute_plan(&mut self) -> Option<Vec<Message>> {
+        self.executing()?;
+        let plan = self.plan_path()?.display().to_string();
+        self.planning = false;
+        self.refresh_contract();
+        self.status = Status::Idle;
+        self.push_notice("Plan mode off — carrying out the plan.");
+        self.send_prompt(format!(
+            "The plan at {plan} is approved. Read it, then carry it out. Work \
+             through it in order, and tell me what you did when it is done."
+        ))
+    }
+
+    /// Decline for now and stay in plan mode, so the plan can be revised.
+    pub fn keep_planning(&mut self) {
+        if self.executing().is_some() {
+            self.status = Status::Idle;
+            self.follow = true;
+            self.push_notice(
+                "Still planning. Say what to change, or /plan to leave without executing.",
+            );
+        }
+    }
+
     /// Consume the prompt buffer.
     ///
-    /// A slash command is executed locally and never reaches the model, so this
-    /// returns `None` for those. Otherwise it returns the messages to send.
+    /// A slash command is executed locally and reaches the model only when it
+    /// carries a prompt of its own (`/plan <task>`). Otherwise this returns the
+    /// messages to send for the typed prompt.
     pub fn submit(&mut self) -> Option<Vec<Message>> {
         if self.is_busy() || self.input.is_blank() {
             return None;
         }
         match crate::command::parse(&self.input.take()) {
-            crate::command::Input::Command(command) => {
-                self.run_command(command);
-                None
-            }
+            crate::command::Input::Command(command) => self.run_command(command),
             crate::command::Input::Prompt(text) => self.send_prompt(text),
         }
     }
@@ -953,18 +1164,33 @@ impl App {
         self.history.push(Message::assistant(content));
         // A write's diff needs the file as it is *now*, so it has to be computed
         // before the write runs — and once, since the transcript re-renders long
-        // afterwards. Both the entry and the modal below get this same value.
-        let write_diff = match &action {
+        // afterwards. An edit's diff needs no file, but it is stored for the
+        // second half of that reason alone: rendering repeats every frame, and
+        // an LCS per edit per frame is what made long transcripts crawl.
+        // Both the entry and the modal below get this same value.
+        let action_diff = match &action {
             Action::Write { path, contents } => self.diff_against_disk(path, contents),
+            Action::Edit { old, new, .. } => crate::diff::lines(old, new),
             _ => None,
         };
         self.transcript.push(Entry::Action {
             action: action.clone(),
             usage,
-            diff: write_diff.clone(),
+            diff: action_diff.clone(),
         });
 
         match action {
+            // In plan mode a final answer means the plan is ready, so the turn
+            // ends on the question that follows from it rather than on nothing.
+            // Only when a plan was actually written: a model that answers
+            // something in passing must not produce a button offering to carry
+            // out a file that does not exist.
+            Action::Response(_) if self.planning && self.plan_is_written() => {
+                self.status = Status::AwaitingExecute {
+                    selected: Choice::Allow,
+                };
+                self.follow = true;
+            }
             // A final answer ends the turn.
             Action::Response(_) => self.status = Status::Idle,
             // Any action past the loop budget stops rather than running, even the
@@ -996,6 +1222,30 @@ impl App {
                 self.status = Status::AwaitingChoice(Question::new(question, choices));
                 self.follow = true;
             }
+            // Plan mode: the plan file is the only thing that may be written. The
+            // sandbox refuses the rest anyway, but saying so here means the model
+            // gets a reason it can act on instead of a permission error, and the
+            // user is never asked to approve a write that was never going to land.
+            Action::Write { ref path, .. } | Action::Edit { ref path, .. }
+                if self.planning && !self.targets_plan_file(path) =>
+            {
+                let plan = self
+                    .plan_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| crate::session::PLAN_FILE.to_string());
+                let path = path.clone();
+                return Some(self.push_write_result(WriteOutcome {
+                    bytes: 0,
+                    error: Some(format!(
+                        "plan mode is on: {plan} is the only writable path, so this \
+                         write was refused. Put the plan there, or ask the user to \
+                         leave plan mode if the work should start now."
+                    )),
+                    path,
+                    timed_out: false,
+                    cancelled: false,
+                }));
+            }
             // An edit is resolved against the file *before* the modal, so a
             // hopeless one (no match, ambiguous) never bothers the user — it goes
             // straight back to the model to fix.
@@ -1010,7 +1260,7 @@ impl App {
                             action: Action::Edit { path, old, new },
                             selected: Choice::Allow,
                             edit_plan: Some(plan),
-                            diff: None,
+                            diff: action_diff,
                         });
                     }
                     Err(message) => return Some(self.push_edit_failure(&path, message)),
@@ -1022,7 +1272,7 @@ impl App {
                     action: other,
                     selected: Choice::Allow,
                     edit_plan: None,
-                    diff: write_diff,
+                    diff: action_diff,
                 });
             }
         }
@@ -1153,14 +1403,18 @@ impl App {
 
     /// Move the focused button in the approval modal.
     pub fn toggle_choice(&mut self) {
-        if let Status::AwaitingApproval(pending) = &mut self.status {
-            pending.selected = pending.selected.toggled();
+        match &mut self.status {
+            Status::AwaitingApproval(pending) => pending.selected = pending.selected.toggled(),
+            Status::AwaitingExecute { selected } => *selected = selected.toggled(),
+            _ => {}
         }
     }
 
     pub fn set_choice(&mut self, choice: Choice) {
-        if let Status::AwaitingApproval(pending) = &mut self.status {
-            pending.selected = choice;
+        match &mut self.status {
+            Status::AwaitingApproval(pending) => pending.selected = choice,
+            Status::AwaitingExecute { selected } => *selected = choice,
+            _ => {}
         }
     }
 
@@ -3827,6 +4081,43 @@ mod file_tests {
         }
     }
 
+    /// The diff an edit displays is computed when the edit arrives, not when it
+    /// is drawn — drawing repeats every frame, and an LCS per frame per edit is
+    /// what made long transcripts crawl. Both the modal and the scrollback entry
+    /// must carry it, and carry the same one.
+    #[test]
+    fn an_edit_stores_its_diff_for_the_modal_and_the_transcript() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
+        app.push_response(edit_reply("m.rs", "let x = 1;", "let x = 2;"), None);
+
+        let from_modal = app
+            .pending()
+            .expect("expected the approval modal")
+            .diff
+            .clone()
+            .expect("the modal should carry a precomputed diff");
+
+        let from_entry = app
+            .transcript
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Action {
+                    action: Action::Edit { .. },
+                    diff,
+                    ..
+                } => Some(diff.clone()),
+                _ => None,
+            })
+            .expect("the edit should be in the transcript")
+            .expect("the entry should carry a precomputed diff");
+
+        assert_eq!(
+            from_modal, from_entry,
+            "the modal and the scrollback must show one computation, not two"
+        );
+        assert_eq!(from_modal, crate::diff::lines("let x = 1;", "let x = 2;").unwrap());
+    }
+
     #[test]
     fn approving_an_edit_runs_the_prepared_write() {
         let (mut app, _dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
@@ -3967,5 +4258,259 @@ mod file_tests {
         reloaded.apply_session(loaded);
         assert_eq!(stored_diff(&reloaded), original);
         assert!(original.is_some());
+    }
+}
+
+/// Plan mode: what it restricts, and how a finished plan becomes work.
+#[cfg(test)]
+mod plan_tests {
+    use super::tests::last_visible;
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// An app with a real sandbox over a temp directory, its sessions inside it.
+    fn app_in_temp() -> (App, std::path::PathBuf) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let unique = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ai-harness-plan-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
+        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        (app, dir)
+    }
+
+    /// Plan mode on, with the plan file already written — the state a finished
+    /// planning turn leaves behind.
+    fn app_mid_plan() -> (App, std::path::PathBuf) {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Plan(None));
+        let plan = app.plan_path().unwrap();
+        std::fs::write(&plan, "# Plan\n\nDo the thing.\n").unwrap();
+        (app, dir)
+    }
+
+    fn contract(app: &App) -> &str {
+        &app.history[0].content
+    }
+
+    #[test]
+    fn the_mode_is_off_until_asked_for() {
+        let (app, _dir) = app_in_temp();
+        assert!(!app.planning());
+        assert!(
+            !contract(&app).contains("PLAN MODE"),
+            "the contract must not mention a mode that is off"
+        );
+    }
+
+    #[test]
+    fn entering_names_the_plan_file_and_creates_its_folder() {
+        let (mut app, _dir) = app_in_temp();
+        app.run_command(Command::Plan(None));
+
+        assert!(app.planning());
+        let plan = app.plan_path().expect("a session always has a plan path");
+        assert!(
+            plan.parent().unwrap().is_dir(),
+            "the folder must exist before the sandbox is narrowed to a file in it"
+        );
+        match last_visible(&app) {
+            Entry::Notice(text) => assert!(
+                text.contains(&plan.display().to_string()),
+                "the user has to be told where the plan goes: {text}"
+            ),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_contract_tells_the_model_the_path_and_the_restriction() {
+        let (mut app, _dir) = app_in_temp();
+        app.run_command(Command::Plan(None));
+
+        let contract = contract(&app);
+        let plan = app.plan_path().unwrap();
+        assert!(contract.contains(&plan.to_string_lossy().to_string()));
+        assert!(contract.contains("READ-ONLY"));
+        // The rules it already had must survive the rebuild.
+        assert!(contract.contains(crate::protocol::SHELL_TAG));
+    }
+
+    #[test]
+    fn the_toggle_goes_both_ways_and_restores_the_contract() {
+        let (mut app, _dir) = app_in_temp();
+        let plain = contract(&app).to_string();
+        app.run_command(Command::Plan(None));
+        assert_ne!(contract(&app), plain);
+
+        app.run_command(Command::Plan(None));
+        assert!(!app.planning());
+        assert_eq!(
+            contract(&app),
+            plain,
+            "leaving the mode must leave no trace in the contract"
+        );
+    }
+
+    #[test]
+    fn a_task_given_with_the_command_starts_the_turn() {
+        let (mut app, _dir) = app_in_temp();
+        let messages = app
+            .run_command(Command::Plan(Some("add a --json flag".into())))
+            .expect("a task should be sent, not just stored");
+
+        assert!(app.planning(), "the mode is on for the turn it started");
+        assert!(app.is_waiting());
+        assert!(
+            messages.last().unwrap().content.contains("--json"),
+            "the task must reach the model"
+        );
+    }
+
+    #[test]
+    fn a_write_outside_the_plan_is_refused_without_asking() {
+        // The sandbox would refuse it anyway; this is about not making the user
+        // approve a write that was never going to land, and telling the model why.
+        let (mut app, _dir) = app_mid_plan();
+        app.input.insert_str("go");
+        app.submit();
+
+        let messages = app
+            .push_response(
+                "<ai-harness-write file=src/main.rs>fn main() {}</ai-harness-write>".into(),
+                None,
+            )
+            .expect("the refusal goes straight back to the model");
+
+        assert!(
+            app.pending().is_none(),
+            "a doomed write must not raise the approval panel"
+        );
+        let result = &messages.last().unwrap().content;
+        assert!(result.contains("plan mode"), "{result}");
+        assert!(
+            result.contains("plan.md"),
+            "the model must be told where writing is allowed: {result}"
+        );
+    }
+
+    #[test]
+    fn a_write_to_the_plan_is_approved_like_any_other() {
+        let (mut app, _dir) = app_mid_plan();
+        app.input.insert_str("go");
+        app.submit();
+        let plan = app.plan_path().unwrap();
+
+        let sent = app.push_response(
+            format!(
+                "<ai-harness-write file={}># Plan</ai-harness-write>",
+                plan.display()
+            ),
+            None,
+        );
+
+        assert!(sent.is_none(), "nothing is sent until the user approves");
+        assert!(
+            app.pending().is_some(),
+            "the plan file itself still goes through approval"
+        );
+    }
+
+    #[test]
+    fn a_written_plan_turns_a_response_into_the_execute_question() {
+        let (mut app, _dir) = app_mid_plan();
+        app.input.insert_str("plan it");
+        app.submit();
+
+        app.push_response(
+            "<ai-harness-response>Plan written.</ai-harness-response>".into(),
+            None,
+        );
+
+        assert_eq!(
+            app.executing(),
+            Some(Choice::Allow),
+            "a finished plan should offer to be carried out, Execute focused"
+        );
+    }
+
+    #[test]
+    fn a_response_with_no_plan_on_disk_just_ends_the_turn() {
+        // Otherwise a model that answers something in passing would produce a
+        // button offering to execute a file that was never written.
+        let (mut app, _dir) = app_in_temp();
+        app.run_command(Command::Plan(None));
+        app.input.insert_str("what is this repo?");
+        app.submit();
+
+        app.push_response(
+            "<ai-harness-response>A harness.</ai-harness-response>".into(),
+            None,
+        );
+
+        assert!(app.executing().is_none());
+        assert!(!app.is_busy(), "the turn is simply over");
+    }
+
+    #[test]
+    fn executing_leaves_the_mode_and_sends_the_go_ahead() {
+        let (mut app, _dir) = app_mid_plan();
+        app.input.insert_str("plan it");
+        app.submit();
+        app.push_response(
+            "<ai-harness-response>Plan written.</ai-harness-response>".into(),
+            None,
+        );
+        let plain = crate::protocol::system_prompt(None);
+
+        let messages = app.execute_plan().expect("Execute starts the work");
+
+        assert!(!app.planning(), "the mode must end when the work begins");
+        assert_eq!(contract(&app), plain, "the restriction is lifted too");
+        assert!(app.is_waiting());
+        let sent = &messages.last().unwrap().content;
+        assert!(
+            sent.contains("plan.md"),
+            "the model is told what to read: {sent}"
+        );
+    }
+
+    #[test]
+    fn keeping_planning_returns_to_the_prompt_still_in_the_mode() {
+        let (mut app, _dir) = app_mid_plan();
+        app.input.insert_str("plan it");
+        app.submit();
+        app.push_response(
+            "<ai-harness-response>Plan written.</ai-harness-response>".into(),
+            None,
+        );
+
+        app.keep_planning();
+
+        assert!(app.executing().is_none(), "the panel is gone");
+        assert!(!app.is_busy(), "and the prompt is usable again");
+        assert!(
+            app.planning(),
+            "but the mode stays on so the plan can change"
+        );
+    }
+
+    #[test]
+    fn renaming_mid_plan_moves_the_path_the_contract_names() {
+        let (mut app, _dir) = app_mid_plan();
+        let before = app.plan_path().unwrap();
+        app.run_command(Command::Rename(Some("renamed".into())));
+
+        let after = app.plan_path().unwrap();
+        assert_ne!(before, after);
+        assert!(after.is_file(), "the plan moved with the session folder");
+        assert!(
+            contract(&app).contains(&after.to_string_lossy().to_string()),
+            "the model must be told the new path"
+        );
     }
 }

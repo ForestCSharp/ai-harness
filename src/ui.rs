@@ -62,7 +62,7 @@ impl Metrics {
     }
 }
 
-pub fn draw(frame: &mut Frame, app: &mut App) -> Metrics {
+pub fn draw(frame: &mut Frame, app: &mut App, cache: &mut TranscriptCache) -> Metrics {
     let area = frame.area();
 
     // Lay the prompt out first so we know how tall it needs to be.
@@ -98,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Metrics {
     ])
     .areas(area);
 
-    let mut metrics = draw_transcript(frame, app, transcript_area);
+    let mut metrics = draw_transcript(frame, app, cache, transcript_area);
     if menu_rows > 0 {
         draw_completions(frame, &completions, app.completion_index(), menu_area);
     }
@@ -117,6 +117,7 @@ enum PanelKind {
     Approval,
     Question,
     Picker,
+    Execute,
 }
 
 /// A panel measured and laid out, ready to be drawn into the bottom slot.
@@ -213,6 +214,45 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         });
     }
 
+    if app.executing().is_some() {
+        // The plan itself is in the transcript above, rendered as markdown, so
+        // this asks the question and names the file rather than repeating it.
+        let plan = app
+            .plan_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "The plan is ready:",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::default(),
+        ];
+        lines.extend(body_lines(
+            &plan,
+            Style::default().add_modifier(Modifier::BOLD),
+            inner_width,
+        ));
+        lines.push(Line::default());
+        lines.extend(body_lines(
+            "Executing leaves plan mode, lifting the write restriction.",
+            Style::default().fg(Color::Gray),
+            inner_width,
+        ));
+        lines.push(Line::default());
+        let height = (lines.len() as u16 + 3).min(max).max(MIN_PANEL_ROWS);
+        return Some(Panel {
+            kind: PanelKind::Execute,
+            title: " execute this plan? ",
+            colour: Color::Green,
+            body: lines,
+            hint: None,
+            height,
+            header: 0,
+            offset: 0,
+            owners: Vec::new(),
+        });
+    }
     if let Some(picker) = app.picker() {
         // Borders (2) + footer (1).
         let chrome = 3u16;
@@ -269,7 +309,16 @@ fn draw_prepared_panel(
     match kind {
         PanelKind::Approval => {
             if let Some(pending) = app.pending() {
-                let (allow, deny) = draw_buttons(frame, footer, pending.selected);
+                let (allow, deny) = draw_buttons(frame, footer, pending.selected, APPROVE_LABELS);
+                metrics.allow_button = Some(allow);
+                metrics.deny_button = Some(deny);
+            }
+        }
+        // Same two-button footer as an approval, so the same rects carry the
+        // clicks — the event loop tells them apart by which panel is up.
+        PanelKind::Execute => {
+            if let Some(selected) = app.executing() {
+                let (allow, deny) = draw_buttons(frame, footer, selected, EXECUTE_LABELS);
                 metrics.allow_button = Some(allow);
                 metrics.deny_button = Some(deny);
             }
@@ -565,9 +614,8 @@ fn approval_body(
                 ),
             ),
         ),
-        Action::Edit { path, old, new } => {
-            let changes = crate::diff::lines(old, new);
-            let body = match &changes {
+        Action::Edit { path, new, .. } => {
+            let body = match &pending.diff {
                 Some(changes) => CodeBody::Diff(changes),
                 None => CodeBody::Contents(new),
             };
@@ -593,20 +641,37 @@ fn approval_body(
     (prompt, title, body)
 }
 
-/// Allow and Deny on the panel's footer row. Returns their areas so the event
-/// loop can hit-test mouse clicks against them.
-fn draw_buttons(frame: &mut Frame, button_area: Rect, selected: Choice) -> (Rect, Rect) {
-    // Two fixed-width buttons, centred as a pair.
-    const BUTTON: u16 = 11;
+/// Labels for the two-button footer: the accepting one, then the refusing one.
+/// Padding is part of the label so each panel controls how wide its buttons sit.
+type Labels = [&'static str; 2];
+const APPROVE_LABELS: Labels = ["  Allow  ", "  Deny  "];
+const EXECUTE_LABELS: Labels = ["  Execute  ", "  Keep planning  "];
+
+/// The two buttons on a panel's footer row. Returns their areas so the event loop
+/// can hit-test mouse clicks against them.
+///
+/// Widths come from the labels rather than a constant, because "Keep planning" is
+/// not "Deny" — and are clamped to the row, so a narrow terminal clips the text
+/// instead of drawing buttons outside the panel.
+fn draw_buttons(
+    frame: &mut Frame,
+    button_area: Rect,
+    selected: Choice,
+    labels: Labels,
+) -> (Rect, Rect) {
     let gap = 2;
-    let total = BUTTON * 2 + gap;
+    let natural = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 2;
+    let button = natural
+        .min(button_area.width.saturating_sub(gap) / 2)
+        .max(1);
+    let total = button * 2 + gap;
     let start = button_area.x + button_area.width.saturating_sub(total) / 2;
-    let allow = Rect::new(start, button_area.y, BUTTON, 1);
-    let deny = Rect::new(start + BUTTON + gap, button_area.y, BUTTON, 1);
+    let allow = Rect::new(start, button_area.y, button, 1);
+    let deny = Rect::new(start + button + gap, button_area.y, button, 1);
 
     for (rect, label, choice, colour) in [
-        (allow, "  Allow  ", Choice::Allow, Color::Green),
-        (deny, "  Deny  ", Choice::Deny, Color::Red),
+        (allow, labels[0], Choice::Allow, Color::Green),
+        (deny, labels[1], Choice::Deny, Color::Red),
     ] {
         let focused = selected == choice;
         let style = if focused {
@@ -628,19 +693,101 @@ fn draw_buttons(frame: &mut Frame, button_area: Rect, selected: Choice) -> (Rect
     (allow, deny)
 }
 
-fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) -> Metrics {
+/// Wrapped transcript rows, kept between frames.
+///
+/// Rendering an entry is pure in `(entry, width, debug)` and the transcript is
+/// append-only, so the rows an entry produced last frame are still the rows it
+/// produces this frame. Without this every frame re-parsed every markdown
+/// reply, re-highlighted every code block, and re-wrapped every message in the
+/// conversation — work that grew with the history and was thrown away
+/// immediately. Now a frame costs what has *changed*, plus the screenful it
+/// actually draws.
+#[derive(Default)]
+pub struct TranscriptCache {
+    /// What `lines` was built for. A change to either invalidates all of it.
+    width: usize,
+    debug: bool,
+    /// Entries already folded into `lines`.
+    entries: usize,
+    /// Flattened rows, blank separators included: one `Line` is one screen row.
+    lines: Vec<Line<'static>>,
+}
+
+impl TranscriptCache {
+    /// Bring the cache up to date with the transcript, rendering only what is
+    /// new. Rebuilds from scratch when the width or debug flag changed, or when
+    /// the transcript got shorter — which only `/clear` does.
+    fn sync(&mut self, app: &App, width: usize) {
+        if self.width != width || self.debug != app.debug || app.transcript.len() < self.entries {
+            self.width = width;
+            self.debug = app.debug;
+            self.entries = 0;
+            self.lines.clear();
+        }
+
+        for entry in &app.transcript[self.entries..] {
+            // Rendered per entry so a hidden one contributes nothing at all —
+            // not even the blank separator line.
+            let mut block: Vec<Line> = Vec::new();
+            render_entry(&app.model, app.debug, entry, width, &mut block);
+            if block.is_empty() {
+                continue;
+            }
+            if !self.lines.is_empty() {
+                self.lines.push(Line::default());
+            }
+            self.lines.append(&mut block);
+        }
+        self.entries = app.transcript.len();
+    }
+}
+
+/// Re-point a cached row at the frame being drawn.
+///
+/// The widget wants an owned `Vec<Line>`, but cloning one would deep-copy every
+/// string in it and undo the caching. Only the spans are rebuilt, borrowing the
+/// text that stays put in the cache — and only for rows actually on screen.
+fn borrowed<'a>(line: &'a Line<'static>) -> Line<'a> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .iter()
+            .map(|span| Span {
+                style: span.style,
+                content: std::borrow::Cow::Borrowed(span.content.as_ref()),
+            })
+            .collect(),
+    }
+}
+
+fn draw_transcript(
+    frame: &mut Frame,
+    app: &mut App,
+    cache: &mut TranscriptCache,
+    area: Rect,
+) -> Metrics {
     let block = Block::bordered()
         .title(Line::from(" ai-harness ").bold())
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
+    let width = inner.width as usize;
 
-    // Wrapping up front means `lines.len()` is the true rendered height, which
-    // is what scroll clamping and "stick to the bottom" both depend on.
-    let lines = transcript_lines(app, inner.width as usize);
-    let content_height = lines.len() as u16;
+    cache.sync(app, width);
+    // Live state changes on its own every frame, so it is rebuilt rather than
+    // cached. It is a screenful at most, unlike the history above it.
+    let tail = tail_lines(app, width);
+
+    // Wrapping up front means the row count is the true rendered height, which
+    // is what scroll clamping and "stick to the bottom" both depend on. The
+    // cache keeps that count without re-deriving it.
+    let total = cache.lines.len() + tail.len();
     let metrics = Metrics {
         transcript_height: inner.height,
-        content_height,
+        // Saturating, so a conversation past 65,535 rows pins to the bottom
+        // rather than wrapping around to the top.
+        content_height: u16::try_from(total).unwrap_or(u16::MAX),
         ..Metrics::default()
     };
 
@@ -653,15 +800,30 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) -> Metrics {
         app.scroll = app.scroll.min(max_scroll);
     }
 
-    let paragraph = Paragraph::new(Text::from(lines))
-        .block(block)
-        .scroll((app.scroll, 0));
+    // Take only the rows the viewport shows. Indexed rather than skipped, so
+    // scrolling to the bottom of a long transcript does not walk it first.
+    let start = app.scroll as usize;
+    let wanted = inner.height as usize;
+    let mut visible: Vec<Line> = Vec::with_capacity(wanted);
+    if start < cache.lines.len() {
+        let end = (start + wanted).min(cache.lines.len());
+        visible.extend(cache.lines[start..end].iter().map(borrowed));
+    }
+    let from_tail = start.saturating_sub(cache.lines.len());
+    if visible.len() < wanted && from_tail < tail.len() {
+        let end = (from_tail + wanted - visible.len()).min(tail.len());
+        visible.extend(tail[from_tail..end].iter().map(borrowed));
+    }
+
+    // The slice already applied the offset, so the widget scrolls no further.
+    let paragraph = Paragraph::new(Text::from(visible)).block(block);
     frame.render_widget(paragraph, area);
     metrics
 }
 
-/// Build the transcript as already-wrapped lines, so one `Line` is one screen row.
-fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+/// The rows below the transcript proper: what is happening right now, and the
+/// opening hint when nothing has happened yet. Rebuilt every frame by design.
+fn tail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     if app.transcript.is_empty() {
@@ -674,20 +836,6 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ));
     }
 
-    for entry in app.transcript.iter() {
-        // Rendered per entry so a hidden one contributes nothing at all — not
-        // even the blank separator line.
-        let mut block: Vec<Line> = Vec::new();
-        render_entry(app, entry, width, &mut block);
-        if block.is_empty() {
-            continue;
-        }
-        if !lines.is_empty() {
-            lines.push(Line::default());
-        }
-        lines.extend(block);
-    }
-
     // The live reply renders in place of the spinner once tokens arrive.
     if let Some(text) = &app.streaming {
         lines.push(Line::default());
@@ -697,8 +845,14 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )));
+        let mut body = body_lines(text, Style::default(), width);
         // A block cursor on the last line signals the reply is still arriving.
-        let mut body = body_lines(&format!("{text}▌"), Style::default(), width);
+        // Appended to the wrapped row rather than to the text, so a reply that
+        // is already at the width does not re-wrap on the strength of it.
+        match body.last_mut() {
+            Some(last) => last.spans.push(Span::raw("▌")),
+            None => lines.push(Line::from(Span::raw("▌"))),
+        }
         lines.append(&mut body);
     } else if let Some(running) = &app.running {
         // Live state, not a transcript entry: it belongs after the entries and
@@ -824,7 +978,13 @@ fn truncate(text: &str, width: usize) -> String {
         + "…"
 }
 
-fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'static>>) {
+fn render_entry(
+    model: &str,
+    debug: bool,
+    entry: &Entry,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
     match entry {
         Entry::User(content) => {
             lines.push(Line::from(Span::styled(
@@ -863,7 +1023,7 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                 ));
             }
             header.push(Span::styled(
-                format!("  {}", app.model),
+                format!("  {model}"),
                 Style::default().fg(Color::DarkGray),
             ));
             if let Some(u) = usage {
@@ -912,11 +1072,10 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                     };
                     lines.extend(code_block(highlight::detect(path), body, width));
                 }
-                // An edit's diff comes from the spans in the action, so it needs
-                // nothing stored and nothing read.
-                Action::Edit { path, old, new } => {
-                    let changes = crate::diff::lines(old, new);
-                    let body = match &changes {
+                // The same stored diff a write uses. Computed once when the edit
+                // arrived rather than here, because here runs every frame.
+                Action::Edit { path, new, .. } => {
+                    let body = match diff {
                         Some(changes) => CodeBody::Diff(changes),
                         None => CodeBody::Contents(new),
                     };
@@ -952,13 +1111,19 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
             ]));
             let dim = Style::default().fg(Color::DarkGray);
             if !output.stdout.trim().is_empty() {
-                lines.extend(body_lines(output.stdout.trim_end(), dim, width));
+                lines.extend(bounded_body(
+                    output.stdout.trim_end(),
+                    dim,
+                    width,
+                    MAX_OUTPUT_PREVIEW,
+                ));
             }
             if !output.stderr.trim().is_empty() {
-                lines.extend(body_lines(
+                lines.extend(bounded_body(
                     output.stderr.trim_end(),
                     Style::default().fg(Color::Red),
                     width,
+                    MAX_OUTPUT_PREVIEW,
                 ));
             }
             if output.truncated {
@@ -1079,7 +1244,7 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
         }
         // Recorded always, shown only in debug mode, so toggling /debug
         // reveals traffic that already happened.
-        Entry::Frame { direction, body } if app.debug => {
+        Entry::Frame { direction, body } if debug => {
             let label = match direction {
                 Direction::Sent => "sent",
                 Direction::Received => "received",
@@ -1090,10 +1255,11 @@ fn render_entry(app: &App, entry: &Entry, width: usize, lines: &mut Vec<Line<'st
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::DIM | Modifier::BOLD),
             )));
-            lines.extend(body_lines(
+            lines.extend(bounded_body(
                 body,
                 Style::default().fg(Color::DarkGray),
                 width,
+                MAX_FRAME_PREVIEW,
             ));
         }
         // Frames stay hidden outside debug mode, contributing no lines.
@@ -1124,20 +1290,33 @@ fn body_lines(content: &str, style: Style, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Wrap at most `max` lines, then say how many were left out.
+///
+/// Only the shown lines are wrapped. The rest are counted — a scan — but never
+/// styled, allocated, or stored, which is the difference between rendering
+/// eight lines of a 64 KB file and rendering the file.
+fn bounded_body(contents: &str, style: Style, width: usize, max: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut rest = contents.lines();
+    for line in rest.by_ref().take(max) {
+        lines.extend(body_lines(line, style, width));
+    }
+    let remaining = rest.count();
+    if remaining > 0 {
+        lines.push(elision(remaining, "more"));
+    }
+    lines
+}
+
 /// A bounded excerpt of text with no file behind it — a read's contents, a
 /// fetched page — for callers whose own header already carries the size.
 fn preview_body(contents: &str, width: usize) -> Vec<Line<'static>> {
-    let total = contents.lines().count();
-    let dim = Style::default().fg(Color::DarkGray);
-
-    let mut lines: Vec<Line> = Vec::new();
-    for line in contents.lines().take(MAX_PREVIEW) {
-        lines.extend(body_lines(line, dim, width));
-    }
-    if total > MAX_PREVIEW {
-        lines.push(elision(total - MAX_PREVIEW, "more"));
-    }
-    lines
+    bounded_body(
+        contents,
+        Style::default().fg(Color::DarkGray),
+        width,
+        MAX_PREVIEW,
+    )
 }
 
 /// Render a model response as markdown.
@@ -1161,7 +1340,6 @@ fn render_markdown(source: &str, width: usize) -> Vec<Line<'static>> {
         if i > 0 && !tight {
             lines.push(Line::default());
         }
-        let block = block.clone();
         match block {
             crate::markdown::Block::Heading { level, text } => {
                 // The weight carries the level, so the `#` does not have to.
@@ -1172,16 +1350,16 @@ fn render_markdown(source: &str, width: usize) -> Vec<Line<'static>> {
                         2 => Color::Cyan,
                         _ => Color::Blue,
                     });
-                lines.extend(inline_lines(&text, style, 0, width));
+                lines.extend(inline_lines(text, style, 0, width));
             }
             crate::markdown::Block::Paragraph(text) => {
-                lines.extend(inline_lines(&text, Style::default(), 0, width));
+                lines.extend(inline_lines(text, Style::default(), 0, width));
             }
             crate::markdown::Block::Code { language, text } => {
                 let lang = highlight::from_fence(language.as_deref().unwrap_or(""));
                 // Full, not a preview: the model chose to include exactly this
                 // much, so eliding it would cut off the answer.
-                lines.extend(code_block(lang, CodeBody::Full(&text), width));
+                lines.extend(code_block(lang, CodeBody::Full(text), width));
             }
             crate::markdown::Block::Item {
                 depth,
@@ -1194,7 +1372,7 @@ fn render_markdown(source: &str, width: usize) -> Vec<Line<'static>> {
                     None => "• ".to_string(),
                 };
                 let mut rows = inline_lines(
-                    &text,
+                    text,
                     Style::default(),
                     indent + marker.chars().count(),
                     width,
@@ -1210,7 +1388,7 @@ fn render_markdown(source: &str, width: usize) -> Vec<Line<'static>> {
                 lines.extend(rows);
             }
             crate::markdown::Block::Quote(text) => {
-                for line in inline_lines(&text, Style::default().fg(Color::Gray), 2, width) {
+                for line in inline_lines(text, Style::default().fg(Color::Gray), 2, width) {
                     let mut spans = line.spans;
                     spans[0] = Span::styled("│ ", Style::default().fg(Color::DarkGray));
                     lines.push(Line::from(spans));
@@ -1279,6 +1457,16 @@ enum CodeBody<'a> {
 /// by [`crate::diff`], which has to cap it anyway to keep session files small.
 const MAX_PREVIEW: usize = 8;
 
+/// The same, for a command's output. Far more generous than a read's preview:
+/// a read is something you asked to see and can ask for again, while output is
+/// usually the reason the command was run — a failing build's errors have to
+/// stay on screen. The model is sent the full text either way.
+const MAX_OUTPUT_PREVIEW: usize = 50;
+
+/// The same, for a raw protocol frame under `/debug`. These duplicate content
+/// shown properly elsewhere, so a glance at the shape of one is the point.
+const MAX_FRAME_PREVIEW: usize = 20;
+
 /// Width of the `+ ` / `- ` gutter, and of the indent wrapped rows sit under.
 const GUTTER: usize = 2;
 
@@ -1307,12 +1495,15 @@ fn code_block(lang: highlight::Language, body: CodeBody<'_>, width: usize) -> Ve
 
     match body {
         CodeBody::Contents(contents) => {
-            let total = contents.lines().count();
-            for line in contents.lines().take(MAX_PREVIEW) {
+            let mut rest = contents.lines();
+            for line in rest.by_ref().take(MAX_PREVIEW) {
                 lines.extend(code_line(line, lang, ' ', None, width));
             }
-            if total > MAX_PREVIEW {
-                lines.push(elision(total - MAX_PREVIEW, "more"));
+            // Counted, not highlighted: the elided lines cost a scan, not a
+            // wrap and a tokenise apiece.
+            let remaining = rest.count();
+            if remaining > 0 {
+                lines.push(elision(remaining, "more"));
             }
         }
         CodeBody::Full(contents) => {
@@ -1464,6 +1655,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Status::Streaming => (" streaming ", Color::Cyan),
         Status::AwaitingApproval(_) => (" approve ", Color::Magenta),
         Status::AwaitingChoice(_) => (" answer ", Color::Yellow),
+        Status::AwaitingExecute { .. } => (" execute ", Color::Green),
         Status::Running => (" running ", Color::Blue),
     };
 
@@ -1496,6 +1688,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
+    // Cyan rather than red: plan mode takes capability away, so it is a state
+    // worth seeing but not a warning.
+    if app.planning() {
+        spans.push(Span::styled("  plan", Style::default().fg(Color::Cyan)));
+    }
     if !app.follow {
         spans.push(Span::styled(
             "  scrolled — End to resume",
@@ -1504,6 +1701,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     }
     let hints = if app.pending().is_some() {
         "  ←/→ choose · Enter confirm · y allow · n/Esc deny"
+    } else if app.executing().is_some() {
+        "  ←/→ choose · Enter confirm · Esc keep planning"
     } else if app.question().is_some() {
         "  ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
     } else if app.picker().is_some() {
@@ -1578,10 +1777,24 @@ mod tests {
     use super::*;
 
     /// Render into a fake terminal and return the screen as one string per row.
+    /// Starts from a cold cache, which is what most tests want to pin down.
     fn render(app: &mut App, width: u16, height: u16) -> (Vec<String>, Metrics) {
+        render_cached(app, &mut TranscriptCache::default(), width, height)
+    }
+
+    /// The same, against a cache that survives between calls — the way the real
+    /// loop draws, and the only way to exercise cache reuse.
+    fn render_cached(
+        app: &mut App,
+        cache: &mut TranscriptCache,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Metrics) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut metrics = Metrics::default();
-        terminal.draw(|frame| metrics = draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| metrics = draw(frame, app, cache))
+            .unwrap();
 
         let buffer = terminal.backend().buffer().clone();
         let rows = (0..height)
@@ -1660,6 +1873,21 @@ mod tests {
     }
 
     /// Only the transcript pane, so status-bar text cannot satisfy an assertion.
+    /// An edit entry as the app builds one: with its diff already computed.
+    /// See `App::push_response` — the diff is stored when the edit arrives,
+    /// because rendering it repeats every frame.
+    fn edit_entry(path: &str, old: &str, new: &str) -> Entry {
+        Entry::Action {
+            action: crate::protocol::Action::Edit {
+                path: path.into(),
+                old: old.into(),
+                new: new.into(),
+            },
+            usage: None,
+            diff: crate::diff::lines(old, new),
+        }
+    }
+
     fn transcript_only(rows: &[String]) -> String {
         rows.iter()
             .take_while(|r| !r.starts_with('└'))
@@ -1907,15 +2135,8 @@ mod tests {
     #[test]
     fn edit_action_renders_as_a_diff() {
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
-        app.transcript.push(Entry::Action {
-            action: crate::protocol::Action::Edit {
-                path: "src/app.rs".into(),
-                old: "let x = 1;".into(),
-                new: "let x = 2;".into(),
-            },
-            usage: None,
-            diff: None,
-        });
+        app.transcript
+            .push(edit_entry("src/app.rs", "let x = 1;", "let x = 2;"));
 
         let (rows, _) = render(&mut app, 70, 16);
         let screen = transcript_only(&rows);
@@ -2125,15 +2346,8 @@ mod tests {
         // The whole point of the diff: five lines in, one changed. The four
         // that did not change must not appear as removals and additions.
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
-        app.transcript.push(Entry::Action {
-            action: crate::protocol::Action::Edit {
-                path: "m.rs".into(),
-                old: "a\nb\nOLD\nd\ne".into(),
-                new: "a\nb\nNEW\nd\ne".into(),
-            },
-            usage: None,
-            diff: None,
-        });
+        app.transcript
+            .push(edit_entry("m.rs", "a\nb\nOLD\nd\ne", "a\nb\nNEW\nd\ne"));
 
         let (rows, _) = render(&mut app, 70, 20);
         let screen = transcript_only(&rows);
@@ -2241,15 +2455,7 @@ mod tests {
     #[test]
     fn a_deletion_edit_shows_removals_and_nothing_added() {
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
-        app.transcript.push(Entry::Action {
-            action: crate::protocol::Action::Edit {
-                path: "x".into(),
-                old: "remove me\n".into(),
-                new: String::new(),
-            },
-            usage: None,
-            diff: None,
-        });
+        app.transcript.push(edit_entry("x", "remove me\n", ""));
         let (rows, _) = render(&mut app, 60, 12);
         let screen = transcript_only(&rows);
         assert!(
@@ -2711,6 +2917,32 @@ mod tests {
         app
     }
 
+    /// An app with a finished plan, waiting to be told whether to carry it out.
+    ///
+    /// Writes a real plan file: the panel only appears for a plan that exists,
+    /// which is the point of that rule.
+    fn plan_ready() -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-harness-uiplan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = App::new("test/model".into(), None, 10, dir.clone());
+        app.run_command(crate::command::Command::Plan(None));
+        std::fs::write(app.plan_path().unwrap(), "# Plan\n").unwrap();
+        app.input.insert_str("plan it");
+        app.submit().unwrap();
+        app.push_response(
+            "<ai-harness-response>Plan written.</ai-harness-response>".into(),
+            None,
+        );
+        assert!(app.executing().is_some(), "should be awaiting the decision");
+        (app, dir)
+    }
+
     /// The row index of the panel's top border, and of the transcript's bottom.
     fn panel_top(rows: &[String], title: &str) -> usize {
         rows.iter()
@@ -2720,9 +2952,11 @@ mod tests {
 
     #[test]
     fn every_panel_sits_at_the_bottom_in_the_prompts_place() {
+        let (planned, plan_dir) = plan_ready();
         let cases: Vec<(App, &str)> = vec![
             (asked("Which?", &["a", "b"]), "the model is asking"),
             (awaiting_approval("ls -la"), "run this command?"),
+            (planned, "execute this plan?"),
         ];
         for (mut app, title) in cases {
             let (rows, _) = render(&mut app, 70, 20);
@@ -2736,13 +2970,44 @@ mod tests {
                 "{title} should be below the transcript:\n{}",
                 rows.join("\n")
             );
-            // And in the prompt's slot: nothing after it but its own border.
+            // And in the prompt's slot: its own bottom border is the last row on
+            // screen, with nothing drawn after it.
             assert!(
-                top >= rows.len() - 10,
-                "{title} should be near the bottom:\n{}",
+                rows.last().is_some_and(|r| r.starts_with('└')),
+                "{title} should close out the screen:\n{}",
                 rows.join("\n")
             );
         }
+        let _ = std::fs::remove_dir_all(&plan_dir);
+    }
+
+    #[test]
+    fn the_execute_panel_names_the_plan_and_offers_both_ways_out() {
+        let (mut app, dir) = plan_ready();
+        let (rows, metrics) = render(&mut app, 80, 20);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("plan.md"), "name the file:\n{screen}");
+        assert!(screen.contains("Execute"), "missing Execute:\n{screen}");
+        assert!(
+            screen.contains("Keep planning"),
+            "the way out must be as visible as the way on:\n{screen}"
+        );
+        // Same rects as an approval, so clicks work without new plumbing.
+        assert!(metrics.allow_button.is_some());
+        assert!(metrics.deny_button.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_status_bar_marks_plan_mode() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let (rows, _) = render(&mut app, 70, 12);
+        assert!(!rows.join("\n").contains("plan"));
+
+        app.run_command(crate::command::Command::Plan(None));
+        let (rows, _) = render(&mut app, 70, 12);
+        assert!(rows.join("\n").contains("plan"), "{}", rows.join("\n"));
     }
 
     #[test]
@@ -3168,6 +3433,261 @@ mod tests {
             screen.contains("Sure, I can help"),
             "raw reply should be visible for debugging:\n{screen}"
         );
+    }
+
+    /// A transcript of the shape a real coding session produces: prose replies
+    /// with fenced code, edits, writes, command output, and protocol frames.
+    fn heavy_transcript(app: &mut App, turns: usize) {
+        // Roughly the size of a real edited span; the diff cost is quadratic in
+        // this, so a toy four-liner would flatter the measurement.
+        let body: String = (0..30)
+            .map(|n| format!("    let item_{n} = collect(source, {n})?;\n"))
+            .collect();
+        let code = format!("fn main() -> Result<()> {{\n{body}    Ok(())\n}}\n");
+        let code = code.as_str();
+        for i in 0..turns {
+            app.transcript.push(Entry::User(format!(
+                "turn {i}: please refactor the collector and explain what changed"
+            )));
+            app.transcript.push(Entry::Action {
+                action: Action::Response(format!(
+                    "## Turn {i}\n\nHere is what I changed, and *why* it matters:\n\n\
+                     - the collector no longer allocates twice\n\
+                     - the error path is now explicit\n\n\
+                     ```rust\n{code}```\n\nLet me know if you want it split further."
+                )),
+                usage: None,
+                diff: None,
+            });
+            // A few lines changed out of many, which is what a real edit looks
+            // like: the diff is cheap to *show* and expensive to *compute*.
+            app.transcript.push(edit_entry(
+                &format!("src/collect_{i}.rs"),
+                code,
+                &code.replace("collect(source, 7)", "collect(&source, 7)"),
+            ));
+            app.transcript.push(Entry::Frame {
+                direction: Direction::Received,
+                body: format!("<edit><path>src/collect_{i}.rs</path><old>{code}</old></edit>"),
+            });
+        }
+    }
+
+    /// A chatty command must not push the conversation off the top of the
+    /// scrollback, or sit in the render cache as thousands of styled rows.
+    #[test]
+    fn long_command_output_is_elided() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let stdout: String = (0..400).map(|i| format!("stdout line {i}\n")).collect();
+        app.transcript
+            .push(Entry::CommandResult(Box::new(crate::exec::CommandOutput {
+                command: "make".into(),
+                exit_code: Some(0),
+                stdout,
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                cancelled: false,
+            })));
+
+        let (_, metrics) = render(&mut app, 60, 20);
+        assert!(
+            (metrics.content_height as usize) < 400,
+            "output should be bounded, got {} rows",
+            metrics.content_height
+        );
+
+        // The head of the output stays…
+        app.follow = false;
+        app.scroll = 0;
+        let top = transcript_only(&render(&mut app, 60, 20).0);
+        assert!(top.contains("stdout line 0"), "{top}");
+        assert!(!top.contains("stdout line 399"), "{top}");
+
+        // …and the count of what was dropped closes it out.
+        app.follow = true;
+        let bottom = transcript_only(&render(&mut app, 60, 20).0);
+        assert!(
+            bottom.contains(&format!("{}", 400 - MAX_OUTPUT_PREVIEW)),
+            "expected a count of the elided lines:\n{bottom}"
+        );
+    }
+
+    /// A cached frame and a cold frame must be the same frame. This is the
+    /// whole contract of the cache: it may only save work, never change what is
+    /// on screen.
+    #[test]
+    fn a_warm_cache_draws_what_a_cold_one_draws() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let mut cache = TranscriptCache::default();
+
+        // Grow the transcript a piece at a time, the way a session does, so the
+        // cache is appended to rather than built in one go.
+        for turn in 0..6 {
+            heavy_transcript(&mut app, 1);
+            app.transcript.push(Entry::Notice(format!("notice {turn}")));
+            let (warm, warm_metrics) = render_cached(&mut app, &mut cache, 80, 24);
+
+            let mut cold_app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+            cold_app.transcript = app.transcript.clone();
+            cold_app.scroll = app.scroll;
+            cold_app.follow = app.follow;
+            let (cold, cold_metrics) = render(&mut cold_app, 80, 24);
+
+            assert_eq!(warm, cold, "warm cache diverged from a cold render");
+            assert_eq!(warm_metrics.content_height, cold_metrics.content_height);
+        }
+    }
+
+    /// The cache is keyed on what it was built for. A resize, a `/debug` toggle,
+    /// or a `/clear` all mean the stored rows no longer describe the screen.
+    #[test]
+    fn the_cache_rebuilds_when_its_key_changes() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        heavy_transcript(&mut app, 3);
+        // A line long enough to wrap at one width and not the other — otherwise
+        // a stale cache and a rewrapped one agree and the resize proves nothing.
+        app.transcript.push(Entry::User(
+            "this sentence is deliberately long enough that it must wrap onto a \
+             second row at a narrow width and stay on one row at a wide one"
+                .into(),
+        ));
+        let mut cache = TranscriptCache::default();
+        render_cached(&mut app, &mut cache, 80, 24);
+
+        // A narrower terminal rewraps everything.
+        let (narrow, _) = render_cached(&mut app, &mut cache, 48, 24);
+        let mut fresh = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        fresh.transcript = app.transcript.clone();
+        fresh.scroll = app.scroll;
+        fresh.follow = app.follow;
+        assert_eq!(narrow, render(&mut fresh, 48, 24).0, "resize was not honoured");
+        for row in &narrow {
+            assert!(row.chars().count() <= 48, "row overflows width: {row:?}");
+        }
+
+        // Turning on debug reveals protocol frames that were rendering to nothing.
+        let before = render_cached(&mut app, &mut cache, 80, 24).1.content_height;
+        app.debug = true;
+        let after = render_cached(&mut app, &mut cache, 80, 24).1.content_height;
+        assert!(
+            after > before,
+            "debug frames should appear once /debug is on: {before} -> {after}"
+        );
+
+        // Clearing shortens the transcript, which nothing else does.
+        app.transcript.clear();
+        app.follow = true;
+        let (cleared, metrics) = render_cached(&mut app, &mut cache, 80, 24);
+        assert!(
+            transcript_only(&cleared).contains("Type a prompt"),
+            "a cleared transcript should show the opening hint:\n{}",
+            cleared.join("\n")
+        );
+        assert_eq!(metrics.max_scroll(), 0, "nothing left to scroll through");
+    }
+
+    /// Scrolling reads out of the middle of the cache rather than off the end of
+    /// it, so an offset must land on the same rows a cold render would show.
+    #[test]
+    fn a_scrolled_warm_cache_shows_the_same_rows_as_a_cold_one() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        heavy_transcript(&mut app, 8);
+        let mut cache = TranscriptCache::default();
+        let (_, metrics) = render_cached(&mut app, &mut cache, 80, 20);
+
+        for offset in [0, 5, metrics.max_scroll() / 2, metrics.max_scroll()] {
+            app.follow = false;
+            app.scroll = offset;
+            let (warm, _) = render_cached(&mut app, &mut cache, 80, 20);
+
+            let mut cold_app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+            cold_app.transcript = app.transcript.clone();
+            cold_app.follow = false;
+            cold_app.scroll = offset;
+            let (cold, _) = render(&mut cold_app, 80, 20);
+
+            assert_eq!(warm, cold, "warm and cold disagree at scroll {offset}");
+        }
+    }
+
+    /// The live reply is not cached — it changes every frame — but it still has
+    /// to sit below the cached history and carry the cursor.
+    #[test]
+    fn a_streaming_reply_renders_below_the_cached_history() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::User("earlier turn".into()));
+        let mut cache = TranscriptCache::default();
+        render_cached(&mut app, &mut cache, 60, 16);
+
+        app.status = Status::Streaming;
+        for chunk in ["Here ", "is ", "the answer"] {
+            app.push_delta(chunk);
+        }
+        let (rows, _) = render_cached(&mut app, &mut cache, 60, 16);
+        let screen = transcript_only(&rows);
+
+        assert!(screen.contains("earlier turn"), "history lost:\n{screen}");
+        assert!(
+            screen.contains("Here is the answer▌"),
+            "the live reply should show with a cursor:\n{screen}"
+        );
+    }
+
+    /// A reply taller than the viewport scrolls *into* the live tail: the rows
+    /// on screen start partway through it, past the cached history entirely.
+    /// Following a long answer as it arrives depends on this.
+    #[test]
+    fn following_a_reply_taller_than_the_screen_shows_its_end() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::User("short question".into()));
+        app.status = Status::Streaming;
+        for i in 0..60 {
+            app.push_delta(&format!("reply line {i}\n"));
+        }
+        app.push_delta("reply line 60");
+
+        let mut cache = TranscriptCache::default();
+        let (rows, _) = render_cached(&mut app, &mut cache, 60, 20);
+        let screen = transcript_only(&rows);
+
+        assert!(
+            screen.contains("reply line 60▌"),
+            "following should show the end of the reply:\n{screen}"
+        );
+        assert!(
+            !screen.contains("reply line 0"),
+            "the start of the reply should have scrolled off:\n{screen}"
+        );
+    }
+
+    /// Not an assertion — a stopwatch. Run with
+    /// `cargo test --release render_cost_scales_with_history -- --ignored --nocapture`
+    /// to see per-frame cost against transcript size.
+    #[test]
+    #[ignore = "timing measurement, not a correctness check"]
+    fn render_cost_scales_with_history() {
+        for turns in [25usize, 50, 100, 200] {
+            let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+            heavy_transcript(&mut app, turns);
+
+            // The real loop keeps one cache across frames; a fresh one per frame
+            // would measure the cold path the cache exists to avoid.
+            let mut cache = TranscriptCache::default();
+            // One warm-up frame, so the one-time build is not charged to the timing.
+            render_cached(&mut app, &mut cache, 100, 40);
+
+            let frames = 20;
+            let start = std::time::Instant::now();
+            for _ in 0..frames {
+                render_cached(&mut app, &mut cache, 100, 40);
+            }
+            let per_frame = start.elapsed() / frames;
+            println!(
+                "{:>4} entries -> {per_frame:?} per frame",
+                app.transcript.len()
+            );
+        }
     }
 
     #[test]

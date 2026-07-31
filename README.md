@@ -166,6 +166,7 @@ Commands are handled locally and never sent to the model.
 | --- | --- |
 | `/debug` | Toggle showing the raw protocol sent and received |
 | `/auto` | Toggle running actions without the approval modal (see [Sandboxing](#sandboxing)) |
+| `/plan [task]` | Toggle plan mode; with a task, start planning it (see [Plan mode](#plan-mode)) |
 | `/clear` | Clear the conversation, keeping the system prompt |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -338,6 +339,53 @@ the web.
 Non-macOS platforms fail closed at startup rather than running commands
 unsandboxed.
 
+## Plan mode
+
+`/plan` (or `/plan add a --json flag`, which enters the mode and starts on that
+task) puts the harness in a state where it works out *what to do* before doing any
+of it. The plan goes to `plan.md` in the current session's folder, which is also
+why a session is a directory: rename or fork the session and the plan goes with it.
+
+**While the mode is on, that plan file is the only writable path on the machine.**
+This is the sandbox's rule, not a promise the model makes: the Seatbelt profile is
+narrowed to a single `(allow file-write* (literal …))`, so it holds for a shell
+command exactly as it does for `<ai-harness-write>`. Reads, fetches, and commands
+that only look at things work normally, and that is how the research is meant to
+happen. A write aimed anywhere else is refused before you are asked to approve it,
+and the model is told why so it can put the plan where it belongs.
+
+The cost of that is worth knowing up front: **anything that needs to write fails
+while planning**, including `cargo build`, installs, formatters, and commands that
+spill to a temporary file. That is the intended shape of the mode rather than a
+limitation to work around — but it is the part most likely to surprise you.
+
+The model is told to ask with `<ai-harness-option>` about anything the code cannot
+settle, and to end its turn with `<ai-harness-response>` only once the plan is
+written. That response is what raises the decision:
+
+```
+┌ execute this plan? ──────────────────────────┐
+│ The plan is ready:                           │
+│                                              │
+│ .ai_harness/sessions/<name>/plan.md          │
+│                                              │
+│ Executing leaves plan mode, lifting the      │
+│ write restriction.                           │
+│                                              │
+│      [  Execute  ]      Keep planning        │
+└──────────────────────────────────────────────┘
+```
+
+`Execute` turns the mode off and starts a fresh turn that reads the plan and
+carries it out — with writes unrestricted again, and the approval modal back to
+being what stands between a proposal and a change. `Keep planning` returns you to
+the prompt with the mode still on, so you can say what to change and let the model
+revise the file. `/plan` on its own leaves the mode without executing anything.
+
+Auto-approve is unaffected either way. It decides *whether you are asked*; the
+narrowed profile decides *what can happen at all*, so an auto-approved command
+during plan mode is still confined to reading.
+
 ## Setup
 
 Put your OpenRouter key in a `.env` file next to the project (it is gitignored):
@@ -417,7 +465,9 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | `PageUp` / `PageDown` | Scroll the transcript |
 | `Ctrl+↑` / `Ctrl+↓` | Scroll one line |
 | `End` | Jump back to the newest message when scrolled up |
-| `Ctrl+W` / `Alt+Backspace` | Delete the previous word |
+| `Ctrl+←` / `Ctrl+→` | Move one word left / right (also `Alt`) |
+| `Ctrl+W` / `Ctrl+Backspace` | Delete the previous word (also `Alt+Backspace`) |
+| `Ctrl+Delete` | Delete the next word (also `Alt+Delete`) |
 | `Ctrl+U` | Delete to the start of the line |
 | `Ctrl+K` | Clear the prompt |
 | `Ctrl+A` / `Ctrl+E` | Start / end of line |
@@ -431,6 +481,9 @@ While the model's question modal is up, the keyboard belongs to it:
 | `1`–`9` | Pick that choice outright |
 | `Enter` | Answer with the highlighted choice, or with what you typed |
 | `Esc` | Dismiss the question (reported to the model, which then continues) |
+
+The free-text row takes the same editing keys as the prompt, word motions and
+word deletion included.
 
 Typing goes to the free-text row **only while it is focused**, so a keystroke
 aimed at a highlighted choice cannot vanish into a buffer you cannot see. Choices
@@ -497,7 +550,7 @@ than squeezing the conversation out of view.
 | `src/highlight.rs` | Language detection and tokenising for code blocks |
 | `src/markdown.rs` | Markdown subset for rendering model responses |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
-| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
+| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`) |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
 | `src/ui.rs` | Rendering and layout |
 | `src/app.rs` | Application state: transcript, history, request status |
@@ -562,12 +615,14 @@ The session **auto-saves after every turn**. Each session is a *folder*, under
 └── sessions/
     └── <name>/
         ├── session.json
-        └── preview.txt
+        ├── preview.txt
+        └── plan.md
 ```
 
 A folder rather than a file because the conversation is only the first thing a
-session owns — per-session plans and the like will sit beside it, and a folder
-means `/rename` and `/fork` carry them along without knowing they exist.
+session owns: `plan.md` is [plan mode](#plan-mode)'s output and sits beside it, and
+a folder means `/rename` and `/fork` carry it along without knowing it exists.
+`plan.md` is only there once a plan has been written.
 
 `preview.txt` is the session's last few lines of prose, written on every save so
 the `/load` picker can show what each session was about. It exists as its own file

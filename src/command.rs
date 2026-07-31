@@ -11,6 +11,8 @@ pub enum Command {
     Debug,
     /// Toggle running actions without the approval modal.
     Auto,
+    /// Toggle plan mode. `Some` carries the task to start planning immediately.
+    Plan(Option<String>),
     Help,
     Clear,
     Quit,
@@ -61,6 +63,7 @@ pub fn parse(input: &str) -> Input {
     Input::Command(match name.to_ascii_lowercase().as_str() {
         "debug" => Command::Debug,
         "auto" | "auto-approve" => Command::Auto,
+        "plan" => Command::Plan(arg),
         "help" | "h" | "?" => Command::Help,
         "clear" | "reset" => Command::Clear,
         "quit" | "exit" | "q" => Command::Quit,
@@ -93,6 +96,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "auto",
         description: "toggle running actions without the approval modal",
+    },
+    Spec {
+        name: "plan",
+        description: "toggle plan mode: research and write a plan first (/plan [task])",
     },
     Spec {
         name: "clear",
@@ -195,6 +202,11 @@ mod tests {
         assert_eq!(command("/debug"), Command::Debug);
         assert_eq!(command("/auto"), Command::Auto);
         assert_eq!(command("/auto-approve"), Command::Auto);
+        assert_eq!(command("/plan"), Command::Plan(None));
+        assert_eq!(
+            command("/plan add a --json flag"),
+            Command::Plan(Some("add a --json flag".into()))
+        );
         assert_eq!(command("/help"), Command::Help);
         assert_eq!(command("/clear"), Command::Clear);
         assert_eq!(command("/quit"), Command::Quit);

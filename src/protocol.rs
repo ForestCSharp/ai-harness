@@ -1047,6 +1047,50 @@ error, so follow them exactly."
     prompt
 }
 
+/// The plan-mode section of the contract, appended after [`system_prompt`].
+///
+/// Kept separate rather than folded in behind a flag because the mode is toggled
+/// mid-session: the contract is rebuilt when it changes, and having the extra
+/// paragraphs be their own string makes the two versions obviously the same
+/// document plus or minus one section.
+///
+/// The read-only claim is not a request. Writes really are refused, by the
+/// kernel — so the model is told the truth about what it can do rather than
+/// asked to behave, which is what makes the guidance safe to trust.
+pub fn plan_contract(plan_path: &str) -> String {
+    format!(
+        "PLAN MODE IS ON. You are working out *what to do*, not doing it.
+
+Write the plan to this file, and no other:
+
+{plan_path}
+
+Use <{WRITE_TAG} file={plan_path}> for the first version and <{EDIT_TAG} \
+file={plan_path}> to revise it. Write markdown — the harness renders it for the \
+user. A good plan says why the change is needed, names the files it will touch, \
+points at the existing functions to reuse, and describes how to verify the \
+result; it does not restate the whole codebase.
+
+While this mode is on the filesystem is READ-ONLY apart from that one file. This \
+is enforced by the sandbox, not by convention: a <{WRITE_TAG}> or <{EDIT_TAG}> \
+aimed anywhere else is refused before it runs, and a <{SHELL_TAG}> that tries to \
+write — including anything that builds, installs, formats, or writes a temporary \
+file — fails. Commands that only look are fine and are how you should work: \
+listing, grepping, showing history. Prefer <{READ_TAG}> for files.
+
+Research before you plan. Read the code the change touches rather than assuming \
+its shape, and use <{OPTION_TAG}> for what the code cannot tell you — which of \
+two designs, what a requirement means, a trade-off that is the user's to make. \
+Ask while planning is cheap; discovering it mid-implementation is not.
+
+Reply with <{RESPONSE_TAG}> only when the plan file is written and you consider \
+it ready. That reply ends the planning turn: the harness then asks the user \
+whether to execute the plan, and if they accept, this mode is switched off and \
+the work begins. Keep it to a short summary of what the plan does — the plan \
+itself is in the file, and repeating it here wastes the user's money."
+    )
+}
+
 /// Shorten a snippet for an error message, on a char boundary.
 fn snippet(s: &str) -> String {
     const MAX: usize = 120;
@@ -1976,6 +2020,22 @@ mod tests {
         // `cat` and making the user click Allow.
         let prompt = system_prompt(None);
         assert!(prompt.contains("needs no approval"), "{prompt}");
+    }
+
+    #[test]
+    fn the_plan_contract_names_the_file_and_the_restriction() {
+        let contract = plan_contract(".ai_harness/sessions/demo/plan.md");
+        assert!(contract.contains(".ai_harness/sessions/demo/plan.md"));
+        assert!(
+            contract.contains("READ-ONLY"),
+            "the model must know writes elsewhere fail: {contract}"
+        );
+        // The two elements it needs to do the job at all.
+        assert!(contract.contains(OPTION_TAG), "asking must be offered");
+        assert!(
+            contract.contains(RESPONSE_TAG),
+            "it must know how to say the plan is ready"
+        );
     }
 
     #[test]

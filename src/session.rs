@@ -78,6 +78,13 @@ pub const FILE: &str = "session.json";
 /// picker and nothing else.
 pub const PREVIEW_FILE: &str = "preview.txt";
 
+/// The plan `/plan` mode writes, inside the session's directory.
+///
+/// Per-session rather than per-project: a plan belongs to the conversation that
+/// produced it, and two sessions planning different work must not overwrite each
+/// other's. Markdown because the transcript renders it.
+pub const PLAN_FILE: &str = "plan.md";
+
 /// Lines kept in a preview, which is also what the picker shows.
 pub const PREVIEW_LINES: usize = 3;
 
@@ -97,6 +104,25 @@ pub fn dir(root: &Path, name: &str) -> Result<PathBuf> {
 /// The conversation file for `name`.
 fn file(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir(root, name)?.join(FILE))
+}
+
+/// The plan file for `name`, whether or not it exists yet.
+pub fn plan_file(root: &Path, name: &str) -> Result<PathBuf> {
+    Ok(dir(root, name)?.join(PLAN_FILE))
+}
+
+/// Create `name`'s directory, so something can be written inside it.
+///
+/// Plan mode needs this before the first write: the sandbox is narrowed to the
+/// plan file's exact path, and a `tee` into a directory that does not exist
+/// would fail for a reason that has nothing to do with the policy. Writing the
+/// folder here rather than through the sandbox is safe for the same reason
+/// [`save`] is — this is the harness's own file access, not the model's.
+pub fn ensure_folder(root: &Path, name: &str) -> Result<PathBuf> {
+    let folder = dir(root, name)?;
+    std::fs::create_dir_all(&folder)
+        .with_context(|| format!("creating session directory {}", folder.display()))?;
+    Ok(folder)
 }
 
 /// Write `session` to `<dir>/<name>/session.json`, creating the folder if needed.
