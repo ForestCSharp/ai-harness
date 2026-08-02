@@ -23,6 +23,7 @@ dependencies = [
  "futures-util",
  "libc",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

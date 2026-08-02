@@ -715,6 +715,22 @@ mod tests {
                 truncated: false,
                 error: None,
             })),
+            Entry::SearchResult(Box::new(crate::search::SearchOutcome {
+                kind: crate::search::SearchKind::Grep,
+                pattern: "needle".into(),
+                dir: None,
+                glob: None,
+                hits: vec![crate::search::Hit {
+                    path: "src/a.rs".into(),
+                    line: Some(7),
+                    text: "let needle = 1;".into(),
+                }],
+                files_matched: 1,
+                files_scanned: 3,
+                files_skipped: 0,
+                capped: None,
+                error: None,
+            })),
             Entry::Denied("rm -rf /".into()),
             Entry::Frame {
                 direction: Direction::Sent,
@@ -740,6 +756,16 @@ mod tests {
             Entry::CommandResult(o) => assert_eq!(o.exit_code, Some(0)),
             other => panic!("variant 3 changed shape: {other:?}"),
         }
+        // A search result was added without a `VERSION` bump, so it has to
+        // survive the same save-and-load every older variant does.
+        match &loaded.transcript[5] {
+            Entry::SearchResult(o) => {
+                assert_eq!(o.hits.len(), 1);
+                assert_eq!(o.hits[0].line, Some(7));
+            }
+            other => panic!("the search result changed shape: {other:?}"),
+        }
+        assert_eq!(loaded.version, VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

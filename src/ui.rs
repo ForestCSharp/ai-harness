@@ -775,6 +775,29 @@ fn approval_body(
                     .add_modifier(Modifier::BOLD),
             ))],
         ),
+        // Only reachable under `--confirm-reads`, like a read. The pattern is
+        // all there is to show: which files it will open is not knowable until
+        // the walk runs.
+        Action::Grep { pattern, dir, glob } => (
+            "The model wants to search for:",
+            " run this search? ",
+            vec![Line::from(Span::styled(
+                crate::protocol::search_label(pattern, dir.as_deref(), glob.as_deref()),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ))],
+        ),
+        Action::Glob { pattern, dir } => (
+            "The model wants to list files matching:",
+            " run this search? ",
+            vec![Line::from(Span::styled(
+                crate::protocol::search_label(pattern, dir.as_deref(), None),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ))],
+        ),
         // Only reachable under `--confirm-fetch`; fetches are otherwise silent.
         Action::Fetch { url } => (
             "The model wants to fetch:",
@@ -1194,6 +1217,8 @@ fn render_entry(
             let (label, colour) = match action {
                 Action::Shell(_) => ("shell", Color::Magenta),
                 Action::Read { .. } => ("read", Color::Blue),
+                Action::Grep { .. } => ("grep", Color::Blue),
+                Action::Glob { .. } => ("glob", Color::Blue),
                 Action::Fetch { .. } => ("fetch", Color::Blue),
                 Action::Write { .. } => ("write", Color::Cyan),
                 Action::Edit { .. } => ("edit", Color::Cyan),
@@ -1235,6 +1260,17 @@ fn render_entry(
                     limit,
                 } => lines.extend(body_lines(
                     &crate::protocol::read_label(path, *offset, *limit),
+                    Style::default().fg(Color::Blue),
+                    width,
+                )),
+                // The pattern is the whole action; the hits arrive as a result.
+                Action::Grep { pattern, dir, glob } => lines.extend(body_lines(
+                    &crate::protocol::search_label(pattern, dir.as_deref(), glob.as_deref()),
+                    Style::default().fg(Color::Blue),
+                    width,
+                )),
+                Action::Glob { pattern, dir } => lines.extend(body_lines(
+                    &crate::protocol::search_label(pattern, dir.as_deref(), None),
                     Style::default().fg(Color::Blue),
                     width,
                 )),
@@ -1350,6 +1386,37 @@ fn render_entry(
                 // it, since a read happens without the user asking for it. The
                 // counts are already in the header above.
                 None => lines.extend(preview_body(&outcome.contents, width)),
+            }
+        }
+        Entry::SearchResult(outcome) => {
+            let ok = outcome.succeeded();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "result",
+                    Style::default()
+                        .fg(if ok { Color::Blue } else { Color::Red })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}  {}", outcome.pattern, outcome.summary()),
+                    Style::default().fg(if ok { Color::DarkGray } else { Color::Red }),
+                ),
+            ]));
+            match &outcome.error {
+                Some(error) => {
+                    lines.extend(body_lines(error, Style::default().fg(Color::Red), width))
+                }
+                // Shown far more generously than a read's contents, on the same
+                // reasoning [`MAX_OUTPUT_PREVIEW`] already carries: a read is
+                // something you asked to see and can ask for again, while a hit
+                // list *is* the reason the search was run. Eight lines of it
+                // would be a tease.
+                None => lines.extend(bounded_body(
+                    &outcome.preview(),
+                    Style::default().fg(Color::DarkGray),
+                    width,
+                    MAX_OUTPUT_PREVIEW,
+                )),
             }
         }
         Entry::FetchResult(outcome) => {
@@ -2304,6 +2371,147 @@ mod tests {
             !screen.contains("line 39"),
             "the whole file leaked into the transcript:\n{screen}"
         );
+    }
+
+    /// A `SearchOutcome` with `n` hits, for the render tests.
+    fn search_result(kind: crate::search::SearchKind, n: usize) -> crate::search::SearchOutcome {
+        crate::search::SearchOutcome {
+            kind,
+            pattern: "needle".into(),
+            dir: None,
+            glob: None,
+            hits: (0..n)
+                .map(|i| crate::search::Hit {
+                    path: format!("src/f{i}.rs"),
+                    line: matches!(kind, crate::search::SearchKind::Grep).then_some(i + 1),
+                    text: if matches!(kind, crate::search::SearchKind::Grep) {
+                        format!("let needle{i} = 1;")
+                    } else {
+                        String::new()
+                    },
+                })
+                .collect(),
+            files_matched: n,
+            files_scanned: 19,
+            files_skipped: 0,
+            capped: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn grep_action_and_its_result_are_rendered() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Grep {
+                pattern: "needle".into(),
+                dir: Some("src".into()),
+                glob: Some("*.rs".into()),
+            },
+            usage: None,
+            diff: None,
+        });
+        app.transcript
+            .push(Entry::SearchResult(Box::new(search_result(
+                crate::search::SearchKind::Grep,
+                1,
+            ))));
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("grep"), "missing grep label:\n{screen}");
+        assert!(screen.contains("needle"), "missing pattern:\n{screen}");
+        assert!(screen.contains("in src"), "missing scope:\n{screen}");
+        assert!(
+            screen.contains("matching *.rs"),
+            "missing filter:\n{screen}"
+        );
+        assert!(
+            screen.contains("src/f0.rs:1:"),
+            "missing the hit itself:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn glob_action_and_its_result_are_rendered() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.transcript.push(Entry::Action {
+            action: crate::protocol::Action::Glob {
+                pattern: "**/*.rs".into(),
+                dir: None,
+            },
+            usage: None,
+            diff: None,
+        });
+        app.transcript
+            .push(Entry::SearchResult(Box::new(search_result(
+                crate::search::SearchKind::Glob,
+                2,
+            ))));
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("glob"), "missing glob label:\n{screen}");
+        assert!(screen.contains("**/*.rs"), "missing pattern:\n{screen}");
+        assert!(screen.contains("src/f0.rs"), "missing a path:\n{screen}");
+        assert!(screen.contains("2 file(s)"), "missing the count:\n{screen}");
+    }
+
+    /// A hit list is the reason the search was run, so it gets the generous
+    /// output cap rather than a read's eight-line taste — but it is still
+    /// bounded, and says how much it held back.
+    #[test]
+    fn a_long_search_result_is_bounded_not_dumped() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let outcome = search_result(crate::search::SearchKind::Grep, 200);
+        app.transcript.push(Entry::SearchResult(Box::new(outcome)));
+
+        let (rows, _) = render(&mut app, 70, 400);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("src/f0.rs"), "the head is shown:\n{screen}");
+        assert!(
+            !screen.contains("src/f199.rs"),
+            "the tail must be elided, not dumped:\n{screen}"
+        );
+        assert!(screen.contains("more"), "missing the elision:\n{screen}");
+    }
+
+    #[test]
+    fn a_failed_search_is_rendered_with_its_reason() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let request = crate::search::Request::grep("fn (");
+        app.transcript.push(Entry::SearchResult(Box::new(
+            crate::search::SearchOutcome::failed(&request, "unclosed group"),
+        )));
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("failed"), "missing status:\n{screen}");
+        assert!(
+            screen.contains("unclosed group"),
+            "missing reason:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn search_approval_modal_appears_under_confirm_reads() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.confirm_reads = true;
+        app.input.insert_str("find a thing");
+        app.submit().unwrap();
+        app.push_response("<ai-harness-grep>needle</ai-harness-grep>".into(), None);
+        assert!(
+            app.pending().is_some(),
+            "should be awaiting search approval"
+        );
+
+        let (rows, _) = render(&mut app, 70, 18);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("run this search?"),
+            "missing title:\n{screen}"
+        );
+        assert!(screen.contains("needle"), "missing pattern:\n{screen}");
     }
 
     #[test]

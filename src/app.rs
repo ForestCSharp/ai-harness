@@ -50,6 +50,8 @@ pub enum Entry {
     CommandResult(Box<CommandOutput>),
     /// The outcome of a file read. Unlike the others, no approval preceded it.
     ReadResult(ReadOutcome),
+    /// The outcome of a grep or a glob. Like a read, no approval preceded it.
+    SearchResult(Box<crate::search::SearchOutcome>),
     /// The outcome of a URL fetch. Like a read, no approval preceded it.
     FetchResult(Box<FetchOutcome>),
     /// The outcome of a file write the user allowed.
@@ -397,6 +399,12 @@ pub struct App {
     /// and needs the same cancellation and generation machinery as a command,
     /// which lives in the event loop rather than here.
     pending_fetch: Option<String>,
+    /// A search the dispatch approved but that `main` still has to spawn.
+    ///
+    /// Parked for the same reason a fetch is, and one more: a read is bounded at
+    /// 64 KB of a single file, where a walk has no such bound. Running one
+    /// inline would stall the redraw and `Esc` for as long as it took.
+    pending_search: Option<crate::search::Request>,
     /// Cumulative token spend for the session. Survives `/clear`: the tokens
     /// were really bought, whether or not the conversation was kept.
     pub ledger: Ledger,
@@ -491,6 +499,7 @@ impl App {
             extra_system,
             auto_approve: false,
             pending_fetch: None,
+            pending_search: None,
             ledger: Ledger::default(),
             price_in: None,
             price_out: None,
@@ -615,9 +624,10 @@ impl App {
         if !self.is_busy() {
             return;
         }
-        // A parked fetch has not been spawned yet, so dropping it here is all
-        // that is needed; a spawned one is stopped by its cancel signal.
+        // A parked fetch or search has not been spawned yet, so dropping it here
+        // is all that is needed; a spawned one is stopped by its cancel signal.
         self.pending_fetch = None;
+        self.pending_search = None;
         // Cancelling out of a retry loop abandons the turn, so the failed
         // attempts should leave no more behind than giving up on them does.
         self.roll_back_retries();
@@ -1438,6 +1448,31 @@ impl App {
                 self.status = Status::Running;
                 self.follow = true;
             }
+            // A search is parked like a fetch, and gated by the same flag a read
+            // is: `--confirm-reads` means "ask before local filesystem access",
+            // and a search is that. The modal would also tell you less than a
+            // read's does — it can show the pattern, but not which files the
+            // pattern will open.
+            Action::Grep { pattern, dir, glob } if !self.confirm_reads => {
+                self.pending_search = Some(crate::search::Request {
+                    kind: crate::search::SearchKind::Grep,
+                    pattern,
+                    dir,
+                    glob,
+                });
+                self.status = Status::Running;
+                self.follow = true;
+            }
+            Action::Glob { pattern, dir } if !self.confirm_reads => {
+                self.pending_search = Some(crate::search::Request {
+                    kind: crate::search::SearchKind::Glob,
+                    pattern,
+                    dir,
+                    glob: None,
+                });
+                self.status = Status::Running;
+                self.follow = true;
+            }
             // A question waits on a person. It is not an approval, so it does
             // not become a `Pending` and auto-approve cannot answer it — which
             // is the whole point of asking.
@@ -1791,6 +1826,16 @@ impl App {
                 offset,
                 limit,
             } => format!("read {}", protocol::read_label(path, *offset, *limit)),
+            Action::Grep { pattern, dir, glob } => format!(
+                "grep {}",
+                protocol::search_label(pattern, dir.as_deref(), glob.as_deref())
+            ),
+            Action::Glob { pattern, dir } => {
+                format!(
+                    "glob {}",
+                    protocol::search_label(pattern, dir.as_deref(), None)
+                )
+            }
             Action::Fetch { url } => format!("fetch {url}"),
             Action::Write { path, .. } => format!("write {path}"),
             Action::Edit { path, .. } => format!("edit {path}"),
@@ -1839,6 +1884,24 @@ impl App {
     /// work itself. Taking it clears it, so a fetch is spawned exactly once.
     pub fn take_pending_fetch(&mut self) -> Option<String> {
         self.pending_fetch.take()
+    }
+
+    /// Take the search the dispatch parked, if there is one.
+    ///
+    /// Taking it clears it, so a search is spawned exactly once.
+    pub fn take_pending_search(&mut self) -> Option<crate::search::Request> {
+        self.pending_search.take()
+    }
+
+    /// Record a finished search and hand the results back to the model.
+    pub fn push_search_result(&mut self, outcome: crate::search::SearchOutcome) -> Vec<Message> {
+        let encoded = protocol::encode_search_result(&outcome);
+        self.transcript.push(Entry::SearchResult(Box::new(outcome)));
+        self.frame(Direction::Sent, encoded.clone());
+        self.history.push(Message::user(encoded));
+        self.status = Status::Waiting;
+        self.follow = true;
+        self.history.clone()
     }
 
     /// Record a finished fetch and hand the text back to the model.
@@ -4455,6 +4518,172 @@ mod file_tests {
 
     fn read_reply(path: &str) -> String {
         format!("<ai-harness-read>{path}</ai-harness-read>")
+    }
+
+    fn grep_reply(pattern: &str) -> String {
+        format!("<ai-harness-grep>{pattern}</ai-harness-grep>")
+    }
+
+    /// A grep is background work: unlike a read it is parked for `main` to
+    /// spawn, because a walk is unbounded where a 64 KB read is not.
+    #[test]
+    fn a_grep_is_parked_rather_than_run_inline() {
+        let (mut app, _dir) = app_with_files(&[("notes.txt", "hello\n")]);
+        assert!(
+            app.push_response(grep_reply("hello"), None).is_none(),
+            "a parked search returns no messages; the result arrives later"
+        );
+        assert!(
+            app.pending().is_none(),
+            "a search must not raise the approval modal"
+        );
+        assert!(matches!(app.status, Status::Running));
+        assert_eq!(
+            app.take_pending_search(),
+            Some(crate::search::Request::grep("hello"))
+        );
+    }
+
+    #[test]
+    fn a_glob_is_parked_with_its_scope() {
+        let (mut app, _dir) = app_with_files(&[]);
+        app.push_response(
+            "<ai-harness-glob dir=src>**/*.rs</ai-harness-glob>".into(),
+            None,
+        );
+        assert_eq!(
+            app.take_pending_search(),
+            Some(crate::search::Request::glob("**/*.rs").in_dir("src"))
+        );
+    }
+
+    #[test]
+    fn taking_the_parked_search_clears_it() {
+        let (mut app, _dir) = app_with_files(&[]);
+        app.push_response(grep_reply("hello"), None);
+        assert!(app.take_pending_search().is_some());
+        assert!(
+            app.take_pending_search().is_none(),
+            "a search must be spawned exactly once"
+        );
+    }
+
+    /// The sibling of `cancelling_drops_a_parked_fetch`. Without the clear in
+    /// `cancel`, a search parked before `Esc` would be spawned into a turn that
+    /// no longer exists.
+    #[test]
+    fn cancelling_drops_a_parked_search() {
+        let (mut app, _dir) = app_with_files(&[]);
+        app.push_response(grep_reply("hello"), None);
+        app.cancel();
+
+        assert!(
+            app.take_pending_search().is_none(),
+            "a cancelled turn must not spawn the search it had parked"
+        );
+    }
+
+    #[test]
+    fn a_search_result_reaches_the_model_and_the_transcript() {
+        let (mut app, _dir) = app_with_files(&[]);
+        let outcome = crate::search::SearchOutcome {
+            kind: crate::search::SearchKind::Grep,
+            pattern: "hello".into(),
+            dir: None,
+            glob: None,
+            hits: vec![crate::search::Hit {
+                path: "notes.txt".into(),
+                line: Some(1),
+                text: "hello".into(),
+            }],
+            files_matched: 1,
+            files_scanned: 1,
+            files_skipped: 0,
+            capped: None,
+            error: None,
+        };
+        let messages = app.push_search_result(outcome);
+
+        assert!(
+            messages
+                .last()
+                .unwrap()
+                .content
+                .contains("notes.txt:1: hello"),
+            "the model gets the hits"
+        );
+        match last_visible(&app) {
+            Entry::SearchResult(outcome) => assert_eq!(outcome.hits.len(), 1),
+            other => panic!("expected a search result, got {other:?}"),
+        }
+        assert!(app.is_waiting());
+    }
+
+    #[test]
+    fn a_search_counts_against_the_iteration_budget() {
+        let (mut app, _dir) = app_with_files(&[]);
+        let before = app.iterations;
+        app.push_response(grep_reply("hello"), None);
+        assert!(
+            app.iterations > before,
+            "'free' is not 'unbounded' — a search costs a round-trip like anything else"
+        );
+    }
+
+    #[test]
+    fn confirm_reads_puts_a_grep_behind_the_modal() {
+        let (mut app, _dir) = app_with_files(&[]);
+        app.confirm_reads = true;
+
+        assert!(
+            app.push_response(grep_reply("hello"), None).is_none(),
+            "with --confirm-reads a search must wait for the user"
+        );
+        assert!(
+            app.take_pending_search().is_none(),
+            "it becomes pending rather than parked"
+        );
+        match app.pending() {
+            Some(pending) => assert_eq!(
+                pending.action,
+                Action::Grep {
+                    pattern: "hello".into(),
+                    dir: None,
+                    glob: None,
+                }
+            ),
+            None => panic!("expected the approval modal"),
+        }
+    }
+
+    #[test]
+    fn a_denied_search_tells_the_model_what_was_refused() {
+        let (mut app, _dir) = app_with_files(&[]);
+        app.confirm_reads = true;
+        app.push_response(
+            "<ai-harness-grep dir=src>hello</ai-harness-grep>".into(),
+            None,
+        );
+        app.deny().expect("a denial continues the loop");
+
+        match last_visible(&app) {
+            Entry::Denied(refused) => assert_eq!(refused, "grep hello  in src"),
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_search_is_reported_to_the_model_rather_than_ending_the_turn() {
+        let (mut app, _dir) = app_with_files(&[]);
+        let request = crate::search::Request::grep("fn (");
+        let outcome = crate::search::SearchOutcome::failed(&request, "unclosed group");
+        let messages = app.push_search_result(outcome);
+
+        assert!(messages.last().unwrap().content.contains("unclosed group"));
+        assert!(
+            app.is_waiting(),
+            "a bad pattern costs a round-trip, not the turn"
+        );
     }
 
     #[test]

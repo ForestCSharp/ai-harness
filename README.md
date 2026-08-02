@@ -11,7 +11,7 @@ Input is not sent as free text. Each prompt goes out wrapped in a single element
 <ai-harness-query>count the rust files in src</ai-harness-query>
 ```
 
-The model must reply with exactly one of seven elements, and nothing else:
+The model must reply with exactly one of nine elements, and nothing else:
 
 ```xml
 <ai-harness-shell>ls -1 src/*.rs | wc -l</ai-harness-shell>
@@ -23,6 +23,18 @@ The model must reply with exactly one of seven elements, and nothing else:
 
 ```xml
 <ai-harness-read offset=1587 limit=400>src/app.rs</ai-harness-read>
+```
+
+```xml
+<ai-harness-grep>fn parse_reply</ai-harness-grep>
+```
+
+```xml
+<ai-harness-grep dir=src glob="*.rs">(?i)todo</ai-harness-grep>
+```
+
+```xml
+<ai-harness-glob>**/*.rs</ai-harness-glob>
 ```
 
 ```xml
@@ -79,6 +91,42 @@ by being confined more tightly than the shell is: reads resolve to a real path
 inside the working directory or they fail. To read anything outside, the model
 has to use `<ai-harness-shell>`, which you approve as usual. Pass
 `--confirm-reads` to put reads behind the modal too.
+
+`<ai-harness-grep>` and `<ai-harness-glob>` finish the thought the read started.
+A read is auto-approved because looking at four files should not cost four
+interruptions — but *finding* those four files meant `<ai-harness-shell>rg …`,
+which interrupts, so the free path was only reachable through a modal. Search
+mutates nothing and confines exactly as a read does, so it earns the same
+treatment on the same argument.
+
+A grep's body is a regular expression and a glob's is a filename pattern (`*`
+within one path segment, `**` across them, `?` for one character). Both take an
+optional `dir=` to scope the walk; a grep also takes `glob=` to filter which
+files it opens. There is no `case=`, because `(?i)` at the front of the pattern
+already says it and says more.
+
+Results come back as `path:line: text` — what `rg -n` prints, so it is the shape
+a model has seen most — with the path relative to the working directory, so a
+hit can be handed straight to `<ai-harness-read>` without translation. Finding
+nothing is reported as `matches: none` rather than an empty section: silence is
+the one answer a model reliably misreads as breakage.
+
+The confinement is the read's, applied per entry instead of once. Every file and
+directory the walk touches is checked against the credential denylist, because a
+glob of `**/*` that consulted it only for the starting directory would list
+`.env`. Symlinks are never followed, which stops an escape out of the root, a
+link back in that double-reports, and `a -> .` looping forever, all with one
+rule. A hardcoded list keeps the walk out of `.git`, `target`, `node_modules`
+and the like — that one is about cost rather than safety, though `.ai_harness`
+is on it for a sharper reason: a session file holds an entire prior
+conversation, so without it a grep would match the transcript of you typing the
+thing you searched for and hand it back.
+
+Searches are bounded on five axes — matches, files walked, per-file size, output
+bytes, and wall clock — and a search that stops early says which cap it hit and
+how to narrow it, the way a partial read names the read that continues it.
+`--confirm-reads` covers searches as well as reads; a search has no flag of its
+own, since a modal showing a *pattern* tells you less than one showing a path.
 
 `<ai-harness-fetch>` is auto-approved on the same reasoning — an agent that
 wants to check three documentation pages should not interrupt you three times —
@@ -226,6 +274,7 @@ escapes are covered too.
 | Writes | Confined to the working-directory subtree, plus the package-manager caches |
 | Shell reads | Open, minus `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.cargo/credentials.toml`, Keychains, `.env` |
 | `<ai-harness-read>` | Working-directory subtree only, minus the same denylist |
+| `<ai-harness-grep>` / `<ai-harness-glob>` | The same, checked per entry; symlinks never followed; build and dependency directories skipped |
 | `<ai-harness-fetch>` | Public https hosts only; never this machine or this network |
 | Network | Allowed — the approval prompt is the control point |
 | Timeout | 30s by default, killing the whole process group |
@@ -500,8 +549,9 @@ money precisely when it is going wrong.
 
 Other flags: `--workdir` sets the sandbox root (default: cwd),
 `--command-timeout` the per-command limit in seconds, `--max-iterations` and
-`--max-turn-bytes` the agentic loop bounds, `--confirm-reads` puts file reads behind the approval modal
-along with everything else, and `--confirm-fetch` does the same for URL fetches.
+`--max-turn-bytes` the agentic loop bounds, `--confirm-reads` puts file reads and
+searches behind the approval modal along with everything else, and
+`--confirm-fetch` does the same for URL fetches.
 `--auto-approve` goes the other way and removes the modal entirely — read
 [Sandboxing](#sandboxing) before using it. Every flag also has an environment
 variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
@@ -604,6 +654,7 @@ than squeezing the conversation out of view.
 | `src/sandbox.rs` | Seatbelt profile generation and the sandboxed command |
 | `src/exec.rs` | Running commands: streamed output, idle timeout, output caps |
 | `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
+| `src/search.rs` | The confined tree walk behind `<ai-harness-grep>` and `<ai-harness-glob>` |
 | `src/fetch.rs` | URL policy, fetching, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/diff.rs` | Line-by-line diffs of writes and edits, bounded for storage |
 | `src/highlight.rs` | Language detection and tokenising for code blocks |

@@ -12,11 +12,14 @@ mod markdown;
 mod openrouter;
 mod protocol;
 mod sandbox;
+mod search;
 mod session;
 mod tui;
 mod ui;
 mod wrap;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -55,6 +58,9 @@ enum Update {
     /// A URL fetch finished. Refusals and HTTP errors arrive as a `FetchOutcome`
     /// carrying the reason, so `Err` here means the request never started.
     Fetch(Box<FetchOutcome>),
+    /// A grep or glob finished. Like a fetch, every failure mode is carried in
+    /// the outcome, so there is no `Err` arm to handle.
+    Search(Box<search::SearchOutcome>),
     /// The model catalog arrived, or the reason it did not. Unlike every other
     /// update this belongs to no turn — see [`handle_update`].
     Models(Result<Vec<openrouter::ModelInfo>, String>),
@@ -256,6 +262,8 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
                 None => {
                     if let Some(url) = app.take_pending_fetch() {
                         spawn_fetch(app, ctx, inflight, url);
+                    } else if let Some(request) = app.take_pending_search() {
+                        spawn_search(app, ctx, inflight, request);
                     // Under `--auto-approve` the modal is skipped: the app still
                     // parked a `Pending` exactly as it always does, and the
                     // decision to act on it is made here. `else if` rather than a
@@ -307,6 +315,13 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
         Update::Fetch(outcome) => {
             *inflight = None;
             let messages = app.push_fetch_result(*outcome);
+            spawn_request(app, ctx, inflight, messages);
+        }
+        // A search does the same: a bad pattern or an unreachable directory is
+        // an outcome the model can act on, not a failed turn.
+        Update::Search(outcome) => {
+            *inflight = None;
+            let messages = app.push_search_result(*outcome);
             spawn_request(app, ctx, inflight, messages);
         }
     }
@@ -484,6 +499,37 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
             spawn_fetch(app, ctx, inflight, url);
             return;
         }
+        // Only reachable under `--confirm-reads`, like a read — but unlike one,
+        // a search is spawned rather than run inline, since a walk is unbounded
+        // work and would stall the event loop.
+        Action::Grep { pattern, dir, glob } => {
+            spawn_search(
+                app,
+                ctx,
+                inflight,
+                search::Request {
+                    kind: search::SearchKind::Grep,
+                    pattern,
+                    dir,
+                    glob,
+                },
+            );
+            return;
+        }
+        Action::Glob { pattern, dir } => {
+            spawn_search(
+                app,
+                ctx,
+                inflight,
+                search::Request {
+                    kind: search::SearchKind::Glob,
+                    pattern,
+                    dir,
+                    glob: None,
+                },
+            );
+            return;
+        }
         other => other,
     };
 
@@ -512,11 +558,14 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
                     .map_err(|e| format!("{e:#}")),
             ),
             // A Response is never approvable, a question waits in
-            // `AwaitingChoice` rather than becoming pending, a Read and a Fetch
-            // were handled above, a Shell was handled just now, and an Edit is
-            // converted to a Write by `approve`, so none are reachable.
+            // `AwaitingChoice` rather than becoming pending, a Read, a Fetch and
+            // the two searches were handled above, a Shell was handled just now,
+            // and an Edit is converted to a Write by `approve`, so none are
+            // reachable.
             Action::Shell(_)
             | Action::Read { .. }
+            | Action::Grep { .. }
+            | Action::Glob { .. }
             | Action::Fetch { .. }
             | Action::Edit { .. }
             | Action::Options { .. }
@@ -873,6 +922,56 @@ fn spawn_fetch(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: S
             .send(Tagged {
                 generation,
                 update: Update::Fetch(Box::new(outcome)),
+            })
+            .await;
+    });
+    *inflight = Some(InFlight::new(cancel_tx));
+}
+
+/// Search the working directory in the background.
+///
+/// Shared by the automatic path and the `--confirm-reads` approval path. Two
+/// things keep this off the inline route a read takes: it is unbounded work,
+/// where a read is capped at 64 KB of one file, and it is *blocking*
+/// filesystem work, which on a runtime worker would stall the redraw and `Esc`
+/// along with it. Hence `spawn_blocking`.
+///
+/// A blocking task cannot be aborted, only asked to stop, so cancellation is
+/// cooperative: the flag is set and the walk notices at its next directory
+/// entry. Even if it finished first, the generation tag would see the result
+/// dropped as stale.
+fn spawn_search(
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    request: search::Request,
+) {
+    let generation = app.next_generation();
+    let sandbox = ctx.sandbox.clone();
+    let tx = ctx.tx.clone();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+
+    tokio::spawn(async move {
+        let job = tokio::task::spawn_blocking(move || search::run(&sandbox, &request, &stop));
+        tokio::pin!(job);
+        let outcome = tokio::select! {
+            done = &mut job => match done {
+                Ok(outcome) => outcome,
+                // A panicked walk has nothing to report; the turn ends when the
+                // user cancels or asks again.
+                Err(_) => return,
+            },
+            _ = cancel_rx => {
+                flag.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let _ = tx
+            .send(Tagged {
+                generation,
+                update: Update::Search(Box::new(outcome)),
             })
             .await;
     });

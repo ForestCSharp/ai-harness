@@ -50,8 +50,14 @@ pub struct Args {
     #[arg(long, default_value_t = 512 * 1024, env = "AI_HARNESS_MAX_TURN_BYTES")]
     pub max_turn_bytes: usize,
 
-    /// Ask before each file read. Off by default: a read mutates nothing and
-    /// cannot leave the working directory, so it runs without interrupting you.
+    /// Ask before each file read or search. Off by default: none of the three
+    /// mutates anything or leaves the working directory, so they run without
+    /// interrupting you.
+    ///
+    /// Searches share this flag rather than taking their own. The meaning is
+    /// "ask before auto-approved local filesystem access", and a search is that
+    /// — but a search modal would also tell you *less* than a read's: it can
+    /// show the pattern, not which files the pattern will open.
     #[arg(long, env = "AI_HARNESS_CONFIRM_READS")]
     pub confirm_reads: bool,
 
@@ -180,6 +186,18 @@ mod tests {
             chosen.sessions_dir(Path::new("/projects/thing")),
             PathBuf::from("/tmp/elsewhere"),
             "the escape hatch must not be re-rooted"
+        );
+    }
+
+    /// Searches deliberately share `--confirm-reads` rather than taking a flag
+    /// of their own; this records that as a decision rather than an oversight.
+    #[test]
+    fn one_flag_covers_every_auto_approved_filesystem_action() {
+        assert!(!args(&[]).confirm_reads);
+        assert!(args(&["--confirm-reads"]).confirm_reads);
+        assert!(
+            Args::try_parse_from(["ai-harness", "--confirm-search"]).is_err(),
+            "a separate search flag would be a surface nobody finds"
         );
     }
 

@@ -185,7 +185,31 @@ the exact follow-up read. That matters more than it looks: the note it replaced
 said only that the file was longer, which left the model with no better move than
 to read the identical head again — measured at 25% of one real session's context.
 
-**(e) `<ai-harness-fetch>`** — the model wants to read a web page. Also
+**(e) `<ai-harness-grep>` / `<ai-harness-glob>`** — the model wants to find
+something. Auto-approved on the read's reasoning, but dispatched on the fetch's:
+the walk is parked in `App.pending_search` and `handle_update` spawns it via
+`take_pending_search`. Two reasons it cannot take the read's inline shortcut.
+It is *unbounded* work where a read is capped at 64 KB of one file, and it is
+*blocking* filesystem work, which on a runtime worker would freeze the redraw and
+`Esc` along with it — so `spawn_search` puts it on `spawn_blocking`. A blocking
+task cannot be aborted, only asked to stop, so cancellation is an `AtomicBool`
+the walk polls per directory entry; the generation tag catches the race where it
+finishes anyway.
+
+Confinement is the read's, applied per entry rather than once. `files::resolve`
+handles a `dir=`, and then every file and directory the walk touches is checked
+against `Sandbox::denies_read` — a glob of `**/*` that consulted the denylist
+only for its starting point would list `.env`. Symlinks are never followed,
+which closes escaping the root, double-reporting, and `a -> .` looping in one
+rule, and leaves every assembled path canonical, which is what `denies_read`
+expects. A hardcoded skip list keeps the walk out of `target/` and friends; it
+is a cost heuristic, not part of the boundary.
+
+Both share one `SearchOutcome` and one `Entry::SearchResult`, because a glob is
+a grep with the line dimension removed — two types would have doubled four
+exhaustive matches to save an `Option<usize>`.
+
+**(f) `<ai-harness-fetch>`** — the model wants to read a web page. Also
 auto-approved, but it cannot take the read's shortcut: it is network I/O, so it
 needs exactly the task spawning and generation tagging a read avoids. The
 dispatch therefore parks the URL in `App.pending_fetch` and returns `None`,
@@ -378,6 +402,7 @@ cannot be run.
 | `src/openrouter.rs` | `open_stream` and SSE framing |
 | `src/exec.rs` / `src/sandbox.rs` | Sandboxed command execution |
 | `src/files.rs` | Path resolution and bounded reads for `<ai-harness-read>` |
+| `src/search.rs` | The confined tree walk behind `<ai-harness-grep>` and `<ai-harness-glob>` |
 | `src/diff.rs` | Line-by-line diffs of a write or edit, bounded for storage |
 | `src/highlight.rs` | Language detection and per-line tokenising for code blocks |
 | `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |

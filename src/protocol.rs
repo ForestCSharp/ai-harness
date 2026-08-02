@@ -38,6 +38,11 @@ pub const SHELL_TAG: &str = "ai-harness-shell";
 pub const RESPONSE_TAG: &str = "ai-harness-response";
 /// A file read. Non-mutating, so it runs without the approval modal.
 pub const READ_TAG: &str = "ai-harness-read";
+/// A content search. Non-mutating and confined like a read, so it runs without
+/// the approval modal; see [`crate::search`].
+pub const GREP_TAG: &str = "ai-harness-grep";
+/// A filename search. The find half of the pair [`GREP_TAG`] completes.
+pub const GLOB_TAG: &str = "ai-harness-glob";
 /// A URL fetch. Like a read, it runs without the approval modal; what bounds it
 /// is the destination policy in [`crate::fetch`] rather than a filesystem root.
 pub const FETCH_TAG: &str = "ai-harness-fetch";
@@ -63,6 +68,11 @@ pub const FILE_ATTR: &str = "file";
 pub const OFFSET_ATTR: &str = "offset";
 /// How many lines a read returns. Optional; as many as fit without it.
 pub const LIMIT_ATTR: &str = "limit";
+/// The subtree a search is confined to. Optional; the whole working directory
+/// without it.
+pub const DIR_ATTR: &str = "dir";
+/// A filename filter on a grep, e.g. `glob="*.rs"`. Optional.
+pub const GLOB_ATTR: &str = "glob";
 
 /// Harness → model only. Carries the outcome of a shell action; never parsed.
 pub const RESULT_TAG: &str = "ai-harness-shell-result";
@@ -70,6 +80,10 @@ pub const RESULT_TAG: &str = "ai-harness-shell-result";
 pub const WRITE_RESULT_TAG: &str = "ai-harness-write-result";
 /// Harness → model only. Carries the contents of a file read; never parsed.
 pub const READ_RESULT_TAG: &str = "ai-harness-read-result";
+/// Harness → model only. Carries the matches from a content search; never parsed.
+pub const GREP_RESULT_TAG: &str = "ai-harness-grep-result";
+/// Harness → model only. Carries the paths from a filename search; never parsed.
+pub const GLOB_RESULT_TAG: &str = "ai-harness-glob-result";
 /// Harness → model only. Carries the text of a fetched page; never parsed.
 pub const FETCH_RESULT_TAG: &str = "ai-harness-fetch-result";
 /// Harness → model only. Carries the user's answer to an option; never parsed.
@@ -79,8 +93,10 @@ pub const OPTION_RESULT_TAG: &str = "ai-harness-option-result";
 /// children ([`OLD_TAG`], [`NEW_TAG`], and the option children) are not here:
 /// they are only valid nested inside their parent, so at the top level they are
 /// correctly rejected as unknown.
-const REPLY_TAGS: [&str; 7] = [
+const REPLY_TAGS: [&str; 9] = [
     READ_TAG,
+    GREP_TAG,
+    GLOB_TAG,
     FETCH_TAG,
     SHELL_TAG,
     WRITE_TAG,
@@ -96,10 +112,12 @@ const REPLY_TAGS: [&str; 7] = [
 /// [`OPTION_RESULT_TAG`] belongs here most of all: it is the one result whose
 /// content comes from a person, so a model writing its own would not be
 /// inventing a machine's output but putting words in the user's mouth.
-const RESULT_TAGS: [&str; 5] = [
+const RESULT_TAGS: [&str; 7] = [
     RESULT_TAG,
     WRITE_RESULT_TAG,
     READ_RESULT_TAG,
+    GREP_RESULT_TAG,
+    GLOB_RESULT_TAG,
     FETCH_RESULT_TAG,
     OPTION_RESULT_TAG,
 ];
@@ -120,6 +138,25 @@ pub enum Action {
         offset: Option<usize>,
         #[serde(default)]
         limit: Option<usize>,
+    },
+    /// Files whose contents match a regex. Runs without approval; see
+    /// [`crate::search`].
+    ///
+    /// The scope is optional, and `serde(default)` for the same reason a read's
+    /// window is: a session written before searches existed has neither.
+    Grep {
+        pattern: String,
+        #[serde(default)]
+        dir: Option<String>,
+        #[serde(default)]
+        glob: Option<String>,
+    },
+    /// Files whose paths match a glob. Runs without approval; see
+    /// [`crate::search`].
+    Glob {
+        pattern: String,
+        #[serde(default)]
+        dir: Option<String>,
     },
     /// A URL the model wants to read. Runs without approval; see [`crate::fetch`].
     Fetch { url: String },
@@ -151,6 +188,7 @@ impl Action {
         match self {
             Self::Shell(s) | Self::Response(s) => s,
             Self::Read { path, .. } => path,
+            Self::Grep { pattern, .. } | Self::Glob { pattern, .. } => pattern,
             Self::Fetch { url } => url,
             Self::Write { contents, .. } => contents,
             Self::Edit { old, .. } => old,
@@ -169,6 +207,20 @@ pub fn read_label(path: &str, offset: Option<usize>, limit: Option<usize>) -> St
         (None, Some(limit)) => format!("{path}  first {limit} line(s)"),
         (Some(from), Some(limit)) => format!("{path}  lines {from}-{}", from + limit - 1),
     }
+}
+
+/// How a search names itself on screen: the pattern, and the scope when it has
+/// one. Shared by the approval modal, the transcript, and the denial notice, so
+/// a scoped search is never displayed as though it swept the whole tree.
+pub fn search_label(pattern: &str, dir: Option<&str>, glob: Option<&str>) -> String {
+    let mut label = pattern.to_string();
+    if let Some(dir) = dir {
+        label.push_str(&format!("  in {dir}"));
+    }
+    if let Some(glob) = glob {
+        label.push_str(&format!("  matching {glob}"));
+    }
+    label
 }
 
 /// The reply tags, phrased for an error message: `<a>, <b>, or <c>`.
@@ -190,6 +242,8 @@ fn did_not_happen(tag: &str) -> &'static str {
     match tag {
         FETCH_RESULT_TAG => "that fetch did not happen",
         READ_RESULT_TAG => "that file was not read",
+        GREP_RESULT_TAG => "that search did not run",
+        GLOB_RESULT_TAG => "that file listing did not happen",
         WRITE_RESULT_TAG => "that write did not happen",
         _ => "that command did not run",
     }
@@ -523,6 +577,110 @@ pub fn encode_read_result(outcome: &crate::files::ReadOutcome) -> String {
     format!("<{READ_RESULT_TAG}>\n{body}</{READ_RESULT_TAG}>")
 }
 
+/// Hand the results of a search back to the model.
+///
+/// Matches are given as `path:line: text`, which is what `rg -n` prints — the
+/// shape a model has seen most — and the path is root-relative so it drops
+/// straight into an `<ai-harness-read>` without translation.
+pub fn encode_search_result(outcome: &crate::search::SearchOutcome) -> String {
+    use crate::search::SearchKind;
+
+    let tag = match outcome.kind {
+        SearchKind::Grep => GREP_RESULT_TAG,
+        SearchKind::Glob => GLOB_RESULT_TAG,
+    };
+    let body = match &outcome.error {
+        Some(message) => format!(
+            "status: {} for {} failed: {message}\n",
+            outcome.kind.label(),
+            outcome.pattern
+        ),
+        None => {
+            let mut body = format!("pattern: {}\n", outcome.pattern);
+            if let Some(scope) = scope_line(outcome) {
+                body.push_str(&format!("{scope}\n"));
+            }
+            match outcome.kind {
+                SearchKind::Grep => body.push_str(&format!(
+                    "files: {} matched of {} scanned\n",
+                    outcome.files_matched, outcome.files_scanned
+                )),
+                SearchKind::Glob => body.push_str(&format!("files: {}\n", outcome.hits.len())),
+            }
+            for note in search_notes(outcome) {
+                body.push_str(&format!("note: {note}\n"));
+            }
+            let section = match outcome.kind {
+                SearchKind::Grep => "matches",
+                SearchKind::Glob => "paths",
+            };
+            if outcome.hits.is_empty() {
+                // Saying "none" rather than leaving the section empty: silence
+                // is the one answer a model is likely to read as breakage.
+                body.push_str(&format!("{section}: none\n"));
+            } else {
+                body.push_str(&format!("{section}:\n"));
+                body.push_str(&outcome.preview());
+            }
+            body
+        }
+    };
+    format!("<{tag}>\n{body}</{tag}>")
+}
+
+/// The `scope:` line, when a search was given one to report.
+fn scope_line(outcome: &crate::search::SearchOutcome) -> Option<String> {
+    match (&outcome.dir, &outcome.glob) {
+        (None, None) => None,
+        (Some(dir), None) => Some(format!("scope: {dir}")),
+        (None, Some(glob)) => Some(format!("glob: {glob}")),
+        (Some(dir), Some(glob)) => Some(format!("scope: {dir}, glob: {glob}")),
+    }
+}
+
+/// What the model needs told about a search that did not run to completion.
+///
+/// Each names the move that follows, the way a read's continuation note names
+/// the exact next read. "There is more" on its own is a dead end.
+fn search_notes(outcome: &crate::search::SearchOutcome) -> Vec<String> {
+    use crate::search::{Capped, SearchKind};
+
+    let mut notes = Vec::new();
+    let element = match outcome.kind {
+        SearchKind::Grep => GREP_TAG,
+        SearchKind::Glob => GLOB_TAG,
+    };
+    match outcome.capped {
+        Some(Capped::Matches) => notes.push(format!(
+            "stopped at the first {} result(s); there are more. Narrow the pattern, \
+             or scope it with <{element} {DIR_ATTR}=src/…>pattern</{element}>.",
+            outcome.hits.len()
+        )),
+        Some(Capped::Entries) => notes.push(format!(
+            "stopped after walking {} directory entries; the tree is larger than one \
+             search covers. Scope it with {DIR_ATTR}=.",
+            crate::search::MAX_ENTRIES
+        )),
+        Some(Capped::Bytes) => notes.push(format!(
+            "stopped at the output size limit; these results are partial. Narrow the \
+             pattern or scope it with {DIR_ATTR}=."
+        )),
+        Some(Capped::Time) => notes.push(format!(
+            "stopped after {} seconds; these results are partial. Scope it with {DIR_ATTR}=.",
+            crate::search::MAX_SEARCH_TIME.as_secs()
+        )),
+        None => {}
+    }
+    if outcome.files_skipped > 0 {
+        notes.push(format!(
+            "{} file(s) were skipped as binary or over {} MB.",
+            outcome.files_skipped,
+            crate::search::MAX_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    notes
+}
+
 /// Hand the text of a fetched page back to the model.
 ///
 /// The note about untrusted content is not decoration. This is the one result
@@ -627,6 +785,8 @@ pub fn encode_correction(error: &ProtocolError) -> String {
          '>'. Use <{READ_TAG}>path</{READ_TAG}> to read a file (optionally \
          <{READ_TAG} {OFFSET_ATTR}=1 {LIMIT_ATTR}=100>path</{READ_TAG}> for a \
          line window), \
+         <{GREP_TAG}>regex</{GREP_TAG}> to search file contents, \
+         <{GLOB_TAG}>**/*.rs</{GLOB_TAG}> to find files by name, \
          <{FETCH_TAG}>https://…</{FETCH_TAG}> to read a web page, \
          <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, \
          <{WRITE_TAG} file=path>…</{WRITE_TAG}> to write a whole file, \
@@ -712,11 +872,18 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
     } else {
         (None, None)
     };
+    // A search's scope, read the same way. Infallible, unlike a read's window:
+    // there is no `dir=` value that is *syntactically* wrong, and where it
+    // points is `files::resolve`'s business rather than the parser's. Keeping
+    // it infallible is what lets `BadAttributeValue`'s message stay about
+    // `offset=`, which it names outright.
+    let scope = parse_search_scope(tag, attrs);
     let takes_attrs = tag == WRITE_TAG
         || tag == EDIT_TAG
         // A read only "took" the attributes if they parsed as its window;
         // anything else it carries is still an error.
-        || (tag == READ_TAG && read_window != (None, None));
+        || (tag == READ_TAG && read_window != (None, None))
+        || ((tag == GREP_TAG || tag == GLOB_TAG) && scope != (None, None));
     if !takes_attrs && !attrs.is_empty() {
         return Err(ProtocolError::UnexpectedAttribute {
             tag: tag.to_string(),
@@ -813,6 +980,18 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
                 limit,
             }
         }
+        GREP_TAG => {
+            let (dir, glob) = scope;
+            Action::Grep {
+                pattern: body.to_string(),
+                dir,
+                glob,
+            }
+        }
+        GLOB_TAG => Action::Glob {
+            pattern: body.to_string(),
+            dir: scope.0,
+        },
         FETCH_TAG => Action::Fetch {
             url: body.to_string(),
         },
@@ -874,6 +1053,26 @@ fn parse_read_window(attrs: &str) -> Result<(Option<usize>, Option<usize>), Prot
         }
     }
     Ok((window[0], window[1]))
+}
+
+/// Parse a search's `dir=` and, for a grep, `glob=`.
+///
+/// Deliberately infallible. A read's window has values that are wrong on their
+/// face — `offset=0`, `limit=abc` — so it reports them. A scope has none: any
+/// string is a syntactically valid path or glob, and whether it resolves is
+/// settled later by [`crate::files::resolve`] and [`crate::search`], whose
+/// messages can name the actual problem. Returning nothing here also keeps
+/// [`ProtocolError::BadAttributeValue`] honest, since its text explains itself
+/// in terms of `offset=`.
+fn parse_search_scope(tag: &str, attrs: &str) -> (Option<String>, Option<String>) {
+    match tag {
+        GREP_TAG => (
+            parse_attribute(attrs, DIR_ATTR),
+            parse_attribute(attrs, GLOB_ATTR),
+        ),
+        GLOB_TAG => (parse_attribute(attrs, DIR_ATTR), None),
+        _ => (None, None),
+    }
 }
 
 /// Strip the single formatting newline a model puts right after `>` when it
@@ -1049,22 +1248,40 @@ a file whose result said there was more. A whole-file read of something large \
 costs you context you will need later, and every read stays in the conversation \
 for the rest of the session.
 
-2. Read a web page. Prefer this over curl or wget — it returns the page as text
+2. Search file contents. The body is a regular expression:
+
+<{GREP_TAG}>fn parse_reply</{GREP_TAG}>
+
+Confine it to a subtree with `{DIR_ATTR}=` and to particular filenames with \
+`{GLOB_ATTR}=`; both are optional:
+
+<{GREP_TAG} {DIR_ATTR}=src {GLOB_ATTR}=\"*.rs\">(?i)todo</{GREP_TAG}>
+
+Search first, then read. Grepping for a symbol and reading the window around \
+the hit costs a fraction of reading whole files to work out where something \
+lives. Start the pattern with `(?i)` to make it case-insensitive.
+
+3. Find files by name. The body is a glob — `*` matches within one path \
+segment, `**` across segments, `?` is one character:
+
+<{GLOB_TAG}>**/*.rs</{GLOB_TAG}>
+
+4. Read a web page. Prefer this over curl or wget — it returns the page as text
 rather than raw HTML, and needs no approval:
 
 <{FETCH_TAG}>https://example.com/docs</{FETCH_TAG}>
 
-3. Run a shell command. Use this to gather information or take action:
+5. Run a shell command. Use this to gather information or take action:
 
 <{SHELL_TAG}>the command to run</{SHELL_TAG}>
 
-4. Write a whole file. Use this only for a new file or a full rewrite:
+6. Write a whole file. Use this only for a new file or a full rewrite:
 
 <{WRITE_TAG} file=path/to/file>
 the exact file contents
 </{WRITE_TAG}>
 
-5. Change part of an existing file. Prefer this over write for edits — it is far
+7. Change part of an existing file. Prefer this over write for edits — it is far
 cheaper than repeating the whole file, and it cannot accidentally drop the parts
 you did not mean to touch:
 
@@ -1077,7 +1294,7 @@ the text to put in its place
 </{NEW_TAG}>
 </{EDIT_TAG}>
 
-6. Ask the user a question, offering the answers to pick between:
+8. Ask the user a question, offering the answers to pick between:
 
 <{OPTION_TAG}>
 <{OPTION_QUESTION_TAG}>which database should the schema target?</{OPTION_QUESTION_TAG}>
@@ -1085,7 +1302,7 @@ the text to put in its place
 <{OPTION_CHOICE_TAG}>SQLite</{OPTION_CHOICE_TAG}>
 </{OPTION_TAG}>
 
-7. Give the user a final answer. This ends the current task:
+9. Give the user a final answer. This ends the current task:
 
 <{RESPONSE_TAG}>your answer to the user</{RESPONSE_TAG}>
 
@@ -1101,6 +1318,30 @@ contents:
 When the window does not reach the end, the result says so and names the read \
 that continues it. Follow that rather than re-reading the same file: reading it \
 again returns the same lines and costs the same context twice.
+
+After a grep, it sends the matching lines as path:line: text — paths are \
+relative to the working directory, so you can hand one straight to a read:
+
+<{GREP_RESULT_TAG}>
+pattern: fn parse_reply
+files: 1 matched of 19 scanned
+matches:
+src/protocol.rs:670: pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {{
+</{GREP_RESULT_TAG}>
+
+After a glob, it sends the paths alone:
+
+<{GLOB_RESULT_TAG}>
+pattern: **/*.rs
+files: 2
+paths:
+src/app.rs
+src/protocol.rs
+</{GLOB_RESULT_TAG}>
+
+'matches: none' or 'paths: none' means the search ran and found nothing — that \
+is an answer, not a failure. A search that stopped early says so in a note and \
+names how to narrow it; follow that rather than repeating the same search.
 
 After a fetch, it sends:
 
@@ -1157,10 +1398,13 @@ the user's call. The user may also answer with something you did not offer, or \
 dismiss the question entirely; the result says which happened, and a dismissal \
 means proceed without asking again rather than asking the same thing twice.
 
-<{READ_TAG}> and <{FETCH_TAG}> are the exceptions: they need no approval and \
-run immediately, so reading a file or a page costs the user nothing. Use them \
-freely to gather context, and read a file before changing it rather than \
-guessing at its contents.
+<{READ_TAG}>, <{GREP_TAG}>, <{GLOB_TAG}> and <{FETCH_TAG}> are the exceptions: \
+they need no approval and run immediately, so finding a file, reading one, or \
+reading a page costs the user nothing. Use them freely to gather context, and \
+read a file before changing it rather than guessing at its contents. Prefer \
+<{GREP_TAG}> over a <{SHELL_TAG}> running grep, rg, or find: the element needs \
+no approval, where the shell command would interrupt the user for the same \
+answer.
 
 Commands and writes run in a sandbox rooted at the working directory. Writing \
 outside that directory fails, and credential files such as .env and ~/.ssh are \
@@ -1168,6 +1412,13 @@ unreadable. <{READ_TAG}> is confined more tightly still: it reads only files \
 inside the working directory. To read something outside it, use <{SHELL_TAG}>, \
 which the user will be asked to approve. Treat those failures as expected, not \
 as something to work around.
+
+<{GREP_TAG}> and <{GLOB_TAG}> are confined exactly as <{READ_TAG}> is, and skip \
+some things besides: build and dependency directories such as .git, target, \
+node_modules, .venv, dist and build, along with files that are binary or larger \
+than 1 MB. So 'none' can mean either 'nothing matches' or 'it is somewhere the \
+search does not go' — if you have reason to think it is the second, use \
+<{SHELL_TAG}> to look there.
 
 <{FETCH_TAG}> reaches public https sites only. Plain http, other schemes, and \
 addresses on the local machine or network are refused, so it cannot be used to \
@@ -1191,11 +1442,19 @@ to the harness.
 you need several. Prefer non-interactive commands that terminate on their own.
 - A <{READ_TAG}> contains one file path and nothing else. One file per element. \
 It may carry {OFFSET_ATTR}= and {LIMIT_ATTR}=, each a whole number of 1 or more.
+- A <{GREP_TAG}> contains one regular expression and nothing else. It may carry \
+{DIR_ATTR}= and {GLOB_ATTR}=. Leading and trailing whitespace is stripped from \
+the body, so write \\s if you need to match a space at either end.
+- A <{GLOB_TAG}> contains one filename pattern and nothing else, and returns \
+paths rather than contents. It may carry {DIR_ATTR}=. Use <{GLOB_TAG}> to find \
+files and <{GREP_TAG}> to find text inside them.
 - A <{FETCH_TAG}> contains one absolute https URL and nothing else. One page per \
 element.
 - A <{WRITE_TAG}> must have a file=… path and contains the complete new file \
 contents (not a diff). <{WRITE_TAG}> and <{EDIT_TAG}> take the file= attribute; \
-<{READ_TAG}> takes {OFFSET_ATTR}= and {LIMIT_ATTR}=; no other tag takes any.
+<{READ_TAG}> takes {OFFSET_ATTR}= and {LIMIT_ATTR}=; <{GREP_TAG}> takes \
+{DIR_ATTR}= and {GLOB_ATTR}=; <{GLOB_TAG}> takes {DIR_ATTR}=; no other tag \
+takes any.
 - An <{EDIT_TAG}> must have a file=… path and contain a <{OLD_TAG}> then a \
 <{NEW_TAG}>, in that order and nothing else. The <{OLD_TAG}> text must appear \
 EXACTLY ONCE in the file, copied character-for-character — whitespace included — \
@@ -1250,7 +1509,9 @@ is enforced by the sandbox, not by convention: a <{WRITE_TAG}> or <{EDIT_TAG}> \
 aimed anywhere else is refused before it runs, and a <{SHELL_TAG}> that tries to \
 write — including anything that builds, installs, formats, or writes a temporary \
 file — fails. Commands that only look are fine and are how you should work: \
-listing, grepping, showing history. Prefer <{READ_TAG}> for files.
+listing, showing history. Prefer <{READ_TAG}> for files and <{GREP_TAG}>/\
+<{GLOB_TAG}> to find them — none of the three needs approval, so researching a \
+codebase in plan mode costs the user no keypresses at all.
 
 Research before you plan. Read the code the change touches rather than assuming \
 its shape, and use <{OPTION_TAG}> for what the code cannot tell you — which of \
@@ -1445,6 +1706,141 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parses_a_grep_with_no_attributes() {
+        assert_eq!(
+            parse_reply("<ai-harness-grep>fn parse_reply</ai-harness-grep>").unwrap(),
+            Action::Grep {
+                pattern: "fn parse_reply".into(),
+                dir: None,
+                glob: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_glob_with_no_attributes() {
+        assert_eq!(
+            parse_reply("<ai-harness-glob>**/*.rs</ai-harness-glob>").unwrap(),
+            Action::Glob {
+                pattern: "**/*.rs".into(),
+                dir: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_grep_takes_its_scope_in_either_order_and_alone() {
+        let cases = [
+            ("dir=src glob=*.rs", (Some("src"), Some("*.rs"))),
+            ("glob=*.rs dir=src", (Some("src"), Some("*.rs"))),
+            ("dir=src", (Some("src"), None)),
+            ("glob=*.rs", (None, Some("*.rs"))),
+        ];
+        for (attrs, (dir, glob)) in cases {
+            assert_eq!(
+                parse_reply(&format!(
+                    "<ai-harness-grep {attrs}>needle</ai-harness-grep>"
+                ))
+                .unwrap(),
+                Action::Grep {
+                    pattern: "needle".into(),
+                    dir: dir.map(str::to_string),
+                    glob: glob.map(str::to_string),
+                },
+                "attrs: {attrs}"
+            );
+        }
+    }
+
+    /// A glob pattern is full of characters a shell would eat, so the model will
+    /// reach for quotes and they have to come back off.
+    #[test]
+    fn a_quoted_glob_value_is_unquoted() {
+        assert_eq!(
+            parse_reply("<ai-harness-grep glob=\"*.rs\">needle</ai-harness-grep>").unwrap(),
+            Action::Grep {
+                pattern: "needle".into(),
+                dir: None,
+                glob: Some("*.rs".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_search_takes_no_attribute_but_its_own() {
+        for reply in [
+            "<ai-harness-grep file=x>y</ai-harness-grep>",
+            "<ai-harness-glob offset=2>y</ai-harness-glob>",
+            // `glob=` belongs to a grep; a glob's pattern is already its body.
+            "<ai-harness-glob glob=*.rs>y</ai-harness-glob>",
+        ] {
+            assert!(
+                matches!(
+                    parse_reply(reply).unwrap_err(),
+                    ProtocolError::UnexpectedAttribute { .. }
+                ),
+                "{reply}"
+            );
+        }
+    }
+
+    /// `BadAttributeValue` explains itself in terms of `offset=`, so a search
+    /// must never be able to raise it. Where a `dir=` points is settled by
+    /// `files::resolve` later, in wording that can name the real problem.
+    #[test]
+    fn a_search_scope_never_raises_a_bad_value_error() {
+        for reply in [
+            "<ai-harness-grep dir=0>x</ai-harness-grep>",
+            "<ai-harness-grep dir=../nope glob=>x</ai-harness-grep>",
+            "<ai-harness-glob dir=not/a/real/place>x</ai-harness-glob>",
+        ] {
+            assert!(
+                !matches!(
+                    parse_reply(reply),
+                    Err(ProtocolError::BadAttributeValue { .. })
+                ),
+                "{reply} must not be rejected with a read's window wording"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_search_body_is_rejected() {
+        for tag in [GREP_TAG, GLOB_TAG] {
+            assert!(
+                matches!(
+                    parse_reply(&format!("<{tag}></{tag}>")).unwrap_err(),
+                    ProtocolError::EmptyBody { .. }
+                ),
+                "{tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fabricated_search_result_is_named_as_such() {
+        for tag in [GREP_RESULT_TAG, GLOB_RESULT_TAG] {
+            let raw = format!("<{tag}>\nmatches:\nsrc/a.rs:1: invented\n</{tag}>");
+            assert!(
+                matches!(
+                    parse_reply(&raw).unwrap_err(),
+                    ProtocolError::FabricatedResult { .. }
+                ),
+                "{tag}"
+            );
+            // And the fiction must not survive into the correction we send back.
+            assert!(!elide_results(&raw).contains("invented"), "{tag}");
+        }
+    }
+
+    #[test]
+    fn both_search_tags_are_offered_when_a_reply_is_unrecognised() {
+        let expected = expected_tags();
+        assert!(expected.contains(GREP_TAG), "{expected}");
+        assert!(expected.contains(GLOB_TAG), "{expected}");
+    }
+
     /// Lines count from 1, so 0 is a mistake worth one correction rather than a
     /// silently different window that looks like it worked.
     #[test]
@@ -1504,6 +1900,127 @@ mod tests {
         let outcome = crate::files::ReadOutcome::failed("secret.txt", "no such file");
         let encoded = encode_read_result(&outcome);
         assert!(encoded.contains("status: read of secret.txt failed: no such file"));
+    }
+
+    /// A `SearchOutcome` built by hand, so the encoder can be tested without a
+    /// filesystem — the walk itself is covered in `crate::search`.
+    fn search_outcome(
+        kind: crate::search::SearchKind,
+        hits: Vec<crate::search::Hit>,
+    ) -> crate::search::SearchOutcome {
+        crate::search::SearchOutcome {
+            kind,
+            pattern: "fn parse_reply".into(),
+            dir: None,
+            glob: None,
+            files_matched: if hits.is_empty() { 0 } else { 1 },
+            files_scanned: 19,
+            files_skipped: 0,
+            capped: None,
+            error: None,
+            hits,
+        }
+    }
+
+    #[test]
+    fn a_grep_result_carries_its_matches_as_path_line_text() {
+        let outcome = search_outcome(
+            crate::search::SearchKind::Grep,
+            vec![crate::search::Hit {
+                path: "src/protocol.rs".into(),
+                line: Some(670),
+                text: "pub fn parse_reply(raw: &str) {".into(),
+            }],
+        );
+        let encoded = encode_search_result(&outcome);
+        assert!(encoded.starts_with("<ai-harness-grep-result>"), "{encoded}");
+        assert!(encoded.ends_with("</ai-harness-grep-result>"), "{encoded}");
+        assert!(encoded.contains("pattern: fn parse_reply"), "{encoded}");
+        assert!(
+            encoded.contains("files: 1 matched of 19 scanned"),
+            "{encoded}"
+        );
+        // The `rg -n` shape, and a path a read can be handed directly.
+        assert!(
+            encoded.contains("src/protocol.rs:670: pub fn parse_reply(raw: &str) {"),
+            "{encoded}"
+        );
+    }
+
+    #[test]
+    fn a_glob_result_carries_paths_without_lines() {
+        let mut outcome = search_outcome(
+            crate::search::SearchKind::Glob,
+            vec![crate::search::Hit {
+                path: "src/app.rs".into(),
+                line: None,
+                text: String::new(),
+            }],
+        );
+        outcome.pattern = "**/*.rs".into();
+        let encoded = encode_search_result(&outcome);
+        assert!(encoded.starts_with("<ai-harness-glob-result>"), "{encoded}");
+        assert!(encoded.contains("files: 1"), "{encoded}");
+        assert!(encoded.contains("paths:\nsrc/app.rs"), "{encoded}");
+        assert!(!encoded.contains("scanned"), "a glob has nothing to scan");
+    }
+
+    /// Silence is the one answer a model is likely to read as breakage.
+    #[test]
+    fn a_search_with_no_hits_says_none_rather_than_nothing() {
+        let grep = encode_search_result(&search_outcome(crate::search::SearchKind::Grep, vec![]));
+        assert!(grep.contains("matches: none"), "{grep}");
+        let glob = encode_search_result(&search_outcome(crate::search::SearchKind::Glob, vec![]));
+        assert!(glob.contains("paths: none"), "{glob}");
+    }
+
+    #[test]
+    fn a_scoped_search_reports_its_scope() {
+        let mut outcome = search_outcome(crate::search::SearchKind::Grep, vec![]);
+        outcome.dir = Some("src".into());
+        outcome.glob = Some("*.rs".into());
+        assert!(
+            encode_search_result(&outcome).contains("scope: src, glob: *.rs"),
+            "{}",
+            encode_search_result(&outcome)
+        );
+        // An unscoped search has no scope line to print.
+        let plain = encode_search_result(&search_outcome(crate::search::SearchKind::Grep, vec![]));
+        assert!(!plain.contains("scope:"), "{plain}");
+    }
+
+    /// A note saying only "there is more" is a dead end. Each one has to name
+    /// the move that follows, the way a read's continuation names the next read.
+    #[test]
+    fn a_capped_search_names_how_to_narrow_it() {
+        let mut outcome = search_outcome(crate::search::SearchKind::Grep, vec![]);
+        outcome.capped = Some(crate::search::Capped::Matches);
+        let encoded = encode_search_result(&outcome);
+        assert!(encoded.contains("note: stopped at the first"), "{encoded}");
+        assert!(encoded.contains(DIR_ATTR), "{encoded}");
+    }
+
+    #[test]
+    fn skipped_files_are_reported_so_none_is_not_misread() {
+        let mut outcome = search_outcome(crate::search::SearchKind::Grep, vec![]);
+        outcome.files_skipped = 12;
+        assert!(
+            encode_search_result(&outcome).contains("note: 12 file(s) were skipped"),
+            "{}",
+            encode_search_result(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_failed_search_reports_status_rather_than_matches() {
+        let request = crate::search::Request::grep("fn (");
+        let outcome = crate::search::SearchOutcome::failed(&request, "unclosed group");
+        let encoded = encode_search_result(&outcome);
+        assert!(
+            encoded.contains("status: grep for fn ( failed: unclosed group"),
+            "{encoded}"
+        );
+        assert!(!encoded.contains("matches:"), "{encoded}");
     }
 
     /// A clipped window must not be a dead end: the result has to name the read
@@ -2433,6 +2950,29 @@ mod tests {
                     path: "path/to/file".into(),
                     offset: Some(200),
                     limit: Some(100),
+                },
+            ),
+            (
+                format!("<{GREP_TAG}>fn parse_reply</{GREP_TAG}>"),
+                Action::Grep {
+                    pattern: "fn parse_reply".into(),
+                    dir: None,
+                    glob: None,
+                },
+            ),
+            (
+                format!("<{GREP_TAG} {DIR_ATTR}=src {GLOB_ATTR}=\"*.rs\">(?i)todo</{GREP_TAG}>"),
+                Action::Grep {
+                    pattern: "(?i)todo".into(),
+                    dir: Some("src".into()),
+                    glob: Some("*.rs".into()),
+                },
+            ),
+            (
+                format!("<{GLOB_TAG}>**/*.rs</{GLOB_TAG}>"),
+                Action::Glob {
+                    pattern: "**/*.rs".into(),
+                    dir: None,
                 },
             ),
             (
