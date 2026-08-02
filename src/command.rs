@@ -26,6 +26,8 @@ pub enum Command {
     Fork(Option<String>),
     /// Report cumulative token spend for the session.
     Cost,
+    /// Choose the model; `None` opens the picker, `Some` sets it by id.
+    Model(Option<String>),
     /// Something starting with `/` that we do not recognise. Reported to the
     /// user rather than forwarded — silently sending a typo'd command to the
     /// model is the worst available outcome.
@@ -72,6 +74,7 @@ pub fn parse(input: &str) -> Input {
         "rename" => Command::Rename(arg),
         "fork" => Command::Fork(arg),
         "cost" | "tokens" => Command::Cost,
+        "model" => Command::Model(arg),
         // A bare "/" has no name; report it the same way as any unknown.
         _ => Command::Unknown(name.to_string()),
     })
@@ -124,6 +127,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "cost",
         description: "show cumulative tokens and estimated spend",
+    },
+    Spec {
+        name: "model",
+        description: "choose the model (/model to browse, /model <id> to set)",
     },
     Spec {
         name: "help",

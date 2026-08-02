@@ -347,6 +347,20 @@ UI back into `Streaming`, or a late reply would commit to an abandoned turn.
 Inside the approval modal, `Esc` keeps its existing meaning — **Deny** — which
 refuses the command and continues the loop rather than abandoning the turn.
 
+### The one update that is not part of a turn
+
+The model catalog behind `/model` is fetched once at startup by
+`spawn_catalog_fetch` and arrives as `Update::Models`. It sets no `InFlight`, so
+`Esc` cannot cancel it, bumps no generation, so it cannot invalidate a turn, and
+is exempt from the staleness check above — it is tagged with generation 0 and
+applies whenever it lands. Every other update belongs to a turn; this one belongs
+to the process.
+
+The chosen model rides on the request rather than on the client: `spawn_request`
+builds each request with `ctx.client.with_model(&app.model)`, so `App::model` is
+the single source of truth and can change mid-session. It is saved with the
+session, and `App::apply_session` adopts it on load.
+
 ## The one caveat that shapes everything
 
 Because `parse_reply` is strict and whole-reply, **streaming is display-only**.

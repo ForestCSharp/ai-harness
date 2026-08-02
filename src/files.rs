@@ -236,7 +236,12 @@ pub fn resolve_target(sandbox: &Sandbox, path: &str) -> Result<PathBuf, String> 
 ///
 /// Every failure mode comes back as a `ReadOutcome` carrying an error the model
 /// can act on, so a bad path costs a round-trip rather than ending the turn.
-pub fn read(sandbox: &Sandbox, path: &str, offset: Option<usize>, limit: Option<usize>) -> ReadOutcome {
+pub fn read(
+    sandbox: &Sandbox,
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> ReadOutcome {
     let resolved = match resolve(sandbox, path) {
         Ok(resolved) => resolved,
         Err(error) => return ReadOutcome::failed(path, error),
@@ -454,7 +459,10 @@ mod tests {
         let (sandbox, dir) = sandbox_in("subdir");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
-        assert_eq!(read(&sandbox, "src/main.rs", None, None).contents, "fn main() {}");
+        assert_eq!(
+            read(&sandbox, "src/main.rs", None, None).contents,
+            "fn main() {}"
+        );
     }
 
     #[test]

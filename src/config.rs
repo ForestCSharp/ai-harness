@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-pub const DEFAULT_MODEL: &str = "z-ai/glm-5.2";
+pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-pro";
 
 /// Everything the harness keeps for a project, under its working directory.
 /// Sessions live here today; per-session plans and the like will join them.
@@ -19,7 +19,7 @@ pub const HARNESS_DIR: &str = ".ai_harness";
     about = "A terminal harness for chatting with models via OpenRouter"
 )]
 pub struct Args {
-    /// OpenRouter model slug, e.g. `z-ai/glm-5.2` or `anthropic/claude-sonnet-4.5`.
+    /// OpenRouter model slug, e.g. `deepseek/deepseek-v4-pro` or `anthropic/claude-sonnet-4.5`.
     #[arg(short, long, env = "OPENROUTER_MODEL", default_value = DEFAULT_MODEL)]
     pub model: String,
 

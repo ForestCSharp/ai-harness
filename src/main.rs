@@ -55,6 +55,9 @@ enum Update {
     /// A URL fetch finished. Refusals and HTTP errors arrive as a `FetchOutcome`
     /// carrying the reason, so `Err` here means the request never started.
     Fetch(Box<FetchOutcome>),
+    /// The model catalog arrived, or the reason it did not. Unlike every other
+    /// update this belongs to no turn — see [`handle_update`].
+    Models(Result<Vec<openrouter::ModelInfo>, String>),
 }
 
 /// An [`Update`] tagged with the generation of the task that produced it, so a
@@ -153,6 +156,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         timeout: args.timeout(),
         tx,
     };
+    spawn_catalog_fetch(&ctx);
     // The current in-flight task, if any, so `Esc` can cancel it.
     let mut inflight: Option<InFlight> = None;
     let mut ticker = tokio::time::interval(TICK);
@@ -227,12 +231,15 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
 }
 
 fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
-    // Drop anything from a task the user has since cancelled or superseded.
-    if tagged.generation != app.generation() {
+    // Drop anything from a task the user has since cancelled or superseded. The
+    // catalog is exempt: it is fetched once at startup and belongs to no turn,
+    // so whatever the user did while it was in flight, it is still the catalog.
+    if !matches!(tagged.update, Update::Models(_)) && tagged.generation != app.generation() {
         return;
     }
 
     match tagged.update {
+        Update::Models(result) => app.set_catalog(result),
         // Live tokens accumulate in the display-only streaming buffer.
         Update::Delta(delta) => app.push_delta(&delta),
         // The reply is complete. Drop the live view and commit the full text
@@ -381,10 +388,39 @@ fn handle_event(
                     app.picker_select(i);
                 }
             }
+            // Clicking a model chooses it; hovering focuses it. Uniform rows,
+            // so the question panel's row arithmetic works here unchanged.
+            MouseEventKind::Down(MouseButton::Left) if app.model_picker().is_some() => {
+                if let Some(i) = row_at(
+                    metrics.models_list,
+                    metrics.models_offset,
+                    mouse.column,
+                    mouse.row,
+                ) && app.model_select(i)
+                {
+                    app.model_confirm();
+                }
+            }
+            MouseEventKind::Moved if app.model_picker().is_some() => {
+                if let Some(i) = row_at(
+                    metrics.models_list,
+                    metrics.models_offset,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    app.model_select(i);
+                }
+            }
             MouseEventKind::ScrollUp => app.scroll_up(3),
             MouseEventKind::ScrollDown => app.scroll_down(3, metrics.max_scroll()),
             _ => {}
         },
+        // A paste into the model picker narrows the list — pasting a model id is
+        // exactly how you would use one you already have.
+        Event::Paste(text) if app.model_picker().is_some() => {
+            let text = text.replace(['\r', '\n'], " ");
+            app.model_query_input(|input| input.insert_str(&text));
+        }
         Event::Paste(text) if !app.is_busy() && app.picker().is_none() => {
             // Normalise line endings so pasted CRLF does not leave stray \r.
             app.input
@@ -660,9 +696,7 @@ fn handle_key(
                 app.question_input(|input| input.delete_word_before())
             }
             KeyCode::Backspace => app.question_input(|input| input.backspace()),
-            KeyCode::Delete if alt || ctrl => {
-                app.question_input(|input| input.delete_word_after())
-            }
+            KeyCode::Delete if alt || ctrl => app.question_input(|input| input.delete_word_after()),
             KeyCode::Delete => app.question_input(|input| input.delete()),
             KeyCode::Left if alt || ctrl => app.question_input(|input| input.move_word_left()),
             KeyCode::Right if alt || ctrl => app.question_input(|input| input.move_word_right()),
@@ -689,6 +723,47 @@ fn handle_key(
             KeyCode::PageDown => app.picker_move(page as isize),
             KeyCode::Enter => app.picker_confirm(),
             KeyCode::Esc => app.picker_cancel(),
+            _ => {}
+        }
+        return;
+    }
+
+    // The model picker owns the keyboard too, and like the model's question it
+    // is a list plus a text field: navigation keys move the highlight and
+    // everything else narrows the list. There is no digit shortcut — digits are
+    // part of model ids and have to be typeable.
+    if app.model_picker().is_some() {
+        match key.code {
+            KeyCode::Up => app.model_move(-1),
+            KeyCode::Down => app.model_move(1),
+            KeyCode::PageUp => app.model_move(-(page as isize)),
+            KeyCode::PageDown => app.model_move(page as isize),
+            KeyCode::Enter => app.model_confirm(),
+            KeyCode::Esc => app.model_cancel(),
+            // Word-wise editing matches the prompt's, so the query behaves like
+            // the box it stands in for.
+            KeyCode::Char(c) if !ctrl => app.model_query_input(|input| input.insert_char(c)),
+            KeyCode::Backspace if alt || ctrl => {
+                app.model_query_input(|input| input.delete_word_before())
+            }
+            KeyCode::Backspace => app.model_query_input(|input| input.backspace()),
+            KeyCode::Delete if alt || ctrl => {
+                app.model_query_input(|input| input.delete_word_after())
+            }
+            KeyCode::Delete => app.model_query_input(|input| input.delete()),
+            KeyCode::Left if alt || ctrl => app.model_query_input(|input| input.move_word_left()),
+            KeyCode::Right if alt || ctrl => app.model_query_input(|input| input.move_word_right()),
+            KeyCode::Left => app.model_query_input(|input| input.move_left()),
+            KeyCode::Right => app.model_query_input(|input| input.move_right()),
+            KeyCode::Home => app.model_query_input(|input| input.move_to_line_start()),
+            KeyCode::End => app.model_query_input(|input| input.move_to_line_end()),
+            KeyCode::Char('u') if ctrl => {
+                app.model_query_input(|input| input.delete_to_line_start())
+            }
+            // See the prompt's handler: off the kitty protocol, Ctrl+Backspace
+            // reaches us as Ctrl+H.
+            KeyCode::Char('h') if ctrl => app.model_query_input(|input| input.delete_word_before()),
+            KeyCode::Char('w') if ctrl => app.model_query_input(|input| input.delete_word_before()),
             _ => {}
         }
         return;
@@ -804,6 +879,26 @@ fn spawn_fetch(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: S
     *inflight = Some(InFlight::new(cancel_tx));
 }
 
+/// Fetch the model catalog once, in the background, at startup.
+///
+/// Deliberately outside the turn machinery: it sets no `InFlight`, so `Esc`
+/// cannot cancel it, and bumps no generation, so it cannot invalidate a turn.
+/// It is tagged with generation 0 and exempted from the staleness check in
+/// [`handle_update`] — the catalog is not part of any conversation.
+fn spawn_catalog_fetch(ctx: &Ctx) {
+    let client = ctx.client.clone();
+    let tx = ctx.tx.clone();
+    tokio::spawn(async move {
+        let result = client.list_models().await.map_err(|e| format!("{e:#}"));
+        let _ = tx
+            .send(Tagged {
+                generation: 0,
+                update: Update::Models(result),
+            })
+            .await;
+    });
+}
+
 fn spawn_request(
     app: &mut App,
     ctx: &Ctx,
@@ -812,7 +907,9 @@ fn spawn_request(
 ) {
     let generation = app.next_generation();
     app.mark_request_sent();
-    let client = ctx.client.clone();
+    // The model can change mid-session, so the request is built with the one the
+    // app holds now rather than the one the client was constructed with.
+    let client = ctx.client.with_model(&app.model);
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {

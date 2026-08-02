@@ -45,6 +45,9 @@ pub struct Metrics {
     /// The same, for the model's question modal.
     pub question_list: Option<Rect>,
     pub question_offset: usize,
+    /// The same, for the `/model` picker. Uniform rows, so an offset is enough.
+    pub models_list: Option<Rect>,
+    pub models_offset: usize,
 }
 
 /// Did `(column, row)` land inside `area`?
@@ -118,6 +121,7 @@ enum PanelKind {
     Question,
     Picker,
     Execute,
+    Models,
 }
 
 /// A panel measured and laid out, ready to be drawn into the bottom slot.
@@ -281,6 +285,63 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         });
     }
 
+    if let Some(picker) = app.model_picker() {
+        let matches = app.model_matches();
+        let selected = app.model_index();
+        // Borders (2) + footer (1) + the query row + a blank after it.
+        let chrome = 5u16;
+        // The catalog stands in for the list until it arrives, so the panel is
+        // the same shape whether or not the fetch has landed.
+        let placeholder = match &app.catalog {
+            crate::app::Catalog::Loading => Some(vec![Line::from(Span::styled(
+                "  loading models…",
+                Style::default().fg(Color::DarkGray),
+            ))]),
+            crate::app::Catalog::Failed(error) => {
+                let mut lines = body_lines(
+                    &format!("  could not load the model list: {error}"),
+                    Style::default().fg(Color::Red),
+                    inner_width,
+                );
+                lines.push(Line::from(Span::styled(
+                    "  /model <id> still sets it by hand.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                Some(lines)
+            }
+            crate::app::Catalog::Ready(_) if matches.is_empty() => Some(vec![Line::from(
+                Span::styled("  no model matches", Style::default().fg(Color::DarkGray)),
+            )]),
+            crate::app::Catalog::Ready(_) => None,
+        };
+
+        let wanted = placeholder.as_ref().map_or(matches.len(), Vec::len);
+        let height = (chrome + wanted as u16).min(max).max(MIN_PANEL_ROWS);
+        let visible = height.saturating_sub(chrome).max(1) as usize;
+        let offset = selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(matches.len().saturating_sub(visible));
+
+        let mut body = vec![query_row(&picker.query, inner_width), Line::default()];
+        match placeholder {
+            Some(lines) => body.extend(lines),
+            None => body.extend(model_rows(&matches, selected, offset, visible, inner_width)),
+        }
+
+        return Some(Panel {
+            kind: PanelKind::Models,
+            title: " choose a model ",
+            colour: Color::Blue,
+            body,
+            hint: Some("type to filter · ↑/↓ choose · Enter select · Esc cancel"),
+            height,
+            // The query row and the blank under it.
+            header: 2,
+            offset,
+            owners: Vec::new(),
+        });
+    }
+
     None
 }
 
@@ -343,6 +404,21 @@ fn draw_prepared_panel(
             metrics.picker_list = Some(list);
             metrics.picker_rows = owners;
         }
+        PanelKind::Models => {
+            metrics.models_list = Some(list);
+            metrics.models_offset = offset;
+            // The cursor lives in the query row, which sits in the header above
+            // the list — the same trick the question panel uses for its
+            // free-text row, so typing here reads as typing at the prompt.
+            if let Some(picker) = app.model_picker() {
+                let col = picker
+                    .query
+                    .layout(content.width.saturating_sub(2))
+                    .cursor
+                    .1;
+                frame.set_cursor_position(Position::new(content.x + 2 + col, content.y));
+            }
+        }
     }
 }
 
@@ -379,7 +455,13 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: Panel) -> (Rect, Rect) {
 /// A blank row trails each entry, because with three lines under every name a
 /// flat run of rows stops being scannable — the gap is what makes an entry read
 /// as one thing.
-fn picker_entry(name: &str, lines: &[String], focused: bool, width: usize) -> Vec<Line<'static>> {
+fn picker_entry(
+    name: &str,
+    model: &str,
+    lines: &[String],
+    focused: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let title = if focused {
         Style::default()
             .fg(Color::Black)
@@ -390,9 +472,30 @@ fn picker_entry(name: &str, lines: &[String], focused: bool, width: usize) -> Ve
             .fg(Color::Gray)
             .add_modifier(Modifier::BOLD)
     };
+    // Dimmer than the name, on the same reasoning as the preview lines below:
+    // the name is what you are choosing, the model is what you are choosing
+    // between. Only slightly, though — loading adopts it, so it is not trivia.
+    let aside = Style::default().fg(if focused {
+        Color::Gray
+    } else {
+        Color::DarkGray
+    });
     let marker = if focused { "› " } else { "  " };
 
-    let mut rows = vec![Line::from(Span::styled(format!("{marker}{name}"), title))];
+    // The name gives way to the model rather than the other way round: a name
+    // truncated in the middle of a timestamp is still recognisable, a price of
+    // admission cut in half is not.
+    let room = width.saturating_sub(model.chars().count() + 3);
+    let shown = truncate(name, room.max(1));
+    let mut title_row = vec![Span::styled(format!("{marker}{shown}"), title)];
+    if !model.is_empty() {
+        let gap = width
+            .saturating_sub(2 + shown.chars().count() + model.chars().count())
+            .max(1);
+        title_row.push(Span::styled(format!("{}{model}", " ".repeat(gap)), aside));
+    }
+
+    let mut rows = vec![Line::from(title_row)];
     if !lines.is_empty() {
         rows.push(Line::from(Span::styled(
             format!("  {}", "─".repeat(width.saturating_sub(2))),
@@ -435,7 +538,8 @@ fn picker_rows(
         .enumerate()
         .map(|(i, name)| {
             let lines = picker.previews.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            picker_entry(name, lines, i == picker.selected, width)
+            let model = picker.models.get(i).map_or("", String::as_str);
+            picker_entry(name, model, lines, i == picker.selected, width)
         })
         .collect();
 
@@ -496,6 +600,87 @@ fn question_rows(
         rows.push(Line::from(Span::styled(label, style)));
     }
     rows
+}
+
+/// The model picker's query row: what has been typed, or the invitation to type.
+///
+/// The terminal cursor sits in this row (see [`draw_prepared_panel`]), so it
+/// reads as the prompt with a list under it rather than a box with a search
+/// field bolted on.
+fn query_row(query: &crate::input::Input, width: usize) -> Line<'static> {
+    let text = query.text();
+    if text.is_empty() {
+        Line::from(Span::styled(
+            "  type to filter…",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("  {}", truncate(text, width.saturating_sub(2))),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
+    }
+}
+
+/// One row per visible model: the id, and what it costs to use.
+///
+/// The metadata is right-aligned and dim so the ids stay a scannable column —
+/// the id is what you are choosing, the rest is what you are choosing between.
+fn model_rows(
+    matches: &[&crate::openrouter::ModelInfo],
+    selected: usize,
+    offset: usize,
+    visible: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for (i, model) in matches.iter().enumerate().skip(offset).take(visible) {
+        let focused = i == selected;
+        let style = if focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let marker = if focused { "› " } else { "  " };
+        let detail = model_detail(model);
+
+        // Truncate the id first, so a long one loses its own tail rather than
+        // pushing the price off the edge.
+        let room = width.saturating_sub(detail.chars().count() + 3);
+        let id = truncate(&model.id, room.max(1));
+        let gap = width
+            .saturating_sub(2 + id.chars().count() + detail.chars().count())
+            .max(1);
+        let label = format!("{marker}{id}{}{detail}", " ".repeat(gap));
+
+        // One span so the highlight covers the whole row, including the gap.
+        rows.push(Line::from(Span::styled(label, style)));
+    }
+    rows
+}
+
+/// Context window and price, as one dim column: `200K   $5.00/$25.00`.
+fn model_detail(model: &crate::openrouter::ModelInfo) -> String {
+    let context = match model.context_length {
+        Some(n) if n >= 1_000_000 => format!("{}M", n / 1_000_000),
+        Some(n) if n >= 1_000 => format!("{}K", n / 1_000),
+        Some(n) => n.to_string(),
+        None => String::new(),
+    };
+    let price = match model.price_per_million() {
+        // A free model is worth saying outright rather than as two zeroes.
+        Some((0.0, 0.0)) => "free".to_string(),
+        Some((prompt, completion)) => format!("${prompt:.2}/${completion:.2}"),
+        None => String::new(),
+    };
+    match (context.is_empty(), price.is_empty()) {
+        (true, true) => String::new(),
+        (false, false) => format!("{context}  {price}"),
+        _ => format!("{context}{price}"),
+    }
 }
 
 /// The slash-command completion menu, shown above the status line.
@@ -1719,6 +1904,8 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         // The picker coexists with `Idle`, so without this the bar offers to
         // send a prompt while the panel below it is asking you to choose.
         "  ↑/↓ choose · Enter load · Esc cancel"
+    } else if app.model_picker().is_some() {
+        "  type to filter · ↑/↓ choose · Enter select · Esc cancel"
     } else if matches!(
         app.status,
         Status::Waiting | Status::Streaming | Status::Running
@@ -3206,6 +3393,60 @@ mod tests {
     }
 
     #[test]
+    fn a_picker_entry_names_the_model_it_would_load() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ai-harness-ui-picker-model-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, model) in [
+            ("alpha", "anthropic/claude-opus-5"),
+            ("beta", "deepseek/deepseek-v4-pro"),
+        ] {
+            let session = crate::session::Session::new(
+                model.into(),
+                vec![],
+                vec![Entry::User(format!("what {name} was about"))],
+                vec![],
+                Default::default(),
+            );
+            crate::session::save(&dir, name, &session).unwrap();
+        }
+        let mut app = App::new("test/model".into(), None, 10, dir.clone());
+        app.open_load_picker();
+
+        let (rows, _) = render(&mut app, 70, 24);
+        let screen = rows.join("\n");
+        let alpha = rows
+            .iter()
+            .find(|r| r.contains("alpha"))
+            .expect("alpha's row");
+        assert!(
+            alpha.contains("anthropic/claude-opus-5"),
+            "the model belongs on the name's row:\n{screen}"
+        );
+        assert!(
+            alpha
+                .trim_end()
+                .trim_end_matches('│')
+                .trim_end()
+                .ends_with("anthropic/claude-opus-5"),
+            "and right-aligned against the panel's inner edge:\n{alpha:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("beta") && r.contains("deepseek/deepseek-v4-pro")),
+            "every session names its own model:\n{screen}"
+        );
+        for row in &rows {
+            assert!(row.chars().count() <= 70, "row overflowed: {row:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_picker_entry_shows_its_name_a_rule_and_its_last_lines() {
         let (mut app, dir) = app_with_previews(&["alpha", "beta"]);
         let (rows, _) = render(&mut app, 70, 24);
@@ -3362,6 +3603,169 @@ mod tests {
             "a long list must scroll past the first session"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An app with a small catalog and the model picker open.
+    fn app_with_models() -> App {
+        let mut app = App::new("alpha/one".into(), None, 10, std::env::temp_dir());
+        app.set_catalog(Ok(vec![
+            crate::openrouter::ModelInfo {
+                id: "alpha/one".into(),
+                name: "Alpha: One".into(),
+                context_length: Some(200_000),
+                pricing: Some(crate::openrouter::Pricing {
+                    prompt: "0.000005".into(),
+                    completion: "0.000025".into(),
+                }),
+            },
+            crate::openrouter::ModelInfo {
+                id: "beta/free-model".into(),
+                name: "Beta: Free".into(),
+                context_length: Some(32_768),
+                pricing: Some(crate::openrouter::Pricing {
+                    prompt: "0".into(),
+                    completion: "0".into(),
+                }),
+            },
+        ]));
+        app.open_model_picker();
+        app
+    }
+
+    #[test]
+    fn model_picker_lists_ids_with_context_and_price() {
+        let mut app = app_with_models();
+        let (rows, metrics) = render(&mut app, 60, 20);
+        let screen = rows.join("\n");
+
+        assert!(
+            screen.contains("choose a model"),
+            "missing title:\n{screen}"
+        );
+        assert!(screen.contains("alpha/one"), "missing id:\n{screen}");
+        assert!(
+            screen.contains("200K") && screen.contains("$5.00/$25.00"),
+            "a row should carry its context and price:\n{screen}"
+        );
+        assert!(
+            screen.contains("32K") && screen.contains("free"),
+            "a free model should say so:\n{screen}"
+        );
+        assert!(screen.contains("Enter select"), "missing footer:\n{screen}");
+        assert!(
+            metrics.models_list.is_some(),
+            "the list rect must be reported for clicks"
+        );
+    }
+
+    #[test]
+    fn model_picker_marks_the_selection_and_shows_the_query() {
+        let mut app = app_with_models();
+        app.model_query_input(|input| input.insert_str("beta"));
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("beta"), "the query should show:\n{screen}");
+        assert!(
+            rows.iter().any(|r| r.contains("› beta/free-model")),
+            "the single match should be marked:\n{screen}"
+        );
+        // Scoped to the panel: the status bar names the model in use, which is
+        // the one being filtered out here.
+        let panel = rows
+            .iter()
+            .skip_while(|r| !r.contains("choose a model"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !panel.contains("alpha/one"),
+            "a filtered-out model should be gone from the list:\n{panel}"
+        );
+    }
+
+    #[test]
+    fn model_picker_says_when_nothing_matches_and_while_loading() {
+        let mut app = app_with_models();
+        app.model_query_input(|input| input.insert_str("zzz"));
+        let (rows, _) = render(&mut app, 60, 20);
+        assert!(
+            rows.join("\n").contains("no model matches"),
+            "an empty result should say so:\n{}",
+            rows.join("\n")
+        );
+
+        let mut app = App::new("alpha/one".into(), None, 10, std::env::temp_dir());
+        app.open_model_picker();
+        let (rows, _) = render(&mut app, 60, 20);
+        assert!(
+            rows.join("\n").contains("loading models"),
+            "the picker should stand in for the catalog until it lands:\n{}",
+            rows.join("\n")
+        );
+
+        app.set_catalog(Err("network unreachable".into()));
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("network unreachable") && screen.contains("/model <id>"),
+            "a failed catalog should show the reason and the way round it:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn model_picker_scrolls_to_keep_a_deep_selection_visible() {
+        let mut app = App::new("m/0".into(), None, 10, std::env::temp_dir());
+        let models = (0..40)
+            .map(|i| crate::openrouter::ModelInfo {
+                id: format!("m/{i:02}"),
+                name: String::new(),
+                context_length: None,
+                pricing: None,
+            })
+            .collect();
+        app.set_catalog(Ok(models));
+        app.open_model_picker();
+        app.model_move(39);
+
+        let (rows, metrics) = render(&mut app, 60, 16);
+        assert!(
+            rows.iter().any(|r| r.contains("› m/39")),
+            "the deep selection must be scrolled into view:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            metrics.models_offset > 0,
+            "a long list must scroll past the first model"
+        );
+    }
+
+    #[test]
+    fn a_long_model_id_does_not_overflow_the_panel() {
+        let mut app = App::new("x".into(), None, 10, std::env::temp_dir());
+        app.set_catalog(Ok(vec![crate::openrouter::ModelInfo {
+            id: "some-very-long-provider/an-extremely-long-model-identifier-v3".into(),
+            name: String::new(),
+            context_length: Some(1_000_000),
+            pricing: Some(crate::openrouter::Pricing {
+                prompt: "0.000005".into(),
+                completion: "0.000025".into(),
+            }),
+        }]));
+        app.open_model_picker();
+
+        let (rows, _) = render(&mut app, 40, 16);
+        for row in &rows {
+            assert!(
+                row.chars().count() <= 40,
+                "a row overflowed the screen: {row:?}"
+            );
+        }
+        assert!(
+            rows.iter().any(|r| r.contains("$5.00/$25.00")),
+            "the price must survive a long id:\n{}",
+            rows.join("\n")
+        );
     }
 
     #[test]
@@ -3566,7 +3970,11 @@ mod tests {
         fresh.transcript = app.transcript.clone();
         fresh.scroll = app.scroll;
         fresh.follow = app.follow;
-        assert_eq!(narrow, render(&mut fresh, 48, 24).0, "resize was not honoured");
+        assert_eq!(
+            narrow,
+            render(&mut fresh, 48, 24).0,
+            "resize was not honoured"
+        );
         for row in &narrow {
             assert!(row.chars().count() <= 48, "row overflows width: {row:?}");
         }

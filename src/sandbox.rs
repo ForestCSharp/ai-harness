@@ -10,6 +10,8 @@
 //!
 //! - writes confined to the working-directory subtree — or, under
 //!   [`Sandbox::writes_limited_to`], to a single file,
+//! - plus the package-manager caches under `$HOME`, without which no build
+//!   command works at all,
 //! - reads open, minus an explicit denylist of secret locations,
 //! - network allowed (the approval prompt is the control point).
 //!
@@ -36,12 +38,50 @@ const SECRET_HOME_SUBPATHS: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
     "Library/Keychains",
 ];
 
 /// Files inside the working directory that stay unreadable even though the rest
 /// of the tree is open. The harness's own key lives here.
 const SECRET_ROOT_FILES: &[&str] = &[".env", ".env.local"];
+
+/// Package-manager caches, relative to the user's home directory, that writes
+/// are allowed to reach despite living outside the working directory.
+///
+/// Without these, no build command works: cargo, npm, pip and go keep their
+/// downloaded packages and index state under `$HOME`, so a denied write there
+/// fails the whole command with a bare `Operation not permitted` that reads as a
+/// broken toolchain rather than as a policy decision.
+///
+/// Scoped to the cache directories rather than to each tool's home. `~/.cargo`
+/// as a whole would include `bin/` — the `cargo` and `rustc` binaries you run
+/// *outside* the sandbox, which is an escape — and the credentials file denied
+/// above. A cache holds data the tool will re-fetch if it is corrupted; a
+/// binary directory does not. `~/Library/Caches` and `~/.cache` are likewise
+/// not taken wholesale: they are shared roots holding every other application's
+/// state.
+///
+/// Not exhaustive, and deliberately so — an unlisted tool fails closed with a
+/// path in the error, which is a fixable diagnostic. `~/.rustup` is left out:
+/// installing a toolchain is not part of building a project.
+const CACHE_HOME_SUBPATHS: &[&str] = &[
+    ".cargo/registry",
+    ".cargo/git",
+    ".npm",
+    ".cache/pip",
+    ".cache/uv",
+    "Library/Caches/pip",
+    "Library/Caches/go-build",
+    "go/pkg/mod",
+];
+
+/// Individual files under the home directory that writes may reach, on the same
+/// grounds as [`CACHE_HOME_SUBPATHS`]. Cargo takes its inter-process lock on
+/// `$CARGO_HOME/.package-cache`, which sits beside the caches rather than in
+/// one, and cannot be acquired read-only.
+const CACHE_HOME_FILES: &[&str] = &[".cargo/.package-cache"];
 
 #[derive(Debug, Clone)]
 pub struct Sandbox {
@@ -155,6 +195,33 @@ impl Sandbox {
             ),
         };
 
+        // Caches are granted only to the subtree policy, never to the narrowed
+        // one: plan mode's promise is that the plan file is the only thing any
+        // command can change, and nothing can build under it anyway — `target/`
+        // is inside the root, which plan mode has already made read-only.
+        let caches = match (&self.write_only, &self.home) {
+            (None, Some(home)) => {
+                let mut paths = String::new();
+                for entry in CACHE_HOME_SUBPATHS {
+                    paths.push_str(&format!(
+                        "\n  (subpath \"{}\")",
+                        escape(&home.join(entry).to_string_lossy())
+                    ));
+                }
+                for file in CACHE_HOME_FILES {
+                    paths.push_str(&format!(
+                        "\n  (literal \"{}\")",
+                        escape(&home.join(file).to_string_lossy())
+                    ));
+                }
+                format!(
+                    "\n;; Package-manager caches, so builds and installs work at all.\n\
+                     (allow file-write*{paths})\n"
+                )
+            }
+            _ => String::new(),
+        };
+
         let mut denies = String::new();
         if let Some(home) = &self.home {
             for entry in SECRET_HOME_SUBPATHS {
@@ -179,7 +246,7 @@ impl Sandbox {
 
 (deny file-write*)
 {writes}
-
+{caches}
 ;; Terminal and null sinks, so ordinary commands can still emit output.
 (allow file-write-data
   (literal "/dev/null")
@@ -333,6 +400,87 @@ mod tests {
         let deny_at = profile.find("(deny file-read* file-write*").unwrap();
         assert!(deny_at > allow_at, "deny rules must still come last");
         assert!(profile.contains(".ssh"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_allows_the_package_manager_caches() {
+        // Regression: a cargo build died on EPERM writing ~/.cargo/registry,
+        // which reads as a broken toolchain rather than as a policy decision.
+        let root = temp_root("caches");
+        let sandbox = Sandbox::new(&root).unwrap();
+        let Some(home) = sandbox.home.clone() else {
+            return; // No home resolved; there is nothing to assert.
+        };
+        let profile = sandbox.profile();
+
+        for entry in [".cargo/registry", ".npm", "go/pkg/mod"] {
+            assert!(
+                profile.contains(&format!(
+                    "(subpath \"{}\")",
+                    home.join(entry).to_string_lossy()
+                )),
+                "{entry} must be writable:\n{profile}"
+            );
+        }
+        // Cargo's lock file sits beside the caches, not inside one.
+        assert!(profile.contains(&format!(
+            "(literal \"{}\")",
+            home.join(".cargo/.package-cache").to_string_lossy()
+        )));
+        // The allowance is scoped: the binaries you run outside the sandbox
+        // stay read-only, or the confinement leaks straight out of the box.
+        assert!(
+            !profile.contains(&format!(
+                "(subpath \"{}\")",
+                home.join(".cargo").to_string_lossy()
+            )),
+            "~/.cargo must not be writable wholesale:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_narrowed_profile_grants_no_caches() {
+        // Plan mode's guarantee is that one file is the only writable path, and
+        // nothing can build under it regardless — `target/` is inside the root.
+        let root = temp_root("plan-caches");
+        let sandbox = Sandbox::new(&root).unwrap();
+        let Some(home) = sandbox.home.clone() else {
+            return;
+        };
+        let profile = sandbox.writes_limited_to(root.join("plan.md")).profile();
+        assert!(
+            !profile.contains(&format!(
+                "(subpath \"{}\")",
+                home.join(".cargo/registry").to_string_lossy()
+            )),
+            "plan mode must not widen writes to the caches:\n{profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cargo_credentials_stay_denied_beside_the_cache_allowance() {
+        // The allow and the deny both name paths under ~/.cargo; the deny block
+        // comes last, so the token is unreadable even though the registry
+        // beside it is writable.
+        let root = temp_root("cargo-creds");
+        let sandbox = Sandbox::new(&root).unwrap();
+        let Some(home) = sandbox.home.clone() else {
+            return;
+        };
+        let profile = sandbox.profile();
+
+        let allow_at = profile.find("(allow file-write*").unwrap();
+        let deny_at = profile.find("(deny file-read* file-write*").unwrap();
+        assert!(deny_at > allow_at, "deny rules must come last:\n{profile}");
+        assert!(profile.contains(&format!(
+            "(subpath \"{}\")",
+            home.join(".cargo/credentials.toml").to_string_lossy()
+        )));
+        assert!(sandbox.denies_read(&home.join(".cargo/credentials.toml")));
+        assert!(!sandbox.denies_read(&home.join(".cargo/registry")));
     }
 
     #[cfg(target_os = "macos")]

@@ -180,6 +180,7 @@ Commands are handled locally and never sent to the model.
 | `/rename <name>` | Rename the current session (the name it loads under) |
 | `/fork [name]` | Branch into a new session, freezing the original |
 | `/cost` | Cumulative tokens, time spent waiting, and estimated spend |
+| `/model [id]` | Choose the model; `/model` with no id opens a picker (see [Choosing a model](#choosing-a-model)) |
 | `/help` | List the commands |
 | `/quit` | Exit |
 
@@ -222,8 +223,8 @@ escapes are covered too.
 
 | | Policy |
 | --- | --- |
-| Writes | Confined to the working-directory subtree |
-| Shell reads | Open, minus `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, Keychains, `.env` |
+| Writes | Confined to the working-directory subtree, plus the package-manager caches |
+| Shell reads | Open, minus `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.cargo/credentials.toml`, Keychains, `.env` |
 | `<ai-harness-read>` | Working-directory subtree only, minus the same denylist |
 | `<ai-harness-fetch>` | Public https hosts only; never this machine or this network |
 | Network | Allowed — the approval prompt is the control point |
@@ -236,6 +237,19 @@ symlink inside the root pointing out of it, because the check runs on the
 *resolved* path, the same rule the kernel applies. Being auto-approved, it must
 not be able to reach files you never agreed to send to OpenRouter; the denylist
 is shared with the Seatbelt profile so the two cannot drift apart.
+
+Writes reach outside the root in exactly one place: the package-manager caches
+(`~/.cargo/registry`, `~/.npm`, `~/go/pkg/mod` and a handful of others — see
+`CACHE_HOME_SUBPATHS` in [src/sandbox.rs](src/sandbox.rs)). Without them no build
+command works at all; cargo keeps its downloaded crates there, and a denied write
+surfaces as a bare `Operation not permitted` that reads as a broken toolchain
+rather than as a policy decision. The allowance is scoped to the cache
+directories, not to each tool's home: `~/.cargo/bin` holds the binaries you run
+*outside* the sandbox, so it stays read-only. A cache is data the tool re-fetches
+if it is corrupted — but it *is* shared with the rest of your machine, and a
+build script that poisons one is not confined to this project. Plan mode grants
+no cache writes: nothing can build under it regardless, since `target/` is inside
+the root it has already frozen.
 
 File writes go through the same Seatbelt confinement: the harness runs `tee` under
 the sandbox with the path passed as an argv element (never shell text, so it
@@ -423,6 +437,30 @@ cargo run -- --model openai/gpt-4o
 OPENROUTER_MODEL=google/gemini-2.5-pro cargo run
 ```
 
+### Choosing a model
+
+`/model` opens a picker over everything OpenRouter offers, in the prompt's place
+like every other panel. The catalog is fetched in the background at startup, so
+it is normally already there; open it in the first second and it says so rather
+than making you wait.
+
+| Key | Action |
+| --- | --- |
+| *(type)* | Narrow the list. Terms are matched against the id and the name, and every term must hit — `claude opus` narrows, it does not widen |
+| `↑` / `↓` | Move the highlight |
+| `Enter` | Switch to the highlighted model |
+| `Esc` | Cancel, leaving the model alone |
+
+Rows show the id, the context window, and the price per million input/output
+tokens. `/model <id>` sets one directly without the picker, which also works
+before the catalog has loaded, or if it failed to.
+
+The switch takes effect on the next turn and lasts the session. Replies already
+in the transcript keep the name of the model that produced them — the label says
+who said it, not who is answering now. The model is saved with the session, so
+`/load` resumes a conversation on the model it was had with, overriding
+`--model` for that session.
+
 Give it extra guidance (appended to the protocol contract, never replacing it):
 
 ```bash
@@ -505,6 +543,10 @@ word deletion included.
 Typing goes to the free-text row **only while it is focused**, so a keystroke
 aimed at a highlighted choice cannot vanish into a buffer you cannot see. Choices
 are clickable too.
+
+The `/model` picker works the same way — it owns the keyboard, its query row
+takes the prompt's editing keys, and rows are clickable — except that typing
+always goes to the query, since narrowing the list is the only thing to do there.
 
 Mouse wheel scrolls the transcript. Scrolling up detaches the view; it re-attaches
 to the bottom once you scroll back down (or press `End`).
@@ -669,12 +711,17 @@ never overwrite each other.
 - `/save [name]` — save now and, with a name, adopt it going forward.
 - `/load <name>` — restore a session. `/load` with no name opens a picker: choose
   with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to cancel. Each entry
-  shows its name and the session's last few lines, so the list can be read rather
-  than navigated — names are timestamps until you `/rename` them, and a timestamp
-  says nothing about what a session was. Sessions saved before previews existed
-  show a bare name until their next save.
+  shows its name, the model it was held with (right of the name — loading switches
+  to it), and the session's last few lines, so the list can be read rather than
+  navigated — names are timestamps until you `/rename` them, and a timestamp says
+  nothing about what a session was. Sessions saved before previews existed show a
+  bare name until their next save.
 - `/clear` — wipe the conversation, **including its saved file** (it is
   overwritten to the cleared state). Use `/fork` first if you want to keep it.
+  The model you are on is session state, not conversation state, so it survives.
+
+A session records the model it was held with, and `/load` resumes on it — see
+[Choosing a model](#choosing-a-model).
 
 All of these work only when idle.
 

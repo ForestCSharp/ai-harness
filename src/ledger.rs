@@ -206,7 +206,7 @@ mod tests {
         Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
-                prompt_tokens_details: None,
+            prompt_tokens_details: None,
         }
     }
 
@@ -321,14 +321,16 @@ mod tests {
         assert!(none_cached.contains("0%"), "{none_cached}");
 
         let mut cached = usage(1_000, 10);
-        cached.prompt_tokens_details = Some(crate::openrouter::PromptTokensDetails {
-            cached_tokens: 750,
-        });
+        cached.prompt_tokens_details =
+            Some(crate::openrouter::PromptTokensDetails { cached_tokens: 750 });
         ledger.record(&cached);
         assert_eq!(ledger.cached_tokens, 750);
         let report = ledger.report(None, None);
         assert!(report.contains("cached input"), "{report}");
-        assert!(report.contains("38%"), "750 of 2000 input tokens:\n{report}");
+        assert!(
+            report.contains("38%"),
+            "750 of 2000 input tokens:\n{report}"
+        );
     }
 
     #[test]

@@ -155,6 +155,36 @@ pub fn preview(dir_: &Path, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The model a session was saved with, for the `/load` picker.
+///
+/// Read out of the head of [`FILE`] rather than by parsing it: `model` is the
+/// third field written, so it lands in the first hundred-odd bytes, and a bounded
+/// read finds it without touching the hundreds of kilobytes of conversation
+/// behind it — the same cost [`PREVIEW_FILE`] exists to avoid. `None` when the
+/// file cannot be read or the field is not where it should be, which the picker
+/// shows as nothing rather than as a guess.
+pub fn model(dir_: &Path, name: &str) -> Option<String> {
+    use std::io::Read;
+
+    let folder = dir(dir_, name).ok()?;
+    let mut head = vec![0u8; HEAD_BYTES];
+    let mut file = std::fs::File::open(folder.join(FILE)).ok()?;
+    let read = file.read(&mut head).ok()?;
+    let head = std::str::from_utf8(&head[..read]).ok()?;
+
+    // `"model": "some/id"` — the value is a model id, so no escape handling:
+    // anything with a quote or a backslash in it is not one, and stopping at the
+    // first quote yields nothing usable rather than something wrong.
+    let rest = head.split_once("\"model\":")?.1.trim_start();
+    let value = rest.strip_prefix('"')?;
+    let (id, _) = value.split_once('"')?;
+    (!id.is_empty() && !id.contains('\\')).then(|| id.to_string())
+}
+
+/// How much of a session file the model can hide in. Generous: the two fields
+/// before it are numbers, so the real answer is under a hundred bytes.
+const HEAD_BYTES: usize = 1024;
+
 /// Summarise a session by its last few lines of prose.
 ///
 /// Only what the user typed and what the model answered: a trailing shell result
@@ -328,7 +358,7 @@ mod tests {
                     usage: Some(Usage {
                         prompt_tokens: 3,
                         completion_tokens: 1,
-                prompt_tokens_details: None,
+                        prompt_tokens_details: None,
                     }),
                     diff: None,
                 },
@@ -349,6 +379,36 @@ mod tests {
             !dir.join("demo.json").exists(),
             "the flat file layout is gone"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_model_is_readable_without_parsing_the_conversation() {
+        let dir = temp_dir("head-model");
+        let mut session = sample();
+        // A conversation far longer than the bounded read, to prove the model is
+        // found in the head rather than by parsing what follows it.
+        session.history = (0..500)
+            .map(|i| Message::user(format!("message number {i}, padded out a bit")))
+            .collect();
+        save(&dir, "big", &session).unwrap();
+        assert!(
+            std::fs::metadata(dir.join("big").join(FILE)).unwrap().len() > HEAD_BYTES as u64,
+            "the fixture should be bigger than the bounded read"
+        );
+
+        assert_eq!(model(&dir, "big").as_deref(), Some("test/model"));
+        assert_eq!(model(&dir, "missing"), None, "no session, no model");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_model_that_is_not_where_it_should_be_reads_as_none() {
+        let dir = temp_dir("head-broken");
+        save(&dir, "demo", &sample()).unwrap();
+        // Truncated mid-header: better to show nothing than to show a fragment.
+        std::fs::write(dir.join("demo").join(FILE), "{\n  \"version\": 1,\n  \"mod").unwrap();
+        assert_eq!(model(&dir, "demo"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -690,7 +750,7 @@ mod tests {
         session.ledger.record(&Usage {
             prompt_tokens: 120,
             completion_tokens: 40,
-                prompt_tokens_details: None,
+            prompt_tokens_details: None,
         });
         save(&dir, "led", &session).unwrap();
 

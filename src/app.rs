@@ -10,7 +10,7 @@ use crate::fetch::FetchOutcome;
 use crate::files::ReadOutcome;
 use crate::input::Input;
 use crate::ledger::Ledger;
-use crate::openrouter::{Message, Usage};
+use crate::openrouter::{Message, ModelInfo, Usage};
 use crate::protocol::{self, Action};
 use crate::sandbox::Sandbox;
 
@@ -264,6 +264,46 @@ pub struct Picker {
     /// is easier to keep right than a lookup that can miss. A session with no
     /// preview holds an empty slot, so the two stay aligned.
     pub previews: Vec<Vec<String>>,
+    /// Each session's model, parallel to `sessions` on the same reasoning. Empty
+    /// for a session whose file does not say, since loading adopts the saved
+    /// model and the picker is where you would want to know which one that is.
+    pub models: Vec<String>,
+}
+
+/// OpenRouter's model catalog, fetched once in the background at startup.
+///
+/// Fetched eagerly rather than when `/model` is typed so the picker is already
+/// populated by the time anyone opens it; the loading state exists for the
+/// person who opens it in the first second.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Catalog {
+    Loading,
+    Ready(Vec<ModelInfo>),
+    /// The fetch failed. Kept rather than retried: `/model <id>` still works,
+    /// and a picker that silently retries would hide that the network is down.
+    Failed(String),
+}
+
+impl Catalog {
+    /// The models, or an empty slice while loading or after a failure.
+    pub fn models(&self) -> &[ModelInfo] {
+        match self {
+            Catalog::Ready(models) => models,
+            _ => &[],
+        }
+    }
+}
+
+/// The `/model` picker overlay. Like [`Picker`], a UI overlay rather than a
+/// conversation status.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPicker {
+    /// What has been typed to narrow the list. Reuses the prompt's editor, the
+    /// same way the model's question does for its free-text row.
+    pub query: Input,
+    /// Highlighted row, as an index into the *matches*. Clamped on read, since
+    /// the list shrinks as the query narrows.
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,6 +431,10 @@ pub struct App {
     history_index: Option<usize>,
     /// The `/load` session picker, when open.
     picker: Option<Picker>,
+    /// Every model OpenRouter offers, once the startup fetch has landed.
+    pub catalog: Catalog,
+    /// The `/model` picker, when open.
+    models: Option<ModelPicker>,
     /// Directory where `/save` and `/load` read and write session files.
     sessions_dir: PathBuf,
     /// The session name auto-save writes to. Updated by save/load/rename/fork.
@@ -464,6 +508,8 @@ impl App {
             prompt_history: Vec::new(),
             history_index: None,
             picker: None,
+            catalog: Catalog::Loading,
+            models: None,
         }
     }
 
@@ -701,6 +747,12 @@ impl App {
             Command::Rename(name) => self.rename_session(name),
             Command::Fork(name) => self.fork_session(name),
             Command::Cost => self.push_notice(self.cost_report()),
+            // A bare `/model` browses; an id sets it outright. The id is not
+            // checked against the catalog: it may not have loaded, and
+            // OpenRouter's own rejection on the next turn says more than a
+            // guess here would.
+            Command::Model(None) => self.open_model_picker(),
+            Command::Model(Some(id)) => self.set_model(id),
             Command::Unknown(name) => self.push_notice(format!(
                 "Unknown command /{name}. Type /help to see what is available."
             )),
@@ -843,8 +895,14 @@ impl App {
     }
 
     /// Replace the in-memory session with a loaded one. Pure — does no I/O.
+    ///
+    /// The saved model is adopted, not just reported: a conversation is a
+    /// conversation with a particular model, and resuming it on whatever the
+    /// process happened to start with would change the thing being resumed. It
+    /// therefore outranks `--model` for the rest of the session.
     pub fn apply_session(&mut self, session: crate::session::Session) {
-        let model_mismatch = (session.model != self.model).then(|| session.model.clone());
+        let switched = (session.model != self.model).then(|| session.model.clone());
+        self.model = session.model;
 
         self.history = session.history;
         self.transcript = session.transcript;
@@ -857,10 +915,9 @@ impl App {
         self.history_index = None;
 
         // Pushed after the transcript is replaced, or it would be overwritten.
-        if let Some(saved_model) = model_mismatch {
+        if let Some(saved_model) = switched {
             self.push_notice(format!(
-                "Loaded a session saved with model {saved_model}; new turns use {}.",
-                self.model
+                "This session was saved with model {saved_model}; switched to it."
             ));
         }
     }
@@ -962,10 +1019,15 @@ impl App {
                 .iter()
                 .map(|name| crate::session::preview(&self.sessions_dir, name))
                 .collect();
+            let models = sessions
+                .iter()
+                .map(|name| crate::session::model(&self.sessions_dir, name).unwrap_or_default())
+                .collect();
             self.picker = Some(Picker {
                 sessions,
                 selected: 0,
                 previews,
+                models,
             });
         }
     }
@@ -1007,6 +1069,133 @@ impl App {
 
     pub fn picker_cancel(&mut self) {
         self.picker = None;
+    }
+
+    /// Record the outcome of the startup catalog fetch.
+    pub fn set_catalog(&mut self, result: Result<Vec<ModelInfo>, String>) {
+        self.catalog = match result {
+            Ok(models) => Catalog::Ready(models),
+            Err(e) => Catalog::Failed(e),
+        };
+    }
+
+    /// Open the model picker, with the model in use highlighted.
+    ///
+    /// Opens whatever state the catalog is in: the panel says "loading" or shows
+    /// the failure, rather than the command appearing to do nothing.
+    pub fn open_model_picker(&mut self) {
+        let selected = self
+            .catalog
+            .models()
+            .iter()
+            .position(|m| m.id == self.model)
+            .unwrap_or(0);
+        self.models = Some(ModelPicker {
+            query: Input::default(),
+            selected,
+        });
+    }
+
+    pub fn model_picker(&self) -> Option<&ModelPicker> {
+        self.models.as_ref()
+    }
+
+    /// The models matching what has been typed, in catalog order.
+    ///
+    /// Derived rather than stored, like the completion menu, so the list can
+    /// never drift from the query. Every whitespace-separated term must appear
+    /// in a model's id or name, so terms narrow rather than widen.
+    pub fn model_matches(&self) -> Vec<&ModelInfo> {
+        let terms: Vec<String> = self
+            .models
+            .as_ref()
+            .map(|picker| {
+                picker
+                    .query
+                    .text()
+                    .split_whitespace()
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.catalog
+            .models()
+            .iter()
+            .filter(|model| model.matches(&terms))
+            .collect()
+    }
+
+    /// Index of the highlighted match, clamped to what is actually offered.
+    pub fn model_index(&self) -> usize {
+        let count = self.model_matches().len();
+        let selected = self.models.as_ref().map_or(0, |picker| picker.selected);
+        if count == 0 {
+            0
+        } else {
+            selected.min(count - 1)
+        }
+    }
+
+    /// Move the highlight, clamped to the list (no wrap), like the session picker.
+    pub fn model_move(&mut self, delta: isize) {
+        let last = self.model_matches().len().saturating_sub(1);
+        let current = self.model_index() as isize;
+        if let Some(picker) = &mut self.models {
+            picker.selected = (current + delta).clamp(0, last as isize) as usize;
+        }
+    }
+
+    /// Focus a row directly, for mouse hover/click. Returns whether `i` was a
+    /// real row, so a click below the list does nothing.
+    pub fn model_select(&mut self, i: usize) -> bool {
+        if i >= self.model_matches().len() {
+            return false;
+        }
+        if let Some(picker) = &mut self.models {
+            picker.selected = i;
+            return true;
+        }
+        false
+    }
+
+    /// Edit the query. Any edit resets the highlight to the top: the list under
+    /// it has just changed, and keeping an index into the old one would land on
+    /// an unrelated model.
+    pub fn model_query_input(&mut self, edit: impl FnOnce(&mut Input)) {
+        if let Some(picker) = &mut self.models {
+            edit(&mut picker.query);
+            picker.selected = 0;
+        }
+    }
+
+    /// Adopt the highlighted model and close the picker.
+    pub fn model_confirm(&mut self) {
+        let chosen = self
+            .model_matches()
+            .get(self.model_index())
+            .map(|model| model.id.clone());
+        self.models = None;
+        if let Some(id) = chosen {
+            self.set_model(id);
+        }
+    }
+
+    pub fn model_cancel(&mut self) {
+        self.models = None;
+    }
+
+    /// Switch the model used for the next turn.
+    ///
+    /// Takes effect immediately and for this session only: the request carries
+    /// the model, so nothing has to be rebuilt. Replies already in the transcript
+    /// keep the name of the model that produced them.
+    pub fn set_model(&mut self, id: String) {
+        if id == self.model {
+            self.push_notice(format!("Already using {id}."));
+            return;
+        }
+        self.model = id;
+        self.push_notice(format!("Model set to {}.", self.model));
     }
 
     fn rename_session(&mut self, name: Option<String>) {
@@ -1390,8 +1579,7 @@ impl App {
         // index into `history`, and shortening it underneath would silently
         // roll back the wrong messages.
         for message in &mut self.history {
-            let Some((path, was_first, was_last)) =
-                protocol::read_result_window(&message.content)
+            let Some((path, was_first, was_last)) = protocol::read_result_window(&message.content)
             else {
                 continue;
             };
@@ -2462,7 +2650,11 @@ mod tests {
         );
 
         let resend = app.push_response("garbage three".into(), None).unwrap();
-        assert_eq!(resend.len(), after_first, "still just one failure in flight");
+        assert_eq!(
+            resend.len(),
+            after_first,
+            "still just one failure in flight"
+        );
         assert!(
             !resend.iter().any(|m| m.content.contains("garbage one")),
             "the superseded attempt should be gone from context"
@@ -3416,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_notes_a_model_mismatch() {
+    fn apply_session_adopts_the_saved_model() {
         let dir = session_temp_dir("mismatch");
         let mut app = app_in(&dir); // model = "test/model"
         let session = crate::session::Session::new(
@@ -3427,10 +3619,178 @@ mod tests {
             Ledger::default(),
         );
         app.apply_session(session);
+        assert_eq!(
+            app.model, "other/model",
+            "a loaded session should resume on the model it was saved with"
+        );
         assert!(
             matches!(last_visible(&app), Entry::Notice(n) if n.contains("other/model")),
-            "a model mismatch should be surfaced"
+            "the switch should be surfaced"
         );
+    }
+
+    fn catalog_entry(id: &str, name: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: name.into(),
+            context_length: Some(128_000),
+            pricing: None,
+        }
+    }
+
+    /// An app whose catalog has landed, currently on `alpha/one`.
+    fn app_with_catalog() -> App {
+        let mut app = App::new("alpha/one".into(), None, 10, std::env::temp_dir());
+        app.set_catalog(Ok(vec![
+            catalog_entry("alpha/one", "Alpha: One"),
+            catalog_entry("beta/three", "Beta: Three"),
+            catalog_entry("beta/two", "Beta: Two"),
+        ]));
+        app
+    }
+
+    fn type_query(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.model_query_input(|input| input.insert_char(c));
+        }
+    }
+
+    #[test]
+    fn the_model_picker_opens_on_the_model_in_use() {
+        let mut app = app_with_catalog();
+        app.run_command(Command::Model(None));
+
+        assert!(
+            app.model_picker().is_some(),
+            "/model should open the picker"
+        );
+        assert_eq!(
+            app.model_matches().len(),
+            3,
+            "an empty query filters nothing"
+        );
+        assert_eq!(
+            app.model_matches()[app.model_index()].id,
+            "alpha/one",
+            "the picker should open on the model in use"
+        );
+    }
+
+    #[test]
+    fn typing_narrows_the_list_on_every_term() {
+        let mut app = app_with_catalog();
+        app.open_model_picker();
+
+        type_query(&mut app, "beta");
+        assert_eq!(app.model_matches().len(), 2);
+
+        // A second term narrows further, and matches the name as well as the id.
+        type_query(&mut app, " three");
+        assert_eq!(
+            app.model_matches()
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["beta/three"]
+        );
+
+        // Case is irrelevant, and a term matching nothing empties the list.
+        app.model_query_input(|input| input.clear());
+        type_query(&mut app, "ALPHA");
+        assert_eq!(app.model_matches().len(), 1);
+        app.model_query_input(|input| input.clear());
+        type_query(&mut app, "nothing-like-this");
+        assert!(app.model_matches().is_empty());
+    }
+
+    #[test]
+    fn the_highlight_stays_inside_the_narrowed_list() {
+        let mut app = app_with_catalog();
+        app.open_model_picker();
+        app.model_move(5); // clamps to the last of three
+        assert_eq!(app.model_index(), 2);
+
+        // Narrowing to one match cannot leave the highlight pointing past it.
+        type_query(&mut app, "alpha");
+        assert_eq!(app.model_index(), 0);
+        assert_eq!(app.model_matches().len(), 1);
+    }
+
+    #[test]
+    fn confirming_the_picker_switches_the_model() {
+        let mut app = app_with_catalog();
+        app.open_model_picker();
+        type_query(&mut app, "beta two");
+        app.model_confirm();
+
+        assert_eq!(app.model, "beta/two");
+        assert!(app.model_picker().is_none(), "confirming closes the picker");
+        assert!(
+            matches!(last_visible(&app), Entry::Notice(n) if n.contains("beta/two")),
+            "the switch should be surfaced"
+        );
+    }
+
+    #[test]
+    fn confirming_with_no_matches_changes_nothing() {
+        let mut app = app_with_catalog();
+        app.open_model_picker();
+        type_query(&mut app, "no-such-model");
+        app.model_confirm();
+
+        assert_eq!(app.model, "alpha/one");
+        assert!(app.model_picker().is_none());
+    }
+
+    #[test]
+    fn cancelling_the_picker_leaves_the_model_alone() {
+        let mut app = app_with_catalog();
+        app.open_model_picker();
+        app.model_move(1);
+        app.model_cancel();
+
+        assert_eq!(app.model, "alpha/one");
+        assert!(app.model_picker().is_none());
+    }
+
+    #[test]
+    fn the_picker_opens_before_the_catalog_lands() {
+        let mut app = App::new("alpha/one".into(), None, 10, std::env::temp_dir());
+        assert_eq!(app.catalog, Catalog::Loading);
+
+        app.run_command(Command::Model(None));
+        assert!(
+            app.model_picker().is_some(),
+            "/model should open even while the catalog is loading"
+        );
+        assert!(app.model_matches().is_empty());
+        // Confirming an empty list is a no-op rather than a panic.
+        app.model_confirm();
+        assert_eq!(app.model, "alpha/one");
+
+        app.set_catalog(Err("network down".into()));
+        assert!(matches!(app.catalog, Catalog::Failed(e) if e == "network down"));
+    }
+
+    #[test]
+    fn model_by_id_needs_no_catalog_and_no_picker() {
+        let mut app = App::new("alpha/one".into(), None, 10, std::env::temp_dir());
+        app.run_command(Command::Model(Some("some/other-model".into())));
+
+        assert_eq!(app.model, "some/other-model");
+        assert!(app.model_picker().is_none(), "an id sets it outright");
+
+        // Setting the model already in use says so rather than claiming a change.
+        app.run_command(Command::Model(Some("some/other-model".into())));
+        assert!(matches!(last_visible(&app), Entry::Notice(n) if n.contains("Already using")));
+    }
+
+    #[test]
+    fn clearing_the_conversation_keeps_the_model() {
+        let mut app = app_with_catalog();
+        app.set_model("beta/two".into());
+        app.reset_conversation();
+        assert_eq!(app.model, "beta/two", "/clear is not a model reset");
     }
 
     /// Number of `.json` files in a directory.
@@ -3945,7 +4305,7 @@ mod tests {
         Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
-                prompt_tokens_details: None,
+            prompt_tokens_details: None,
         }
     }
 
@@ -4273,7 +4633,11 @@ mod file_tests {
         app.perform_read("n.txt", Some(10), Some(3));
 
         assert_eq!(copies_in_history(&app, "line 1\n"), 1, "first window kept");
-        assert_eq!(copies_in_history(&app, "line 10\n"), 1, "second window kept");
+        assert_eq!(
+            copies_in_history(&app, "line 10\n"),
+            1,
+            "second window kept"
+        );
     }
 
     /// A whole-file read does supersede a window inside it.
@@ -4313,8 +4677,7 @@ mod file_tests {
         // and never accumulate, which is the point of `retire_superseded_reads`.
         let big = "x".repeat(40 * 1024);
         let names: Vec<String> = (0..5).map(|n| format!("big{n}.txt")).collect();
-        let files: Vec<(&str, &str)> =
-            names.iter().map(|n| (n.as_str(), big.as_str())).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), big.as_str())).collect();
         let (mut app, _dir) = app_with_files(&files);
         app.max_turn_bytes = 100 * 1024;
         app.max_iterations = 100;
@@ -4469,7 +4832,10 @@ mod file_tests {
             from_modal, from_entry,
             "the modal and the scrollback must show one computation, not two"
         );
-        assert_eq!(from_modal, crate::diff::lines("let x = 1;", "let x = 2;").unwrap());
+        assert_eq!(
+            from_modal,
+            crate::diff::lines("let x = 1;", "let x = 2;").unwrap()
+        );
     }
 
     #[test]

@@ -51,9 +51,19 @@ pub fn line(text: &str, width: usize) -> Vec<Row> {
                 rows.push(Row::new(std::mem::take(&mut current), current_start));
                 current_start = carry_start;
                 current_width = 0;
-                flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
+                flush(
+                    &mut current,
+                    &mut current_width,
+                    &mut pending,
+                    &mut pending_width,
+                );
             } else {
-                flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
+                flush(
+                    &mut current,
+                    &mut current_width,
+                    &mut pending,
+                    &mut pending_width,
+                );
                 if current.is_empty() {
                     // One grapheme wider than the whole row; give it its own row.
                     rows.push(Row::new(grapheme.to_string(), i));
@@ -69,7 +79,12 @@ pub fn line(text: &str, width: usize) -> Vec<Row> {
 
         if grapheme == " " || grapheme == "\t" {
             // Whitespace terminates the pending word, so commit it.
-            flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
+            flush(
+                &mut current,
+                &mut current_width,
+                &mut pending,
+                &mut pending_width,
+            );
             current.push_str(grapheme);
             current_width += w;
         } else {
@@ -78,7 +93,12 @@ pub fn line(text: &str, width: usize) -> Vec<Row> {
         }
     }
 
-    flush(&mut current, &mut current_width, &mut pending, &mut pending_width);
+    flush(
+        &mut current,
+        &mut current_width,
+        &mut pending,
+        &mut pending_width,
+    );
     // Only emit a trailing row if it holds something. The overlong-grapheme
     // path above emits its row directly, which would otherwise leave a blank
     // row here and inflate the rendered height.

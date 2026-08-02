@@ -1449,7 +1449,13 @@ mod tests {
     /// silently different window that looks like it worked.
     #[test]
     fn a_read_window_rejects_values_it_cannot_use() {
-        for attrs in ["offset=0", "limit=0", "offset=abc", "offset=-1", "limit=1.5"] {
+        for attrs in [
+            "offset=0",
+            "limit=0",
+            "offset=abc",
+            "offset=-1",
+            "limit=1.5",
+        ] {
             let err = parse_reply(&format!("<ai-harness-read {attrs}>m.rs</ai-harness-read>"))
                 .unwrap_err();
             assert!(
@@ -1523,8 +1529,7 @@ mod tests {
     /// The same, for a window that does not start at the top.
     #[test]
     fn a_windowed_read_result_reports_its_range() {
-        let mut outcome =
-            crate::files::ReadOutcome::whole_file("m.rs", "x\ny\n").at_line(200);
+        let mut outcome = crate::files::ReadOutcome::whole_file("m.rs", "x\ny\n").at_line(200);
         outcome.has_more = true;
         outcome.total_lines = Some(500);
 
@@ -1539,7 +1544,10 @@ mod tests {
         let outcome = crate::files::ReadOutcome::whole_file("a.txt", "one\ntwo\n");
         let encoded = encode_read_result(&outcome);
         assert!(encoded.contains("lines: 1-2 of 2"), "{encoded}");
-        assert!(!encoded.contains("offset="), "nothing follows it:\n{encoded}");
+        assert!(
+            !encoded.contains("offset="),
+            "nothing follows it:\n{encoded}"
+        );
     }
 
     /// A file with no trailing newline must not leave the closing tag dangling
@@ -2444,4 +2452,3 @@ mod tests {
         }
     }
 }
-

@@ -9,15 +9,26 @@ use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
-/// Endpoint the client posts to. Overridable so tests can point at a local
+/// OpenRouter uses these for attribution on its leaderboards; both are optional.
+const REFERER: &str = "https://github.com/local/ai-harness";
+const TITLE: &str = "ai-harness";
+
+/// Endpoints the client talks to. Overridable so tests can point at a local
 /// server and assert on the exact request we put on the wire.
 #[derive(Debug, Clone)]
-struct Endpoint(String);
+struct Endpoints {
+    chat: String,
+    models: String,
+}
 
-impl Default for Endpoint {
+impl Default for Endpoints {
     fn default() -> Self {
-        Self(API_URL.to_string())
+        Self {
+            chat: API_URL.to_string(),
+            models: MODELS_URL.to_string(),
+        }
     }
 }
 
@@ -64,7 +75,67 @@ pub struct Client {
     http: reqwest::Client,
     api_key: String,
     model: String,
-    endpoint: Endpoint,
+    endpoints: Endpoints,
+}
+
+/// One entry from OpenRouter's model catalog.
+///
+/// Everything past the id is `#[serde(default)]`: this is a third-party payload
+/// listing hundreds of models from dozens of providers, and a field one of them
+/// stops sending must not cost us the whole catalog.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Human-readable name, e.g. "Anthropic: Claude Opus 4.5". Matched against
+    /// alongside the id, since it is what people remember.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    #[serde(default)]
+    pub pricing: Option<Pricing>,
+}
+
+/// Per-token prices, quoted as decimal strings in USD.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Pricing {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub completion: String,
+}
+
+impl ModelInfo {
+    /// Prompt and completion price in dollars per million tokens, when the
+    /// catalog quotes both as numbers. Per million rather than per token because
+    /// that is how the prices are advertised, and how `/cost` reports them.
+    pub fn price_per_million(&self) -> Option<(f64, f64)> {
+        let pricing = self.pricing.as_ref()?;
+        let prompt = pricing.prompt.parse::<f64>().ok()?;
+        let completion = pricing.completion.parse::<f64>().ok()?;
+        Some((prompt * 1_000_000.0, completion * 1_000_000.0))
+    }
+
+    /// Whether every one of `terms` appears in the id or the name. `terms` are
+    /// expected lowercase; both fields are lowered here.
+    ///
+    /// Lives here rather than in the picker so the matching rule sits with the
+    /// data it matches on. Every term must hit, which is what makes "claude opus"
+    /// narrow rather than widen.
+    pub fn matches(&self, terms: &[String]) -> bool {
+        let id = self.id.to_lowercase();
+        let name = self.name.to_lowercase();
+        terms
+            .iter()
+            .all(|term| id.contains(term.as_str()) || name.contains(term.as_str()))
+    }
+}
+
+/// The catalog response: `{"data": [ … ]}`.
+#[derive(Deserialize)]
+struct ModelCatalog {
+    #[serde(default)]
+    data: Vec<ModelInfo>,
 }
 
 /// What a completed request gives back to the UI.
@@ -124,7 +195,7 @@ impl Client {
             http,
             api_key,
             model,
-            endpoint: Endpoint::default(),
+            endpoints: Endpoints::default(),
         })
     }
 
@@ -132,10 +203,69 @@ impl Client {
         &self.model
     }
 
+    /// A copy of this client that asks for `model`.
+    ///
+    /// The model can change mid-session (`/model`) while the event loop holds
+    /// the client behind a shared reference, so each request is built with the
+    /// model the app currently has rather than the one the client was made with.
+    /// Cloning is cheap: `reqwest::Client` is a handle to a shared connection
+    /// pool, not a new one.
+    pub fn with_model(&self, model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            ..self.clone()
+        }
+    }
+
     #[cfg(test)]
     fn with_endpoint(mut self, url: impl Into<String>) -> Self {
-        self.endpoint = Endpoint(url.into());
+        self.endpoints.chat = url.into();
         self
+    }
+
+    #[cfg(test)]
+    fn with_models_endpoint(mut self, url: impl Into<String>) -> Self {
+        self.endpoints.models = url.into();
+        self
+    }
+
+    /// Bearer token and the attribution headers, shared by every request.
+    fn authorised(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .bearer_auth(&self.api_key)
+            .header("HTTP-Referer", REFERER)
+            .header("X-Title", TITLE)
+    }
+
+    /// Fetch the model catalog, sorted by id.
+    ///
+    /// Sorted here rather than at the call site: the API returns its own order,
+    /// and a list you narrow by typing reads better with a provider's models
+    /// together.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let response = self
+            .authorised(self.http.get(&self.endpoints.models))
+            .send()
+            .await
+            .context("requesting the model list from OpenRouter")?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("reading the model list from OpenRouter")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "OpenRouter returned HTTP {status}: {}",
+                error_message(&text)
+            ));
+        }
+
+        let catalog: ModelCatalog =
+            serde_json::from_str(&text).context("parsing the model list from OpenRouter")?;
+        let mut models = catalog.data;
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
     }
 
     /// Open a streaming request, yielding token deltas as they arrive.
@@ -156,12 +286,7 @@ impl Client {
         };
 
         let response = self
-            .http
-            .post(&self.endpoint.0)
-            .bearer_auth(&self.api_key)
-            // OpenRouter uses these for attribution on its leaderboards; both are optional.
-            .header("HTTP-Referer", "https://github.com/local/ai-harness")
-            .header("X-Title", "ai-harness")
+            .authorised(self.http.post(&self.endpoints.chat))
             .json(&body)
             .send()
             .await
@@ -171,12 +296,10 @@ impl Client {
         if !status.is_success() {
             // Errors are a normal JSON body, not a stream. Read it whole.
             let text = response.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<ErrorEnvelope>(&text)
-                .ok()
-                .and_then(|r| r.error)
-                .map(|e| e.message)
-                .unwrap_or_else(|| truncate(&text, 800));
-            return Err(anyhow!("OpenRouter returned HTTP {status}: {message}"));
+            return Err(anyhow!(
+                "OpenRouter returned HTTP {status}: {}",
+                error_message(&text)
+            ));
         }
 
         Ok(sse_events(response.bytes_stream()))
@@ -394,6 +517,16 @@ struct ErrorEnvelope {
     error: Option<ApiError>,
 }
 
+/// What to show for a failed request: the API's own message when the body is
+/// the usual error envelope, and the raw body when it is something else.
+fn error_message(text: &str) -> String {
+    serde_json::from_str::<ErrorEnvelope>(text)
+        .ok()
+        .and_then(|r| r.error)
+        .map(|e| e.message)
+        .unwrap_or_else(|| truncate(text, 800))
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -462,9 +595,12 @@ mod tests {
             Captured { headers, body }
         });
 
+        // Both endpoints point at the one server: it serves whatever single
+        // request arrives, whichever path it asks for.
         let client = Client::new("test-key".into(), "test/model".into())
             .unwrap()
-            .with_endpoint(format!("http://{addr}/chat/completions"));
+            .with_endpoint(format!("http://{addr}/chat/completions"))
+            .with_models_endpoint(format!("http://{addr}/models"));
         (client, handle)
     }
 
@@ -528,7 +664,8 @@ mod tests {
 
         let client = Client::new("test-key".into(), "test/model".into())
             .unwrap()
-            .with_endpoint(format!("http://{addr}/chat/completions"));
+            .with_endpoint(format!("http://{addr}/chat/completions"))
+            .with_models_endpoint(format!("http://{addr}/models"));
         (client, handle)
     }
 
@@ -570,6 +707,128 @@ mod tests {
         assert_eq!(sent["messages"][0]["content"], "be terse");
         assert_eq!(sent["messages"][1]["role"], "user");
         assert_eq!(sent["messages"][1]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn with_model_changes_the_model_the_request_asks_for() {
+        let (client, server) = serve_sse(vec![delta("hi")]);
+
+        client
+            .with_model("other/model")
+            .complete(&[Message::user("hello")])
+            .await
+            .expect("request should succeed");
+
+        let captured = server.join().unwrap();
+        let sent: serde_json::Value =
+            serde_json::from_str(&captured.body).expect("valid JSON body");
+        assert_eq!(sent["model"], "other/model");
+        // The original is untouched, so a per-request copy cannot leak back.
+        assert_eq!(client.model(), "test/model");
+    }
+
+    #[tokio::test]
+    async fn lists_models_sorted_by_id() {
+        let catalog = r#"{"data":[
+            {"id":"z/last","name":"Last","context_length":8000,
+             "pricing":{"prompt":"0.000001","completion":"0.000002"}},
+            {"id":"a/first","name":"First","context_length":200000,
+             "pricing":{"prompt":"0.000005","completion":"0.000025"}}
+        ]}"#;
+        let (client, server) = serve_body("200 OK", "application/json", catalog.to_string());
+
+        let models = client.list_models().await.expect("catalog should parse");
+
+        let captured = server.join().unwrap();
+        let headers = captured.headers.join("\n").to_lowercase();
+        assert!(
+            headers.contains("authorization: bearer test-key"),
+            "missing bearer auth in:\n{headers}"
+        );
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a/first", "z/last"],
+            "the catalog should come back sorted by id"
+        );
+        assert_eq!(models[0].name, "First");
+        assert_eq!(models[0].context_length, Some(200_000));
+        assert_eq!(models[0].price_per_million(), Some((5.0, 25.0)));
+    }
+
+    #[tokio::test]
+    async fn a_catalog_entry_missing_fields_still_parses() {
+        let catalog = r#"{"data":[{"id":"bare/model"}]}"#;
+        let (client, server) = serve_body("200 OK", "application/json", catalog.to_string());
+
+        let models = client.list_models().await.expect("catalog should parse");
+        server.join().unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "bare/model");
+        assert_eq!(models[0].name, "");
+        assert_eq!(models[0].context_length, None);
+        assert_eq!(models[0].price_per_million(), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_catalog_request_surfaces_the_api_message() {
+        let body = r#"{"error":{"message":"No auth credentials found"}}"#;
+        let (client, server) = serve_body("401 Unauthorized", "application/json", body.to_string());
+
+        let error = client
+            .list_models()
+            .await
+            .expect_err("a 401 should be an error");
+        server.join().unwrap();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("No auth credentials found"), "{text}");
+    }
+
+    #[test]
+    fn price_per_million_scales_the_quoted_per_token_price() {
+        let model = ModelInfo {
+            id: "a/b".into(),
+            name: String::new(),
+            context_length: None,
+            pricing: Some(Pricing {
+                prompt: "0.0000005".into(),
+                completion: "0".into(),
+            }),
+        };
+        assert_eq!(model.price_per_million(), Some((0.5, 0.0)));
+    }
+
+    #[test]
+    fn price_per_million_is_none_when_a_price_is_not_a_number() {
+        let model = ModelInfo {
+            id: "a/b".into(),
+            name: String::new(),
+            context_length: None,
+            pricing: Some(Pricing {
+                prompt: "variable".into(),
+                completion: "0".into(),
+            }),
+        };
+        assert_eq!(model.price_per_million(), None);
+    }
+
+    #[test]
+    fn matching_needs_every_term_and_ignores_case() {
+        let model = ModelInfo {
+            id: "anthropic/claude-opus-4.5".into(),
+            name: "Anthropic: Claude Opus 4.5".into(),
+            context_length: None,
+            pricing: None,
+        };
+
+        assert!(model.matches(&["claude".into(), "opus".into()]));
+        // Terms may come from either field.
+        assert!(model.matches(&["anthropic".into(), "4.5".into()]));
+        assert!(!model.matches(&["claude".into(), "sonnet".into()]));
+        // No terms is no filter.
+        assert!(model.matches(&[]));
     }
 
     #[tokio::test]
@@ -802,6 +1061,33 @@ mod tests {
             completion.content.to_lowercase().contains("paris"),
             "unexpected reply: {}",
             completion.content
+        );
+    }
+
+    /// Confirms the real catalog parses: it is a large third-party payload whose
+    /// shape a fixture can only assume.
+    #[tokio::test]
+    #[ignore = "requires OPENROUTER_API_KEY and makes a real API call"]
+    async fn live_catalog_parses() {
+        let _ = dotenvy::dotenv();
+        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
+        let client = Client::new(key, crate::config::DEFAULT_MODEL.to_string()).unwrap();
+
+        let models = client.list_models().await.expect("catalog should load");
+
+        println!("{} models, first: {:?}", models.len(), models.first());
+        assert!(models.len() > 50, "expected a full catalog");
+        assert!(
+            models.windows(2).all(|w| w[0].id <= w[1].id),
+            "the catalog should come back sorted"
+        );
+        assert!(
+            models.iter().any(|m| m.price_per_million().is_some()),
+            "at least some models should quote a price"
+        );
+        assert!(
+            models.iter().any(|m| m.context_length.is_some()),
+            "at least some models should report a context length"
         );
     }
 
