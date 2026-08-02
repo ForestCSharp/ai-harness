@@ -80,6 +80,29 @@ pub struct Usage {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
+    /// Cache accounting, when the provider reports any.
+    ///
+    /// This harness resends the whole conversation every turn and appends to it
+    /// rather than rewriting it, which is the shape prefix caching is for. It
+    /// sends no cache directives of its own, so anything here comes from the
+    /// provider caching on its own initiative — which is worth knowing before
+    /// deciding whether asking for it explicitly is worth the work.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
+}
+
+impl Usage {
+    /// Prompt tokens served from the provider's cache, if it said.
+    pub fn cached_tokens(&self) -> u32 {
+        self.prompt_tokens_details
+            .map_or(0, |details| details.cached_tokens)
+    }
 }
 
 /// One event from a streaming response.

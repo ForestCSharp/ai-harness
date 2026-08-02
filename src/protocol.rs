@@ -41,7 +41,7 @@ pub const READ_TAG: &str = "ai-harness-read";
 /// A URL fetch. Like a read, it runs without the approval modal; what bounds it
 /// is the destination policy in [`crate::fetch`] rather than a filesystem root.
 pub const FETCH_TAG: &str = "ai-harness-fetch";
-/// A file write. Unlike shell/read/response, its opening tag carries a `file=`
+/// A file write. Unlike shell/response, its opening tag carries a `file=`
 /// attribute.
 pub const WRITE_TAG: &str = "ai-harness-write";
 /// A targeted edit: replace one exact span of a file. Carries `file=` like write.
@@ -57,6 +57,13 @@ pub const OPTION_TAG: &str = "ai-harness-option";
 pub const OPTION_QUESTION_TAG: &str = "ai-harness-option-question";
 /// One answer to choose between. A child of [`OPTION_TAG`], repeated.
 pub const OPTION_CHOICE_TAG: &str = "ai-harness-option-choice";
+/// The path attribute on a write or an edit.
+pub const FILE_ATTR: &str = "file";
+/// A read's 1-based first line. Optional; the top of the file without it.
+pub const OFFSET_ATTR: &str = "offset";
+/// How many lines a read returns. Optional; as many as fit without it.
+pub const LIMIT_ATTR: &str = "limit";
+
 /// Harness → model only. Carries the outcome of a shell action; never parsed.
 pub const RESULT_TAG: &str = "ai-harness-shell-result";
 /// Harness → model only. Carries the outcome of a file write; never parsed.
@@ -103,7 +110,17 @@ pub enum Action {
     /// A shell command the model wants run. Not executed yet.
     Shell(String),
     /// A file the model wants to see. Runs without approval; see [`crate::files`].
-    Read { path: String },
+    ///
+    /// The window is optional and 1-based. `serde(default)` and no
+    /// `session::VERSION` bump, the same way `Session::ledger` was added:
+    /// a read recorded before windows existed is a whole-file read.
+    Read {
+        path: String,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// A URL the model wants to read. Runs without approval; see [`crate::fetch`].
     Fetch { url: String },
     /// A file the model wants written. Not written yet.
@@ -133,12 +150,24 @@ impl Action {
     pub fn body(&self) -> &str {
         match self {
             Self::Shell(s) | Self::Response(s) => s,
-            Self::Read { path } => path,
+            Self::Read { path, .. } => path,
             Self::Fetch { url } => url,
             Self::Write { contents, .. } => contents,
             Self::Edit { old, .. } => old,
             Self::Options { question, .. } => question,
         }
+    }
+}
+
+/// How a read names its target on screen: the path, and the window when it has
+/// one. Shared by the approval modal, the transcript, and the denial notice, so
+/// a windowed read is never displayed as though it read the whole file.
+pub fn read_label(path: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    match (offset, limit) {
+        (None, None) => path.to_string(),
+        (Some(from), None) => format!("{path}  from line {from}"),
+        (None, Some(limit)) => format!("{path}  first {limit} line(s)"),
+        (Some(from), Some(limit)) => format!("{path}  lines {from}-{}", from + limit - 1),
     }
 }
 
@@ -255,6 +284,12 @@ pub enum ProtocolError {
         tag: String,
         attr: String,
     },
+    /// An attribute the tag does take, with a value it cannot use — a read's
+    /// `offset=`/`limit=` that is not a whole number of 1 or more.
+    BadAttributeValue {
+        attr: String,
+        value: String,
+    },
     /// A body contained its own closing tag, so the element could not be framed.
     /// Distinguished from [`Self::TrailingContent`] to give an actionable hint.
     DelimiterInBody {
@@ -326,6 +361,12 @@ impl fmt::Display for ProtocolError {
                 "<{tag}> does not take attributes, but had: {}",
                 snippet(attr)
             ),
+            Self::BadAttributeValue { attr, value } => write!(
+                f,
+                "{attr}={} is not usable; it must be a whole number of 1 or more \
+                 ({OFFSET_ATTR} is the first line, counting from 1)",
+                snippet(value)
+            ),
             Self::DelimiterInBody { tag } => write!(
                 f,
                 "the contents of <{tag}> contain the literal text </{tag}>, which \
@@ -391,25 +432,83 @@ pub fn encode_write_result(path: &str, outcome: Result<usize, &str>) -> String {
     format!("<{WRITE_RESULT_TAG}>\n{body}</{WRITE_RESULT_TAG}>")
 }
 
+/// Which lines a read returned, and out of how many.
+///
+/// The range goes in the header rather than as per-line prefixes for the reason
+/// given on [`encode_read_result`] — but it has to be *somewhere*, because a
+/// model that cannot tell which slice it is holding cannot ask for the next one.
+fn read_range(outcome: &crate::files::ReadOutcome) -> String {
+    let bytes = outcome.contents.len();
+    let Some(last) = outcome.last_line() else {
+        return match outcome.total_lines {
+            Some(total) => format!("lines: none — the file has {total}\n"),
+            None => "lines: none\n".to_string(),
+        };
+    };
+    let first = outcome.first_line();
+    match outcome.total_lines {
+        Some(total) => format!("lines: {first}-{last} of {total}, bytes: {bytes}\n"),
+        // Too large to count; say so rather than imply the window is the file.
+        None if outcome.has_more => {
+            format!("lines: {first}-{last} of more than {last}, bytes: {bytes}\n")
+        }
+        None => format!("lines: {first}-{last}, bytes: {bytes}\n"),
+    }
+}
+
+/// The path and line range of an encoded `<{READ_RESULT_TAG}>`, or `None` for
+/// anything else.
+///
+/// The inverse of the header [`read_range`] writes, so a stored result can be
+/// recognised as covering the same ground as a later one. Parsing our own output
+/// back is worth a wince, but the alternative — a side table of history indices
+/// — has to be kept in step with every truncation of the conversation, and
+/// silently rots when it is not.
+pub fn read_result_window(message: &str) -> Option<(&str, usize, usize)> {
+    let rest = message.strip_prefix(&format!("<{READ_RESULT_TAG}>\n"))?;
+    let mut lines = rest.lines();
+    let path = lines.next()?.strip_prefix("path: ")?;
+    let range = lines.next()?.strip_prefix("lines: ")?;
+    // `1-2 of 2, bytes: 8` → (1, 2). A failed or empty read has no range.
+    let range = range.split([' ', ',']).next()?;
+    let (first, last) = range.split_once('-')?;
+    Some((path, first.parse().ok()?, last.parse().ok()?))
+}
+
+/// A placeholder standing in for a read result that a later one supersedes.
+///
+/// Keeps the element shape the model is told to expect, so the slot reads as
+/// "this was here and has moved" rather than as a malformed result.
+pub fn encode_superseded_read(path: &str) -> String {
+    format!(
+        "<{READ_RESULT_TAG}>\npath: {path}\n\
+         note: these lines were read again later in this conversation; \
+         the current contents are in the newer result below.\n\
+         </{READ_RESULT_TAG}>"
+    )
+}
+
 /// Hand the contents of a file back to the model.
 ///
 /// The contents are sent with no line-number prefixes. That is deliberate:
 /// numbering invites the model to copy the prefix back into a later quotation
-/// of the text, and the line count in the header covers what numbering was for.
+/// of the text, and the range in the header covers what numbering was for.
 pub fn encode_read_result(outcome: &crate::files::ReadOutcome) -> String {
     let body = match &outcome.error {
         Some(message) => format!("status: read of {} failed: {message}\n", outcome.path),
         None => {
-            let mut body = format!(
-                "path: {}\nlines: {}, bytes: {}\n",
-                outcome.path,
-                outcome.lines,
-                outcome.contents.len()
-            );
-            if outcome.truncated {
-                body.push_str(
-                    "note: the file is longer than the read limit; only the start is shown\n",
-                );
+            let mut body = format!("path: {}\n", outcome.path);
+            body.push_str(&read_range(outcome));
+            if let Some(next) = outcome.last_line().filter(|_| outcome.has_more) {
+                // Naming the exact next call is the point. A note that only says
+                // "there is more" is a dead end, and a model that hits one has
+                // no better move than to read the same head again.
+                body.push_str(&format!(
+                    "note: to see what follows, read \
+                     <{READ_TAG} {OFFSET_ATTR}={}>{}</{READ_TAG}>\n",
+                    next + 1,
+                    outcome.path
+                ));
             }
             body.push_str("contents:\n");
             body.push_str(&outcome.contents);
@@ -525,7 +624,9 @@ pub fn encode_correction(error: &ProtocolError) -> String {
         "Your last reply was rejected by the parser: {error}\n\n\
          Reply again with exactly one element and nothing else — no prose, no \
          markdown fences. The first character must be '<' and the last must be \
-         '>'. Use <{READ_TAG}>path</{READ_TAG}> to read a file, \
+         '>'. Use <{READ_TAG}>path</{READ_TAG}> to read a file (optionally \
+         <{READ_TAG} {OFFSET_ATTR}=1 {LIMIT_ATTR}=100>path</{READ_TAG}> for a \
+         line window), \
          <{FETCH_TAG}>https://…</{FETCH_TAG}> to read a web page, \
          <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, \
          <{WRITE_TAG} file=path>…</{WRITE_TAG}> to write a whole file, \
@@ -604,8 +705,19 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         });
     }
 
-    // Only write and edit take an attribute (their `file=` path).
-    if tag != WRITE_TAG && tag != EDIT_TAG && !attrs.is_empty() {
+    // Write and edit take a `file=` path; a read may take `offset=`/`limit=`.
+    // Nothing else takes an attribute at all.
+    let read_window = if tag == READ_TAG {
+        parse_read_window(attrs)?
+    } else {
+        (None, None)
+    };
+    let takes_attrs = tag == WRITE_TAG
+        || tag == EDIT_TAG
+        // A read only "took" the attributes if they parsed as its window;
+        // anything else it carries is still an error.
+        || (tag == READ_TAG && read_window != (None, None));
+    if !takes_attrs && !attrs.is_empty() {
         return Err(ProtocolError::UnexpectedAttribute {
             tag: tag.to_string(),
             attr: attrs.to_string(),
@@ -658,7 +770,7 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
     }
 
     if tag == WRITE_TAG {
-        let path = parse_file_attribute(attrs).ok_or(ProtocolError::MissingFileAttribute)?;
+        let path = parse_attribute(attrs, FILE_ATTR).ok_or(ProtocolError::MissingFileAttribute)?;
         // File bytes are significant: preserve the body exactly, stripping only
         // the single formatting newline models put right after '>'.
         let contents = strip_formatting_newline(body);
@@ -674,7 +786,7 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
     }
 
     if tag == EDIT_TAG {
-        let path = parse_file_attribute(attrs).ok_or(ProtocolError::MissingFileAttribute)?;
+        let path = parse_attribute(attrs, FILE_ATTR).ok_or(ProtocolError::MissingFileAttribute)?;
         let (old, new) = parse_edit_children(body)?;
         return Ok(Action::Edit { path, old, new });
     }
@@ -693,9 +805,14 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
 
     Ok(match tag {
         SHELL_TAG => Action::Shell(body.to_string()),
-        READ_TAG => Action::Read {
-            path: body.to_string(),
-        },
+        READ_TAG => {
+            let (offset, limit) = read_window;
+            Action::Read {
+                path: body.to_string(),
+                offset,
+                limit,
+            }
+        }
         FETCH_TAG => Action::Fetch {
             url: body.to_string(),
         },
@@ -703,10 +820,28 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
     })
 }
 
-/// Extract the `file=` value from a write tag's attributes. The value may be
-/// quoted (`file="a b.txt"`) or run bare to the end of the attributes.
-fn parse_file_attribute(attrs: &str) -> Option<String> {
-    let rest = attrs.strip_prefix("file=")?;
+/// Extract `name=` from a tag's attributes. The value may be quoted
+/// (`file="a b.txt"`) or run bare to the next whitespace.
+///
+/// Scans for the attribute rather than assuming it comes first, because a read
+/// may carry `offset=` and `limit=` in either order.
+fn parse_attribute(attrs: &str, name: &str) -> Option<String> {
+    let mut rest = attrs;
+    loop {
+        let at = rest.find(name)?;
+        let after = &rest[at + name.len()..];
+        // A name only counts at the start of an attribute, so `file=` does not
+        // match inside `profile=`, and only when it is followed by `=`.
+        let boundary = at == 0 || rest[..at].ends_with(char::is_whitespace);
+        match after.strip_prefix('=') {
+            Some(value) if boundary => return attribute_value(value),
+            _ => rest = &rest[at + name.len()..],
+        }
+    }
+}
+
+/// The value part of `name=value`, unquoted if it was quoted.
+fn attribute_value(rest: &str) -> Option<String> {
     let value = if let Some(inner) = rest.strip_prefix('"') {
         inner.split_once('"').map(|(v, _)| v)?
     } else {
@@ -715,6 +850,30 @@ fn parse_file_attribute(attrs: &str) -> Option<String> {
     };
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Parse a read's `offset=`/`limit=`, both optional and both 1 or more.
+///
+/// A bad value is an error rather than a silent default: an off-by-one in the
+/// model's paging should cost one correction, not produce the wrong window and
+/// look like it worked.
+fn parse_read_window(attrs: &str) -> Result<(Option<usize>, Option<usize>), ProtocolError> {
+    let mut window = [None, None];
+    for (slot, name) in window.iter_mut().zip([OFFSET_ATTR, LIMIT_ATTR]) {
+        let Some(raw) = parse_attribute(attrs, name) else {
+            continue;
+        };
+        match raw.parse::<usize>() {
+            Ok(value) if value >= 1 => *slot = Some(value),
+            _ => {
+                return Err(ProtocolError::BadAttributeValue {
+                    attr: name.to_string(),
+                    value: raw,
+                });
+            }
+        }
+    }
+    Ok((window[0], window[1]))
 }
 
 /// Strip the single formatting newline a model puts right after `>` when it
@@ -880,6 +1039,16 @@ You MUST reply with exactly one of the following elements, and nothing else.
 
 <{READ_TAG}>path/to/file</{READ_TAG}>
 
+A read may take a line window. `{OFFSET_ATTR}=` is the first line, counting from \
+1, and `{LIMIT_ATTR}=` is how many lines to return; both are optional:
+
+<{READ_TAG} {OFFSET_ATTR}=200 {LIMIT_ATTR}=100>path/to/file</{READ_TAG}>
+
+Use a window when you know roughly where to look — after a grep, or to continue \
+a file whose result said there was more. A whole-file read of something large \
+costs you context you will need later, and every read stays in the conversation \
+for the rest of the session.
+
 2. Read a web page. Prefer this over curl or wget — it returns the page as text
 rather than raw HTML, and needs no approval:
 
@@ -924,10 +1093,14 @@ After a file read, the harness sends you:
 
 <{READ_RESULT_TAG}>
 path: path/to/file
-lines: 12, bytes: 340
+lines: 1-12 of 12, bytes: 340
 contents:
 ...
 </{READ_RESULT_TAG}>
+
+When the window does not reach the end, the result says so and names the read \
+that continues it. Follow that rather than re-reading the same file: reading it \
+again returns the same lines and costs the same context twice.
 
 After a fetch, it sends:
 
@@ -1016,12 +1189,13 @@ to the harness.
 - The element must be non-empty.
 - Put exactly one shell command in <{SHELL_TAG}>. Chain steps with '&&' or ';' if \
 you need several. Prefer non-interactive commands that terminate on their own.
-- A <{READ_TAG}> contains one file path and nothing else. One file per element.
+- A <{READ_TAG}> contains one file path and nothing else. One file per element. \
+It may carry {OFFSET_ATTR}= and {LIMIT_ATTR}=, each a whole number of 1 or more.
 - A <{FETCH_TAG}> contains one absolute https URL and nothing else. One page per \
 element.
 - A <{WRITE_TAG}> must have a file=… path and contains the complete new file \
 contents (not a diff). <{WRITE_TAG}> and <{EDIT_TAG}> take the file= attribute; \
-no other tag does.
+<{READ_TAG}> takes {OFFSET_ATTR}= and {LIMIT_ATTR}=; no other tag takes any.
 - An <{EDIT_TAG}> must have a file=… path and contain a <{OLD_TAG}> then a \
 <{NEW_TAG}>, in that order and nothing else. The <{OLD_TAG}> text must appear \
 EXACTLY ONCE in the file, copied character-for-character — whitespace included — \
@@ -1143,7 +1317,9 @@ mod tests {
         assert_eq!(
             parse_reply("<ai-harness-read>src/app.rs</ai-harness-read>").unwrap(),
             Action::Read {
-                path: "src/app.rs".into()
+                path: "src/app.rs".into(),
+                offset: None,
+                limit: None,
             }
         );
     }
@@ -1154,7 +1330,9 @@ mod tests {
         assert_eq!(
             parse_reply("<ai-harness-read>\n  README.md\n</ai-harness-read>").unwrap(),
             Action::Read {
-                path: "README.md".into()
+                path: "README.md".into(),
+                offset: None,
+                limit: None,
             }
         );
     }
@@ -1223,12 +1401,72 @@ mod tests {
         assert!(encoded.contains("http: is not allowed"));
     }
 
+    /// A read takes `offset=`/`limit=` and nothing else — `file=` belongs to
+    /// write and edit, and accepting it here would be a second spelling that
+    /// quietly works.
     #[test]
-    fn a_read_takes_no_attribute() {
+    fn a_read_takes_no_attribute_but_its_own() {
         assert!(matches!(
             parse_reply("<ai-harness-read file=x>y</ai-harness-read>").unwrap_err(),
             ProtocolError::UnexpectedAttribute { .. }
         ));
+    }
+
+    #[test]
+    fn a_read_parses_its_window() {
+        assert_eq!(
+            parse_reply("<ai-harness-read offset=200 limit=100>src/app.rs</ai-harness-read>")
+                .unwrap(),
+            Action::Read {
+                path: "src/app.rs".into(),
+                offset: Some(200),
+                limit: Some(100),
+            }
+        );
+    }
+
+    #[test]
+    fn a_read_window_takes_its_parts_in_either_order_and_alone() {
+        let cases = [
+            ("limit=5 offset=2", (Some(2), Some(5))),
+            ("offset=2", (Some(2), None)),
+            ("limit=5", (None, Some(5))),
+        ];
+        for (attrs, (offset, limit)) in cases {
+            assert_eq!(
+                parse_reply(&format!("<ai-harness-read {attrs}>m.rs</ai-harness-read>")).unwrap(),
+                Action::Read {
+                    path: "m.rs".into(),
+                    offset,
+                    limit,
+                },
+                "attrs: {attrs}"
+            );
+        }
+    }
+
+    /// Lines count from 1, so 0 is a mistake worth one correction rather than a
+    /// silently different window that looks like it worked.
+    #[test]
+    fn a_read_window_rejects_values_it_cannot_use() {
+        for attrs in ["offset=0", "limit=0", "offset=abc", "offset=-1", "limit=1.5"] {
+            let err = parse_reply(&format!("<ai-harness-read {attrs}>m.rs</ai-harness-read>"))
+                .unwrap_err();
+            assert!(
+                matches!(err, ProtocolError::BadAttributeValue { .. }),
+                "{attrs} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    /// `file=` must not match inside a longer attribute name.
+    #[test]
+    fn an_attribute_name_matches_only_whole_names() {
+        assert_eq!(parse_attribute("profile=x", FILE_ATTR), None);
+        assert_eq!(
+            parse_attribute("profile=x file=y", FILE_ATTR),
+            Some("y".to_string())
+        );
     }
 
     #[test]
@@ -1241,18 +1479,14 @@ mod tests {
 
     #[test]
     fn a_read_result_carries_the_contents_and_the_counts() {
-        let outcome = crate::files::ReadOutcome {
-            path: "a.txt".into(),
-            contents: "one\ntwo\n".into(),
-            lines: 2,
-            truncated: false,
-            error: None,
-        };
+        let outcome = crate::files::ReadOutcome::whole_file("a.txt", "one\ntwo\n");
         let encoded = encode_read_result(&outcome);
         assert!(encoded.starts_with("<ai-harness-read-result>"));
         assert!(encoded.ends_with("</ai-harness-read-result>"));
         assert!(encoded.contains("path: a.txt"));
-        assert!(encoded.contains("lines: 2, bytes: 8"));
+        // The range, not just the count: a model that cannot tell which slice
+        // it is holding cannot ask for the next one.
+        assert!(encoded.contains("lines: 1-2 of 2, bytes: 8"), "{encoded}");
         assert!(encoded.contains("one\ntwo\n"));
         // No line-number prefixes: they would contaminate any later quotation
         // of the text back to us.
@@ -1266,29 +1500,53 @@ mod tests {
         assert!(encoded.contains("status: read of secret.txt failed: no such file"));
     }
 
+    /// A clipped window must not be a dead end: the result has to name the read
+    /// that continues it, or the model's only move is to read the head again.
     #[test]
-    fn a_truncated_read_result_says_so() {
-        let outcome = crate::files::ReadOutcome {
-            path: "big.txt".into(),
-            contents: "x".repeat(10),
-            lines: 1,
-            truncated: true,
-            error: None,
-        };
-        assert!(encode_read_result(&outcome).contains("longer than the read limit"));
+    fn a_clipped_read_result_names_the_read_that_continues_it() {
+        let mut outcome = crate::files::ReadOutcome::whole_file("big.txt", "a\nb\nc\n");
+        outcome.truncated = true;
+        outcome.has_more = true;
+        outcome.total_lines = Some(900);
+
+        let encoded = encode_read_result(&outcome);
+        assert!(
+            encoded.contains("lines: 1-3 of 900"),
+            "the window should be stated:\n{encoded}"
+        );
+        assert!(
+            encoded.contains("<ai-harness-read offset=4>big.txt</ai-harness-read>"),
+            "the follow-up read should be spelled out:\n{encoded}"
+        );
+    }
+
+    /// The same, for a window that does not start at the top.
+    #[test]
+    fn a_windowed_read_result_reports_its_range() {
+        let mut outcome =
+            crate::files::ReadOutcome::whole_file("m.rs", "x\ny\n").at_line(200);
+        outcome.has_more = true;
+        outcome.total_lines = Some(500);
+
+        let encoded = encode_read_result(&outcome);
+        assert!(encoded.contains("lines: 200-201 of 500"), "{encoded}");
+        assert!(encoded.contains("offset=202"), "{encoded}");
+    }
+
+    /// A whole small file is not a window, and should not be dressed up as one.
+    #[test]
+    fn a_whole_file_read_result_mentions_no_follow_up() {
+        let outcome = crate::files::ReadOutcome::whole_file("a.txt", "one\ntwo\n");
+        let encoded = encode_read_result(&outcome);
+        assert!(encoded.contains("lines: 1-2 of 2"), "{encoded}");
+        assert!(!encoded.contains("offset="), "nothing follows it:\n{encoded}");
     }
 
     /// A file with no trailing newline must not leave the closing tag dangling
     /// on the contents' last line.
     #[test]
     fn a_read_result_always_closes_on_its_own_line() {
-        let outcome = crate::files::ReadOutcome {
-            path: "a.txt".into(),
-            contents: "no trailing newline".into(),
-            lines: 1,
-            truncated: false,
-            error: None,
-        };
+        let outcome = crate::files::ReadOutcome::whole_file("a.txt", "no trailing newline");
         assert!(encode_read_result(&outcome).ends_with("\n</ai-harness-read-result>"));
     }
 
@@ -2157,6 +2415,16 @@ mod tests {
                 format!("<{READ_TAG}>path/to/file</{READ_TAG}>"),
                 Action::Read {
                     path: "path/to/file".into(),
+                    offset: None,
+                    limit: None,
+                },
+            ),
+            (
+                format!("<{READ_TAG} {OFFSET_ATTR}=200 {LIMIT_ATTR}=100>path/to/file</{READ_TAG}>"),
+                Action::Read {
+                    path: "path/to/file".into(),
+                    offset: Some(200),
+                    limit: Some(100),
                 },
             ),
             (
@@ -2176,3 +2444,4 @@ mod tests {
         }
     }
 }
+

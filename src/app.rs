@@ -144,6 +144,13 @@ pub struct RunningCommand {
 /// a little, far short of a build log.
 const MAX_RUNNING_LINES: usize = 200;
 
+/// Default ceiling on what one prompt may add to the conversation.
+///
+/// Roughly 128k tokens of text — past any reasonable turn, and short of the
+/// context window of the models this talks to, so it stops a runaway before the
+/// provider does. Adjustable with `--max-turn-bytes`.
+const DEFAULT_MAX_TURN_BYTES: usize = 512 * 1024;
+
 impl RunningCommand {
     fn new(command: String) -> Self {
         Self {
@@ -300,6 +307,16 @@ pub struct App {
     /// keeps proposing commands cannot loop forever.
     pub iterations: usize,
     pub max_iterations: usize,
+    /// Bytes this turn may append to `history` before the loop stops.
+    ///
+    /// `max_iterations` bounds round-trips, not size, and with a 64 KB read cap
+    /// that leaves a multi-megabyte ceiling on what one prompt can pile into the
+    /// conversation. This is the other half of the budget: a turn that has
+    /// gathered this much has gone wrong, whatever it thinks it is doing.
+    pub max_turn_bytes: usize,
+    /// Size of `history` when the current prompt started, so the budget measures
+    /// what this turn added rather than what the session already held.
+    turn_start_bytes: usize,
     /// When true, the transcript also shows raw protocol frames.
     pub debug: bool,
     /// Filesystem access for `<ai-harness-read>`. Set by `main` once the
@@ -419,6 +436,8 @@ impl App {
             tick: 0,
             iterations: 0,
             max_iterations,
+            max_turn_bytes: DEFAULT_MAX_TURN_BYTES,
+            turn_start_bytes: 0,
             debug: false,
             sandbox: None,
             confirm_reads: false,
@@ -1125,6 +1144,7 @@ impl App {
         self.iterations = 0;
         self.retries = 0;
         self.retry_anchor = None;
+        self.turn_start_bytes = self.history_bytes();
         self.status = Status::Waiting;
         self.follow = true;
         Some(self.history.clone())
@@ -1202,10 +1222,24 @@ impl App {
                 ));
                 self.status = Status::Idle;
             }
+            // The same guard, measured in context rather than round-trips: a few
+            // whole-file reads can exhaust the window long before the loop
+            // budget notices. Stopping here leaves the conversation usable.
+            _ if self.turn_bytes() >= self.max_turn_bytes => {
+                self.push_notice(format!(
+                    "Stopped after this turn added {} KB to the conversation —                      enough to crowd out the context window. Send another prompt                      to continue, or /clear to start fresh.",
+                    self.turn_bytes() / 1024
+                ));
+                self.status = Status::Idle;
+            }
             // A read mutates nothing and cannot leave the working directory, so it
             // runs now and the loop continues without interrupting the user.
-            Action::Read { path } if !self.confirm_reads => {
-                return Some(self.perform_read(&path));
+            Action::Read {
+                path,
+                offset,
+                limit,
+            } if !self.confirm_reads => {
+                return Some(self.perform_read(&path, offset, limit));
             }
             // A fetch is auto-approved on the same reasoning, but it is network
             // I/O rather than a local read, so it cannot run inline here. Park
@@ -1316,18 +1350,57 @@ impl App {
     /// than the task-spawning and generation-tagging a background job would need.
     /// A failed read is reported to the model as a result, not raised as an
     /// error, so a bad path costs one round-trip instead of ending the turn.
-    pub fn perform_read(&mut self, path: &str) -> Vec<Message> {
+    pub fn perform_read(
+        &mut self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Vec<Message> {
         let outcome = match &self.sandbox {
-            Some(sandbox) => crate::files::read(sandbox, path),
+            Some(sandbox) => crate::files::read(sandbox, path, offset, limit),
             None => ReadOutcome::failed(path, "file access is not configured"),
         };
         let encoded = protocol::encode_read_result(&outcome);
+        self.retire_superseded_reads(&outcome);
         self.transcript.push(Entry::ReadResult(outcome));
         self.frame(Direction::Sent, encoded.clone());
         self.history.push(Message::user(encoded));
         self.status = Status::Waiting;
         self.follow = true;
         self.history.clone()
+    }
+
+    /// Replace earlier read results that `outcome` covers with a placeholder.
+    ///
+    /// The whole conversation is resent every turn, so a file read twice is paid
+    /// for on every request thereafter — in one real session a single duplicate
+    /// read of `src/app.rs` was a quarter of the entire context. It is also a
+    /// correctness fix: if the file changed in between, the older copy is
+    /// actively describing the file wrongly.
+    ///
+    /// Only `history` is touched. The transcript keeps every result in full,
+    /// because the user may still want to scroll back to what was read at the
+    /// time; it is the model's copy that is redundant.
+    fn retire_superseded_reads(&mut self, outcome: &ReadOutcome) {
+        let (Some(last), true) = (outcome.last_line(), outcome.succeeded()) else {
+            return;
+        };
+        let first = outcome.first_line();
+        // Substituted in place rather than removed: `retry_anchor` holds an
+        // index into `history`, and shortening it underneath would silently
+        // roll back the wrong messages.
+        for message in &mut self.history {
+            let Some((path, was_first, was_last)) =
+                protocol::read_result_window(&message.content)
+            else {
+                continue;
+            };
+            // Only when the new window covers the old one whole. Two different
+            // windows of the same file are both worth keeping.
+            if path == outcome.path && was_first >= first && was_last <= last {
+                message.content = protocol::encode_superseded_read(&outcome.path);
+            }
+        }
     }
 
     /// Roll an abandoned retry loop out of context, back to where history was
@@ -1361,9 +1434,15 @@ impl App {
         content: String,
         error: protocol::ProtocolError,
     ) -> Option<Vec<Message>> {
-        // Remember where context was clean, before the first bad reply.
-        if self.retry_anchor.is_none() {
-            self.retry_anchor = Some(self.history.len());
+        // Remember where context was clean, before the first bad reply — and
+        // roll back to it, so a streak of failures does not stack up. Attempt
+        // three otherwise resends both earlier bad replies and both corrections,
+        // which is the model's own confusion quoted back at it three times over.
+        // The transcript below keeps every attempt, so nothing is hidden from
+        // the user; it is only the model's copy that is pruned to the latest.
+        match self.retry_anchor {
+            Some(anchor) => self.history.truncate(anchor),
+            None => self.retry_anchor = Some(self.history.len()),
         }
         self.retries += 1;
         self.transcript.push(Entry::Malformed {
@@ -1519,7 +1598,11 @@ impl App {
         // Show what was refused: the command, or the write's path.
         let refused = match &pending.action {
             Action::Shell(command) => command.clone(),
-            Action::Read { path } => format!("read {path}"),
+            Action::Read {
+                path,
+                offset,
+                limit,
+            } => format!("read {}", protocol::read_label(path, *offset, *limit)),
             Action::Fetch { url } => format!("fetch {url}"),
             Action::Write { path, .. } => format!("write {path}"),
             Action::Edit { path, .. } => format!("edit {path}"),
@@ -1595,20 +1678,71 @@ impl App {
     pub fn push_error(&mut self, message: String) {
         // Whatever was running is over; the live view must not outlive it.
         self.running = None;
-        // Drop the trailing user turn (a query, or a command result) so a retry
-        // does not double-send it.
-        if matches!(
-            self.history.last(),
-            Some(Message {
-                role: crate::openrouter::Role::User,
-                ..
-            })
-        ) {
+        // An overflow is not a failed turn, it is a full conversation — and the
+        // trailing result is usually the very thing that filled it. Dropping it
+        // would throw away the work that provoked the error and say nothing
+        // about why, leaving a session that fails identically on every retry.
+        let overflowed = Self::is_context_overflow(&message);
+        if !overflowed
+            && matches!(
+                self.history.last(),
+                Some(Message {
+                    role: crate::openrouter::Role::User,
+                    ..
+                })
+            )
+        {
+            // Drop the trailing user turn (a query, or a command result) so a
+            // retry does not double-send it.
             self.history.pop();
         }
         self.transcript.push(Entry::Error(message));
+        if overflowed {
+            self.push_notice(
+                "The conversation no longer fits in the model's context window. \
+                 Nothing was lost — but this will keep happening until the \
+                 conversation is shorter. Use /clear to start fresh, or /save \
+                 and open a new session.",
+            );
+        }
         self.status = Status::Idle;
         self.follow = true;
+    }
+
+    /// Bytes of conversation currently held, as the model will receive it.
+    fn history_bytes(&self) -> usize {
+        self.history.iter().map(|m| m.content.len()).sum()
+    }
+
+    /// Bytes this turn has appended since the user's prompt.
+    ///
+    /// Derived rather than counted up as messages are pushed: history is also
+    /// truncated (retry rollback) and rewritten (superseded reads), and a
+    /// running total would drift out of step with all of it.
+    fn turn_bytes(&self) -> usize {
+        self.history_bytes().saturating_sub(self.turn_start_bytes)
+    }
+
+    /// Whether an API error means "the conversation is too long".
+    ///
+    /// Matched on text because that is all the provider gives us: OpenRouter
+    /// passes the upstream message through, and the wording varies by model.
+    /// A false negative just means the old behaviour; a false positive keeps one
+    /// message that would have been dropped. Both are survivable, which is why
+    /// this stays a heuristic rather than pretending to be a status code.
+    fn is_context_overflow(message: &str) -> bool {
+        let message = message.to_ascii_lowercase();
+        [
+            "context length",
+            "context window",
+            "maximum context",
+            "too many tokens",
+            "reduce the length",
+            "prompt is too long",
+            "context_length_exceeded",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
     }
 
     pub fn push_notice(&mut self, message: impl Into<String>) {
@@ -2308,6 +2442,42 @@ mod tests {
             correction.content
         );
         assert!(correction.content.contains("ai-harness-shell"));
+    }
+
+    /// A retry streak must not stack. Sending attempt three with both earlier
+    /// bad replies and both corrections still attached quotes the model's own
+    /// confusion back at it three times over, and grows with every failure.
+    #[test]
+    fn a_retry_streak_resends_only_the_latest_failure() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.max_retries = 3;
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+
+        let after_first = app.push_response("garbage one".into(), None).unwrap().len();
+        let after_second = app.push_response("garbage two".into(), None).unwrap().len();
+        assert_eq!(
+            after_first, after_second,
+            "a second failure should replace the first, not pile on top of it"
+        );
+
+        let resend = app.push_response("garbage three".into(), None).unwrap();
+        assert_eq!(resend.len(), after_first, "still just one failure in flight");
+        assert!(
+            !resend.iter().any(|m| m.content.contains("garbage one")),
+            "the superseded attempt should be gone from context"
+        );
+        assert!(
+            resend.iter().any(|m| m.content.contains("garbage three")),
+            "the latest attempt is what the model needs to see"
+        );
+
+        // The user still sees every attempt; only the model's copy is pruned.
+        let malformed = visible(&app)
+            .iter()
+            .filter(|e| matches!(e, Entry::Malformed { .. }))
+            .count();
+        assert_eq!(malformed, 3, "the transcript keeps the whole streak");
     }
 
     #[test]
@@ -3775,6 +3945,7 @@ mod tests {
         Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
+                prompt_tokens_details: None,
         }
     }
 
@@ -4015,17 +4186,19 @@ mod file_tests {
             Some(pending) => assert_eq!(
                 pending.action,
                 Action::Read {
-                    path: "notes.txt".into()
+                    path: "notes.txt".into(),
+                    offset: None,
+                    limit: None,
                 }
             ),
             None => panic!("expected the approval modal"),
         }
 
         // Approving runs the very same helper the automatic path uses.
-        let Some(Action::Read { path }) = app.approve() else {
+        let Some(Action::Read { path, .. }) = app.approve() else {
             panic!("approve should hand back the read")
         };
-        let messages = app.perform_read(&path);
+        let messages = app.perform_read(&path, None, None);
         assert!(messages.last().unwrap().content.contains("hello"));
         assert!(app.is_waiting());
     }
@@ -4044,11 +4217,192 @@ mod file_tests {
         );
     }
 
+    /// How many history messages still carry a file's contents.
+    fn copies_in_history(app: &App, needle: &str) -> usize {
+        app.history
+            .iter()
+            .filter(|m| m.content.contains(needle))
+            .count()
+    }
+
+    /// The pattern that cost a quarter of a real session: the same file read
+    /// twice, both copies resent on every request thereafter.
+    #[test]
+    fn re_reading_a_file_retires_the_earlier_copy() {
+        let (mut app, _dir) = app_with_files(&[("big.rs", "alpha\nbeta\ngamma\n")]);
+
+        app.perform_read("big.rs", None, None);
+        assert_eq!(copies_in_history(&app, "alpha\nbeta\ngamma"), 1);
+
+        app.perform_read("big.rs", None, None);
+        assert_eq!(
+            copies_in_history(&app, "alpha\nbeta\ngamma"),
+            1,
+            "the duplicate should not be paid for twice:\n{:#?}",
+            app.history
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.content.contains("read again later")),
+            "the retired slot should say where the contents went"
+        );
+    }
+
+    /// The correctness half: after an edit, the old copy is not merely
+    /// redundant, it describes the file wrongly.
+    #[test]
+    fn re_reading_a_changed_file_retires_the_stale_contents() {
+        let (mut app, dir) = app_with_files(&[("m.rs", "let x = 1;\n")]);
+        app.perform_read("m.rs", None, None);
+        std::fs::write(dir.join("m.rs"), "let x = 2;\n").unwrap();
+        app.perform_read("m.rs", None, None);
+
+        assert_eq!(copies_in_history(&app, "let x = 1;"), 0, "stale contents");
+        assert_eq!(copies_in_history(&app, "let x = 2;"), 1, "current contents");
+    }
+
+    /// Two different windows of one file are both worth keeping — retiring the
+    /// first would make paging through a large file impossible.
+    #[test]
+    fn a_different_window_of_the_same_file_is_kept() {
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let (mut app, _dir) = app_with_files(&[("n.txt", body.as_str())]);
+
+        app.perform_read("n.txt", Some(1), Some(3));
+        app.perform_read("n.txt", Some(10), Some(3));
+
+        assert_eq!(copies_in_history(&app, "line 1\n"), 1, "first window kept");
+        assert_eq!(copies_in_history(&app, "line 10\n"), 1, "second window kept");
+    }
+
+    /// A whole-file read does supersede a window inside it.
+    #[test]
+    fn a_wider_read_retires_the_window_it_covers() {
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let (mut app, _dir) = app_with_files(&[("n.txt", body.as_str())]);
+
+        app.perform_read("n.txt", Some(5), Some(2));
+        assert_eq!(copies_in_history(&app, "line 5\n"), 1);
+
+        app.perform_read("n.txt", None, None);
+        assert_eq!(
+            copies_in_history(&app, "line 5\n"),
+            1,
+            "the window is inside the whole file, so only one copy should remain"
+        );
+    }
+
+    /// Reads of different files must not retire each other.
+    #[test]
+    fn reading_another_file_retires_nothing() {
+        let (mut app, _dir) = app_with_files(&[("a.rs", "aaa\n"), ("b.rs", "bbb\n")]);
+        app.perform_read("a.rs", None, None);
+        app.perform_read("b.rs", None, None);
+
+        assert_eq!(copies_in_history(&app, "aaa"), 1);
+        assert_eq!(copies_in_history(&app, "bbb"), 1);
+    }
+
+    /// `max_iterations` bounds round-trips, not size. A few whole-file reads can
+    /// exhaust the context window well inside the round-trip budget, so the loop
+    /// has to stop on bytes too.
+    #[test]
+    fn a_turn_that_gathers_too_much_context_stops() {
+        // Five *different* files: re-reading one would be retired as superseded
+        // and never accumulate, which is the point of `retire_superseded_reads`.
+        let big = "x".repeat(40 * 1024);
+        let names: Vec<String> = (0..5).map(|n| format!("big{n}.txt")).collect();
+        let files: Vec<(&str, &str)> =
+            names.iter().map(|n| (n.as_str(), big.as_str())).collect();
+        let (mut app, _dir) = app_with_files(&files);
+        app.max_turn_bytes = 100 * 1024;
+        app.max_iterations = 100;
+
+        // `app_with_files` has already sent the prompt, so the turn is underway.
+        for name in &names {
+            app.perform_read(name, None, None);
+            app.push_response(read_reply(name), None);
+        }
+
+        assert!(
+            !app.is_busy(),
+            "the byte budget should have stopped the loop, at {} bytes",
+            app.turn_bytes()
+        );
+        assert!(
+            visible(&app).iter().any(|e| matches!(
+                e,
+                Entry::Notice(text) if text.contains("added") && text.contains("conversation")
+            )),
+            "stopping should say why"
+        );
+        assert!(
+            app.iterations < app.max_iterations,
+            "it stopped on size, not on round-trips"
+        );
+    }
+
+    /// The byte budget is per prompt, like the round-trip budget: a new prompt
+    /// must not inherit the last one's spending.
+    #[test]
+    fn a_fresh_prompt_starts_a_fresh_byte_budget() {
+        let big = "x".repeat(40 * 1024);
+        let (mut app, _dir) = app_with_files(&[("big.txt", big.as_str())]);
+        app.perform_read("big.txt", None, None);
+        assert!(app.turn_bytes() > 30 * 1024);
+
+        app.status = Status::Idle;
+        app.input.insert_str("second");
+        app.submit().unwrap();
+        assert!(
+            app.turn_bytes() < 1024,
+            "a new prompt starts from zero, not {}",
+            app.turn_bytes()
+        );
+    }
+
+    /// An overflow is a full conversation, not a failed turn. Dropping the
+    /// trailing result would discard the work that provoked it and explain
+    /// nothing, leaving a session that fails the same way on every retry.
+    #[test]
+    fn a_context_overflow_keeps_the_result_and_says_what_to_do() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "contents\n")]);
+        app.perform_read("m.rs", None, None);
+        let before = app.history.len();
+
+        app.push_error("This model's maximum context length is 128000 tokens".into());
+
+        assert_eq!(app.history.len(), before, "the read result must survive");
+        assert!(
+            app.history.last().unwrap().content.contains("contents"),
+            "the result that filled the window is the one worth keeping"
+        );
+        assert!(
+            visible(&app)
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(t) if t.contains("/clear"))),
+            "an overflow should say how to recover"
+        );
+    }
+
+    /// Any other error keeps the old behaviour: the trailing turn goes, so a
+    /// retry does not double-send it.
+    #[test]
+    fn an_ordinary_error_still_drops_the_trailing_turn() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "contents\n")]);
+        app.perform_read("m.rs", None, None);
+        let before = app.history.len();
+
+        app.push_error("connection reset by peer".into());
+        assert_eq!(app.history.len(), before - 1);
+    }
+
     /// Without a sandbox a read must fail closed, not panic or read anyway.
     #[test]
     fn a_read_without_a_sandbox_fails_safely() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        let messages = app.perform_read("anything.txt");
+        let messages = app.perform_read("anything.txt", None, None);
         assert!(messages.last().unwrap().content.contains("not configured"));
     }
 

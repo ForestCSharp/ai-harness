@@ -178,6 +178,13 @@ Doing file I/O on the event loop is a deliberate trade: a read is capped at
 64 KB from local disk, which is far cheaper than the task spawning, channel
 plumbing, and generation tagging a background job would need.
 
+A read may carry `offset=`/`limit=` for a line window, and `files::read` streams
+line-wise rather than slurping, so paging through a large file costs only the
+bytes it skips. When a window does not reach the end, `encode_read_result` names
+the exact follow-up read. That matters more than it looks: the note it replaced
+said only that the file was longer, which left the model with no better move than
+to read the identical head again — measured at 25% of one real session's context.
+
 **(e) `<ai-harness-fetch>`** — the model wants to read a web page. Also
 auto-approved, but it cannot take the read's shortcut: it is network I/O, so it
 needs exactly the task spawning and generation tagging a read avoids. The

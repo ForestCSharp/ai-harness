@@ -576,11 +576,15 @@ fn approval_body(
 ) -> (&'static str, &'static str, Vec<Line<'static>>) {
     let (prompt, title, body): (&str, &str, Vec<Line>) = match &pending.action {
         // Only reachable under `--confirm-reads`; reads are otherwise silent.
-        Action::Read { path } => (
+        Action::Read {
+            path,
+            offset,
+            limit,
+        } => (
             "The model wants to read:",
             " read this file? ",
             vec![Line::from(Span::styled(
-                path.clone(),
+                crate::protocol::read_label(path, *offset, *limit),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
@@ -1040,9 +1044,15 @@ fn render_entry(
                     lines.extend(body_lines(cmd, Style::default().fg(Color::Magenta), width))
                 }
                 // The path is the whole action; the contents arrive as a result.
-                Action::Read { path } => {
-                    lines.extend(body_lines(path, Style::default().fg(Color::Blue), width))
-                }
+                Action::Read {
+                    path,
+                    offset,
+                    limit,
+                } => lines.extend(body_lines(
+                    &crate::protocol::read_label(path, *offset, *limit),
+                    Style::default().fg(Color::Blue),
+                    width,
+                )),
                 // Likewise the URL; the page text arrives as a result.
                 Action::Fetch { url } => {
                     lines.extend(body_lines(url, Style::default().fg(Color::Blue), width))
@@ -1983,18 +1993,17 @@ mod tests {
         app.transcript.push(Entry::Action {
             action: crate::protocol::Action::Read {
                 path: "src/app.rs".into(),
+                offset: None,
+                limit: None,
             },
             usage: None,
             diff: None,
         });
         app.transcript
-            .push(Entry::ReadResult(crate::files::ReadOutcome {
-                path: "src/app.rs".into(),
-                contents: "alpha\nbeta\n".into(),
-                lines: 2,
-                truncated: false,
-                error: None,
-            }));
+            .push(Entry::ReadResult(crate::files::ReadOutcome::whole_file(
+                "src/app.rs",
+                "alpha\nbeta\n",
+            )));
 
         let (rows, _) = render(&mut app, 70, 20);
         let screen = transcript_only(&rows);
@@ -2096,13 +2105,9 @@ mod tests {
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         let contents: String = (0..40).map(|i| format!("line {i}\n")).collect();
         app.transcript
-            .push(Entry::ReadResult(crate::files::ReadOutcome {
-                path: "big.txt".into(),
-                lines: 40,
-                contents,
-                truncated: false,
-                error: None,
-            }));
+            .push(Entry::ReadResult(crate::files::ReadOutcome::whole_file(
+                "big.txt", contents,
+            )));
 
         let (rows, _) = render(&mut app, 70, 24);
         let screen = transcript_only(&rows);

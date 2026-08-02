@@ -119,6 +119,11 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     // the sandbox itself, not just its root.
     app.sandbox = Some(sandbox.clone());
     app.confirm_reads = args.confirm_reads;
+    app.max_turn_bytes = if args.max_turn_bytes == 0 {
+        usize::MAX
+    } else {
+        args.max_turn_bytes
+    };
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
@@ -428,8 +433,12 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     // immediately. Only reachable under `--confirm-reads`; otherwise a read
     // never becomes pending in the first place.
     let action = match action {
-        Action::Read { path } => {
-            let messages = app.perform_read(&path);
+        Action::Read {
+            path,
+            offset,
+            limit,
+        } => {
+            let messages = app.perform_read(&path, offset, limit);
             spawn_request(app, ctx, inflight, messages);
             return;
         }

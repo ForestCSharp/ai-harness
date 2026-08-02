@@ -29,6 +29,20 @@ pub struct Ledger {
     /// overnight would report a meaningless number. Time spent waiting on the
     /// model is the figure that means something.
     pub waiting_ms: u64,
+    /// Prompt tokens the provider served from its own cache.
+    ///
+    /// `serde(default)` and no `session::VERSION` bump, the same way
+    /// `Session::ledger` itself was added.
+    #[serde(default)]
+    pub cached_tokens: u64,
+    /// Prompt tokens on the most recent request — that is, how big the
+    /// conversation actually is right now.
+    ///
+    /// The cumulative total says what a session has cost; this says how close it
+    /// is to the context limit, which is the number that predicts the wall. It
+    /// needs no estimating: the last request measured it exactly.
+    #[serde(default)]
+    pub last_prompt_tokens: u64,
 }
 
 impl Ledger {
@@ -36,7 +50,15 @@ impl Ledger {
     pub fn record(&mut self, usage: &Usage) {
         self.prompt_tokens += u64::from(usage.prompt_tokens);
         self.completion_tokens += u64::from(usage.completion_tokens);
+        self.cached_tokens += u64::from(usage.cached_tokens());
+        self.last_prompt_tokens = u64::from(usage.prompt_tokens);
         self.requests += 1;
+    }
+
+    /// Share of prompt tokens served from cache, `None` if nothing was billed
+    /// yet. Zero is a real answer — it means nothing is being cached.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.prompt_tokens > 0).then(|| self.cached_tokens as f64 / self.prompt_tokens as f64)
     }
 
     /// Add time spent on a request. Cancelled and failed requests count too —
@@ -67,9 +89,16 @@ impl Ledger {
         )
     }
 
-    /// A short indicator for the status bar, e.g. `36.7k tok  $0.04`.
+    /// A short indicator for the status bar, e.g. `66k ctx  36.7k tok  $0.04`.
+    ///
+    /// Context first, because it is the one that can end the session: spend
+    /// grows steadily and forgivingly, while the context window is a wall.
     pub fn status_line(&self, price_in: Option<f64>, price_out: Option<f64>) -> String {
-        let mut text = format!("{} tok", compact(self.total_tokens()));
+        let mut text = String::new();
+        if self.last_prompt_tokens > 0 {
+            text.push_str(&format!("{} ctx  ", compact(self.last_prompt_tokens)));
+        }
+        text.push_str(&format!("{} tok", compact(self.total_tokens())));
         if let Some(cost) = self.cost(price_in, price_out) {
             text.push_str(&format!("  {}", money(cost)));
         }
@@ -94,6 +123,19 @@ impl Ledger {
             thousands(self.total_tokens()),
             duration(self.waiting_ms),
         );
+        // The whole conversation is resent every turn, so the current context is
+        // what each further request costs — the total above is mostly re-sends.
+        text.push_str(&format!(
+            "\n  context now    {} (resent with every request)",
+            thousands(self.last_prompt_tokens)
+        ));
+        if let Some(rate) = self.cache_hit_rate() {
+            text.push_str(&format!(
+                "\n  cached input   {} ({:.0}% of input)",
+                thousands(self.cached_tokens),
+                rate * 100.0
+            ));
+        }
         match self.cost(price_in, price_out) {
             Some(cost) => text.push_str(&format!(
                 "\n  estimated cost {} (at ${}/M in, ${}/M out)",
@@ -164,6 +206,7 @@ mod tests {
         Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
+                prompt_tokens_details: None,
         }
     }
 
@@ -242,8 +285,50 @@ mod tests {
     fn the_status_line_stays_short() {
         let mut ledger = Ledger::default();
         ledger.record(&usage(34_500, 2_200));
-        assert_eq!(ledger.status_line(None, None), "36.7k tok");
+        // Context first: it is the figure that can end the session.
+        assert_eq!(ledger.status_line(None, None), "34.5k ctx  36.7k tok");
         assert!(ledger.status_line(Some(1.0), Some(1.0)).contains('$'));
+    }
+
+    /// The cumulative total counts every re-send of the conversation; the
+    /// context figure is the conversation itself, so it must track the latest
+    /// request rather than accumulate.
+    #[test]
+    fn context_size_is_the_last_request_not_the_running_total() {
+        let mut ledger = Ledger::default();
+        ledger.record(&usage(1_000, 10));
+        ledger.record(&usage(3_000, 10));
+        ledger.record(&usage(9_000, 10));
+
+        assert_eq!(ledger.last_prompt_tokens, 9_000);
+        assert_eq!(ledger.prompt_tokens, 13_000);
+        assert!(ledger.status_line(None, None).starts_with("9.0k ctx"));
+    }
+
+    /// Zero is a real answer — it means the provider is not caching this
+    /// conversation, which is exactly what we want to be able to see.
+    #[test]
+    fn cache_reporting_distinguishes_none_from_unknown() {
+        let mut ledger = Ledger::default();
+        assert_eq!(ledger.cache_hit_rate(), None, "nothing billed yet");
+
+        // Reported even at zero. "Nothing is being cached" is the answer this
+        // exists to give; hiding the line would leave it looking unmeasured.
+        ledger.record(&usage(1_000, 10));
+        assert_eq!(ledger.cache_hit_rate(), Some(0.0), "billed, none cached");
+        let none_cached = ledger.report(None, None);
+        assert!(none_cached.contains("cached input"), "{none_cached}");
+        assert!(none_cached.contains("0%"), "{none_cached}");
+
+        let mut cached = usage(1_000, 10);
+        cached.prompt_tokens_details = Some(crate::openrouter::PromptTokensDetails {
+            cached_tokens: 750,
+        });
+        ledger.record(&cached);
+        assert_eq!(ledger.cached_tokens, 750);
+        let report = ledger.report(None, None);
+        assert!(report.contains("cached input"), "{report}");
+        assert!(report.contains("38%"), "750 of 2000 input tokens:\n{report}");
     }
 
     #[test]

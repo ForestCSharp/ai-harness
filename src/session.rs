@@ -328,6 +328,7 @@ mod tests {
                     usage: Some(Usage {
                         prompt_tokens: 3,
                         completion_tokens: 1,
+                prompt_tokens_details: None,
                     }),
                     diff: None,
                 },
@@ -689,6 +690,7 @@ mod tests {
         session.ledger.record(&Usage {
             prompt_tokens: 120,
             completion_tokens: 40,
+                prompt_tokens_details: None,
         });
         save(&dir, "led", &session).unwrap();
 

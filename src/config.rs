@@ -42,6 +42,14 @@ pub struct Args {
     #[arg(long, default_value_t = 100, env = "AI_HARNESS_MAX_ITERATIONS")]
     pub max_iterations: usize,
 
+    /// Maximum bytes one prompt may add to the conversation.
+    ///
+    /// The size half of the loop budget: `--max-iterations` bounds round-trips,
+    /// but a handful of whole-file reads can exhaust the context window well
+    /// inside that. 0 disables the check.
+    #[arg(long, default_value_t = 512 * 1024, env = "AI_HARNESS_MAX_TURN_BYTES")]
+    pub max_turn_bytes: usize,
+
     /// Ask before each file read. Off by default: a read mutates nothing and
     /// cannot leave the working directory, so it runs without interrupting you.
     #[arg(long, env = "AI_HARNESS_CONFIRM_READS")]

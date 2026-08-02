@@ -22,6 +22,10 @@ The model must reply with exactly one of seven elements, and nothing else:
 ```
 
 ```xml
+<ai-harness-read offset=1587 limit=400>src/app.rs</ai-harness-read>
+```
+
+```xml
 <ai-harness-fetch>https://doc.rust-lang.org/std/net/enum.IpAddr.html</ai-harness-fetch>
 ```
 
@@ -65,7 +69,10 @@ formatting newline after `>` is stripped).
 
 `<ai-harness-read>` is the exception: it mutates nothing, so it runs immediately
 with **no approval prompt** and the contents come straight back as
-`<ai-harness-read-result>`. That is the point of having it as its own element
+`<ai-harness-read-result>`. It takes an optional line window — `offset=` is the
+first line, counting from 1, and `limit=` is how many lines to return. A file too
+big for one read says which lines it gave you and names the read that continues
+it, so the tail of a large file is reachable rather than permanently cut off. That is the point of having it as its own element
 rather than leaving reads to `cat` — an agent that wants to look at four files
 before doing anything should not interrupt you four times first. It earns that
 by being confined more tightly than the shell is: reads resolve to a real path
@@ -221,7 +228,7 @@ escapes are covered too.
 | `<ai-harness-fetch>` | Public https hosts only; never this machine or this network |
 | Network | Allowed — the approval prompt is the control point |
 | Timeout | 30s by default, killing the whole process group |
-| Output | Capped at 32 KB per stream; a read at 64 KB |
+| Output | Capped at 32 KB per stream; a read window at 64 KB |
 
 The read element is deliberately stricter than the shell. It resolves the path
 in process and refuses anything that lands outside the root — including a
@@ -303,6 +310,9 @@ forever from running forever.
 
 The agentic loop is bounded by `--max-iterations` so a model that keeps proposing
 actions cannot spin forever; reads and edits count against it like anything else.
+It is bounded by `--max-turn-bytes` as well, because round-trips are the wrong
+unit for the damage a few whole-file reads can do: a handful of them can crowd
+out the context window well inside the round-trip budget.
 
 **This confines the filesystem; it is not a security boundary against a
 determined attacker.** Network is on, so any command you approve can send
@@ -421,10 +431,17 @@ cargo run -- --system "Prefer ripgrep over grep."
 
 ## Cost
 
-The status bar carries a running token total once a session has spent anything,
-and `/cost` prints the breakdown — requests, input and output tokens, and time
-actually spent waiting on the model (not wall-clock, which would count the hours
-a session sat idle).
+The status bar carries the current context size and a running token total once a
+session has spent anything, and `/cost` prints the breakdown — requests, input
+and output tokens, and time actually spent waiting on the model (not wall-clock,
+which would count the hours a session sat idle).
+
+The two numbers answer different questions. The total is what the session has
+cost; the context figure is how big the conversation is *now*, which is what each
+further request pays and what eventually hits the model's limit. The whole
+conversation is resent every turn, so most of the total is re-sends. `/cost` also
+reports how much of the input the provider served from its own cache — `0%` is a
+real answer, and a useful one.
 
 Dollar figures need per-model rates, which differ and change, so they are given
 rather than baked in — a hardcoded price table would go stale without anyone
@@ -444,8 +461,8 @@ that fails protocol validation is counted too, since a retry loop costs real
 money precisely when it is going wrong.
 
 Other flags: `--workdir` sets the sandbox root (default: cwd),
-`--command-timeout` the per-command limit in seconds, `--max-iterations` the
-agentic loop bound, `--confirm-reads` puts file reads behind the approval modal
+`--command-timeout` the per-command limit in seconds, `--max-iterations` and
+`--max-turn-bytes` the agentic loop bounds, `--confirm-reads` puts file reads behind the approval modal
 along with everything else, and `--confirm-fetch` does the same for URL fetches.
 `--auto-approve` goes the other way and removes the modal entirely — read
 [Sandboxing](#sandboxing) before using it. Every flag also has an environment
