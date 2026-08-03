@@ -87,6 +87,22 @@ and returns `Some(messages)`, which `handle_update` immediately re-sends. That i
 a loop back to step 2. Malformed replies do **not** count against the agentic
 `iterations` budget — only valid ones do.
 
+One shape is recovered rather than retried. A sentence of narration in front of
+an otherwise perfect element — "Let me read that.`<ai-harness-read>`…" — is the
+commonest way a model breaks the contract and the least informative: the action
+it wrote was right, so the round-trip buys nothing. `recover_preamble` drops the
+prose, runs the element, and posts a notice saying how much it dropped. It is
+deliberately narrow: only `ProtocolError::NotATag`, only when the element behind
+the prose parses on its own, and it is the **stripped** text that goes into
+history, since sending the preamble back is how the habit gets reinforced.
+Everything else — trailing content, two elements, a fabricated result, any
+attribute error — is rejected exactly as before. `--strict-replies` turns the
+recovery off and takes the retry instead.
+
+When a reply *is* retried and it contained one valid element,
+`encode_correction` quotes that element back and asks for it alone, rather than
+restating the tag list the system prompt already carries.
+
 A retry loop leaves nothing behind. However it ends — the model recovers, the cap
 is hit, or you press `Esc` — `roll_back_retries` truncates history to
 `retry_anchor`, the point where context was last clean, so the failed attempts and
@@ -353,6 +369,40 @@ into it, and it has exactly one terminal exit — `<ai-harness-response>` → `I
                                             └───── deny / command result ┘
 ```
 
+## When the conversation stops fitting
+
+`push_response` has one more thing to do before it returns `None`. With the reply
+committed, the turn ended, and nothing in flight, it asks whether the
+conversation has grown past `--compact-at` of the model's window — real
+`prompt_tokens` from the last request against `ModelInfo::context_length`, or
+`history_bytes()` against a fixed fallback when the catalog cannot say. This is
+the same position and the same reasoning as the `max_turn_bytes` guard: growth
+*within* a turn is that guard's problem, and a mid-turn overflow is
+`push_error`'s.
+
+A compaction is **worked out but not applied**. `compact::plan` returns a `Plan`
+— where the verbatim tail starts, and the prefix with every tool-result body
+replaced by a stub — which `App` parks in `pending_compaction` for the event loop
+to spawn a summarising request for. That request is deliberately out of band:
+`Client::complete` rather than `open_stream`, with a prompt that is *not* the
+protocol contract, because the reply is prose that becomes context and
+`push_response` would reject it as malformed.
+
+Only when the summary lands does `apply_summary` touch `history`. That ordering
+is the whole design: a failed, refused, or cancelled summary leaves the
+conversation byte-identical, because nothing had changed yet. It also has four
+pieces of bookkeeping to get right, each of which fails silently otherwise —
+`retry_anchor` is a raw index (rolled back first), `turn_start_bytes` is a byte
+snapshot (carried across), `fingerprint` assumes lengths only grow (so it saves
+outright), and `history[0]` carries the plan contract (so it re-derives it). The
+pre-compaction conversation goes to `compaction-NNN.json` in the session folder
+before any of that happens.
+
+`push_error` uses the same machinery when the provider rejects a request as too
+long: compact, then resend the identical request. Once — `overflow_compacted`
+is set there and cleared only by a new prompt, so a second overflow in the same
+turn gives up instead of looping.
+
 ## Cancelling a turn
 
 `Esc` while busy (and not in the modal) interrupts the in-flight work. Two things
@@ -403,6 +453,7 @@ cannot be run.
 | `src/exec.rs` / `src/sandbox.rs` | Sandboxed command execution |
 | `src/files.rs` | Path resolution and bounded reads for `<ai-harness-read>` |
 | `src/search.rs` | The confined tree walk behind `<ai-harness-grep>` and `<ai-harness-glob>` |
+| `src/compact.rs` | Working out what to drop when the conversation stops fitting |
 | `src/diff.rs` | Line-by-line diffs of a write or edit, bounded for storage |
 | `src/highlight.rs` | Language detection and per-line tokenising for code blocks |
 | `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |

@@ -1,5 +1,6 @@
 mod app;
 mod command;
+mod compact;
 mod config;
 mod diff;
 mod exec;
@@ -61,6 +62,10 @@ enum Update {
     /// A grep or glob finished. Like a fetch, every failure mode is carried in
     /// the outcome, so there is no `Err` arm to handle.
     Search(Box<search::SearchOutcome>),
+    /// A compaction's summary arrived, or the reason it did not. The job rides
+    /// along because the app handed it out to be spawned and needs it back to
+    /// apply — which is also what keeps `history` untouched until this lands.
+    Summary(Box<(compact::Job, Result<Completion, String>)>),
     /// The model catalog arrived, or the reason it did not. Unlike every other
     /// update this belongs to no turn — see [`handle_update`].
     Models(Result<Vec<openrouter::ModelInfo>, String>),
@@ -124,6 +129,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     );
     app.debug = args.debug || cfg!(debug_assertions);
     app.max_retries = args.max_retries;
+    app.strip_preamble = !args.strict_replies;
     // Reads resolve paths in-process against the sandbox root, so the app needs
     // the sandbox itself, not just its root.
     app.sandbox = Some(sandbox.clone());
@@ -133,6 +139,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     } else {
         args.max_turn_bytes
     };
+    app.compact_at = args.compact_at;
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
@@ -195,12 +202,17 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                         app.should_quit = true;
                     }
                 }
+                // A key can park a compaction — `/compact`, or a prompt whose
+                // turn ends over the threshold. Both converge here rather than
+                // in each handler, so there is one place that starts one.
+                pump_compaction(&mut app, &ctx, &mut inflight);
                 dirty = true;
             }
 
             // Background work finished.
             Some(tagged) = rx.recv() => {
                 handle_update(tagged, &mut app, &ctx, &mut inflight);
+                pump_compaction(&mut app, &ctx, &mut inflight);
                 dirty = true;
             }
 
@@ -210,7 +222,10 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             _ = ticker.tick() => {
                 if matches!(
                     app.status,
-                    app::Status::Waiting | app::Status::Streaming | app::Status::Running
+                    app::Status::Waiting
+                        | app::Status::Streaming
+                        | app::Status::Running
+                        | app::Status::Compacting
                 ) {
                     app.tick = app.tick.wrapping_add(1);
                     dirty = true;
@@ -324,6 +339,16 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
             let messages = app.push_search_result(*outcome);
             spawn_request(app, ctx, inflight, messages);
         }
+        // A summary either shortens the conversation or fails trying; both end
+        // with a shorter history, and the overflow path resends on the spot.
+        Update::Summary(payload) => {
+            *inflight = None;
+            app.mark_request_done();
+            let (job, result) = *payload;
+            if let Some(messages) = app.apply_summary(job, result) {
+                spawn_request(app, ctx, inflight, messages);
+            }
+        }
     }
 }
 
@@ -430,11 +455,15 @@ fn handle_event(
             MouseEventKind::ScrollDown => app.scroll_down(3, metrics.max_scroll()),
             _ => {}
         },
-        // A paste into the model picker narrows the list — pasting a model id is
-        // exactly how you would use one you already have.
+        // A paste into either picker narrows its list — pasting a model id or a
+        // session name is exactly how you would use one you already have.
         Event::Paste(text) if app.model_picker().is_some() => {
             let text = text.replace(['\r', '\n'], " ");
             app.model_query_input(|input| input.insert_str(&text));
+        }
+        Event::Paste(text) if app.picker().is_some() => {
+            let text = text.replace(['\r', '\n'], " ");
+            app.picker_query_input(|input| input.insert_str(&text));
         }
         Event::Paste(text) if !app.is_busy() && app.picker().is_none() => {
             // Normalise line endings so pasted CRLF does not leave stray \r.
@@ -763,7 +792,9 @@ fn handle_key(
         return;
     }
 
-    // The session picker owns the keyboard while it is open.
+    // The session picker owns the keyboard while it is open. Like the model
+    // picker below, it is a list plus a text field: navigation keys move the
+    // highlight and everything else narrows the list.
     if app.picker().is_some() {
         match key.code {
             KeyCode::Up => app.picker_move(-1),
@@ -772,6 +803,34 @@ fn handle_key(
             KeyCode::PageDown => app.picker_move(page as isize),
             KeyCode::Enter => app.picker_confirm(),
             KeyCode::Esc => app.picker_cancel(),
+            KeyCode::Char(c) if !ctrl => app.picker_query_input(|input| input.insert_char(c)),
+            KeyCode::Backspace if alt || ctrl => {
+                app.picker_query_input(|input| input.delete_word_before())
+            }
+            KeyCode::Backspace => app.picker_query_input(|input| input.backspace()),
+            KeyCode::Delete if alt || ctrl => {
+                app.picker_query_input(|input| input.delete_word_after())
+            }
+            KeyCode::Delete => app.picker_query_input(|input| input.delete()),
+            KeyCode::Left if alt || ctrl => app.picker_query_input(|input| input.move_word_left()),
+            KeyCode::Right if alt || ctrl => {
+                app.picker_query_input(|input| input.move_word_right())
+            }
+            KeyCode::Left => app.picker_query_input(|input| input.move_left()),
+            KeyCode::Right => app.picker_query_input(|input| input.move_right()),
+            KeyCode::Home => app.picker_query_input(|input| input.move_to_line_start()),
+            KeyCode::End => app.picker_query_input(|input| input.move_to_line_end()),
+            KeyCode::Char('u') if ctrl => {
+                app.picker_query_input(|input| input.delete_to_line_start())
+            }
+            // See the prompt's handler: off the kitty protocol, Ctrl+Backspace
+            // reaches us as Ctrl+H.
+            KeyCode::Char('h') if ctrl => {
+                app.picker_query_input(|input| input.delete_word_before())
+            }
+            KeyCode::Char('w') if ctrl => {
+                app.picker_query_input(|input| input.delete_word_before())
+            }
             _ => {}
         }
         return;
@@ -976,6 +1035,50 @@ fn spawn_search(
             .await;
     });
     *inflight = Some(InFlight::new(cancel_tx));
+}
+
+/// Ask the model to summarise the conversation a compaction is shortening.
+///
+/// Out of band on purpose: this reply is prose that becomes context, not a
+/// protocol action, so it must not go through `push_response` — which parses
+/// every reply strictly and would reject a summary as malformed.
+///
+/// `Client::complete` takes no cancel future of its own, so cancellation
+/// selects over the whole request. The job travels with the update because
+/// nothing has been applied yet: dropping it on cancel is what makes a
+/// cancelled compaction a no-op.
+fn spawn_summary(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, job: compact::Job) {
+    let generation = app.next_generation();
+    app.mark_request_sent();
+    let client = ctx.client.with_model(&app.model);
+    let tx = ctx.tx.clone();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let result = tokio::select! {
+            done = client.complete(&job.request) => done.map_err(|e| format!("{e:#}")),
+            _ = cancel_rx => return,
+        };
+        let _ = tx
+            .send(Tagged {
+                generation,
+                update: Update::Summary(Box::new((job, result))),
+            })
+            .await;
+    });
+    *inflight = Some(InFlight::new(cancel_tx));
+}
+
+/// Start whatever compaction the app has parked, if any.
+///
+/// Called after handling an update and after handling a key, because a
+/// compaction can be parked by several different paths — the end-of-turn
+/// trigger, an overflow, `/compact` — and every one of them should reach the
+/// single place allowed to start a request.
+fn pump_compaction(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+    if let Some(job) = app.take_pending_compaction() {
+        spawn_summary(app, ctx, inflight, job);
+    }
 }
 
 /// Fetch the model catalog once, in the background, at startup.

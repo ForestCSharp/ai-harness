@@ -85,6 +85,15 @@ pub const PREVIEW_FILE: &str = "preview.txt";
 /// other's. Markdown because the transcript renders it.
 pub const PLAN_FILE: &str = "plan.md";
 
+/// Prefix of the files holding a session's conversation as it stood before each
+/// compaction — `compaction-001.json`, `compaction-002.json`, and so on.
+///
+/// Numbered rather than overwritten because a long session compacts more than
+/// once, and archive *n* holds the material archive *n+1*'s summary is already
+/// a summary of; overwriting would throw away the only copy of the oldest work.
+/// Not appended to, because concatenated JSON documents do not parse.
+pub const ARCHIVE_PREFIX: &str = "compaction-";
+
 /// Lines kept in a preview, which is also what the picker shows.
 pub const PREVIEW_LINES: usize = 3;
 
@@ -109,6 +118,81 @@ fn file(root: &Path, name: &str) -> Result<PathBuf> {
 /// The plan file for `name`, whether or not it exists yet.
 pub fn plan_file(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir(root, name)?.join(PLAN_FILE))
+}
+
+/// A session's conversation as it stood immediately before a compaction.
+///
+/// Compaction discards detail on purpose, and once it has, nothing else holds
+/// what was there. This is where it goes, so a session that summarised away
+/// something you wanted can still be read back.
+///
+/// Holds the *whole* conversation, not just the discarded prefix: recovering
+/// means putting the conversation back, and half of one is not that.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Archive {
+    /// [`VERSION`], the same format contract `session.json` carries.
+    pub version: u32,
+    pub saved_at: u64,
+    pub model: String,
+    /// `"automatic"`, `"manual"`, or `"overflow"` — see `compact::Reason`.
+    pub reason: String,
+    /// Prompt tokens on the last request before compacting.
+    pub last_prompt_tokens: u64,
+    /// The window that was measured against, when it was known.
+    pub context_length: Option<u32>,
+    /// Index at which the kept tail began.
+    pub kept_from: usize,
+    pub history: Vec<Message>,
+}
+
+/// The `n`th archive file for `name`, whether or not it exists yet.
+///
+/// Nothing reads archives back yet — that is what a `/restore` would be for —
+/// so this exists to name one, and is used by the tests that check the
+/// numbering holds.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn archive_file(root: &Path, name: &str, n: usize) -> Result<PathBuf> {
+    Ok(dir(root, name)?.join(format!("{ARCHIVE_PREFIX}{n:03}.json")))
+}
+
+/// The next unused archive number for `name`, counting from 1.
+///
+/// Read off the folder rather than counted in memory. A session loaded with
+/// `/load` has no idea how many times it was compacted in an earlier run, and an
+/// in-memory counter would restart at 1 and overwrite the archives already
+/// there — which is exactly the file nothing else holds a copy of.
+pub fn next_archive_index(root: &Path, name: &str) -> usize {
+    let Ok(folder) = dir(root, name) else {
+        return 1;
+    };
+    let Ok(entries) = std::fs::read_dir(&folder) else {
+        return 1;
+    };
+    let highest = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            name.strip_prefix(ARCHIVE_PREFIX)?
+                .strip_suffix(".json")?
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    highest + 1
+}
+
+/// Write `archive` to the next free `compaction-NNN.json` in `name`'s folder.
+pub fn write_archive(root: &Path, name: &str, archive: &Archive) -> Result<PathBuf> {
+    let folder = ensure_folder(root, name)?;
+    let path = folder.join(format!(
+        "{ARCHIVE_PREFIX}{:03}.json",
+        next_archive_index(root, name)
+    ));
+    let json = serde_json::to_string_pretty(archive).context("serialising archive")?;
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 /// Create `name`'s directory, so something can be written inside it.
@@ -314,7 +398,7 @@ fn sanitize(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -766,6 +850,75 @@ mod tests {
             other => panic!("the search result changed shape: {other:?}"),
         }
         assert_eq!(loaded.version, VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn archive(history: Vec<Message>) -> Archive {
+        Archive {
+            version: VERSION,
+            saved_at: 0,
+            model: "m".into(),
+            reason: "automatic".into(),
+            last_prompt_tokens: 170_000,
+            context_length: Some(200_000),
+            kept_from: 3,
+            history,
+        }
+    }
+
+    /// The file nothing else holds a copy of, so overwriting one is the loss
+    /// this numbering exists to prevent.
+    #[test]
+    fn archives_are_numbered_and_never_overwrite() {
+        let dir = temp_dir("archives");
+        save(&dir, "s", &sample()).unwrap();
+
+        let first = write_archive(&dir, "s", &archive(vec![Message::user("one")])).unwrap();
+        let second = write_archive(&dir, "s", &archive(vec![Message::user("two")])).unwrap();
+        assert!(first.ends_with("compaction-001.json"), "{first:?}");
+        assert!(second.ends_with("compaction-002.json"), "{second:?}");
+
+        // The index is read off the folder, not counted in memory, so a session
+        // reloaded in a fresh run does not restart at 001 and clobber.
+        assert_eq!(next_archive_index(&dir, "s"), 3);
+        assert!(std::fs::read_to_string(&first).unwrap().contains("one"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_archive_round_trips_the_whole_conversation() {
+        let dir = temp_dir("archive-roundtrip");
+        let history = vec![Message::system("CONTRACT"), Message::user("the detail")];
+        let path = write_archive(&dir, "s", &archive(history.clone())).unwrap();
+
+        let loaded: Archive =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(loaded.history, history);
+        assert_eq!(loaded.kept_from, 3);
+        assert_eq!(loaded.reason, "automatic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renaming_a_session_carries_its_archives() {
+        let dir = temp_dir("archive-rename");
+        save(&dir, "old", &sample()).unwrap();
+        write_archive(&dir, "old", &archive(vec![Message::user("kept")])).unwrap();
+
+        rename(&dir, "old", "new").unwrap();
+        let moved = archive_file(&dir, "new", 1).unwrap();
+        assert!(moved.is_file(), "the folder moves whole, archives included");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_archive_is_not_listed_as_a_session() {
+        let dir = temp_dir("archive-list");
+        save(&dir, "real", &sample()).unwrap();
+        write_archive(&dir, "real", &archive(vec![Message::user("x")])).unwrap();
+
+        // `list` keys on `<name>/session.json`, so a file beside one is invisible.
+        assert_eq!(list(&dir), vec!["real".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

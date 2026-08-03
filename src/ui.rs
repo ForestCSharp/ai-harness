@@ -258,28 +258,45 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         });
     }
     if let Some(picker) = app.picker() {
-        // Borders (2) + footer (1).
-        let chrome = 3u16;
+        let matches = app.picker_matches();
+        // Borders (2) + footer (1) + the query row + a blank after it, the same
+        // shape the model picker has.
+        let chrome = 5u16;
         // An entry is a name, a rule, its preview, and a trailing blank, so the
         // natural height is a sum rather than a count.
-        let wanted: usize = (0..picker.sessions.len())
-            .map(|i| {
+        let wanted: usize = matches
+            .iter()
+            .map(|&i| {
                 let lines = picker.previews.get(i).map_or(0, Vec::len);
                 if lines == 0 { 2 } else { lines + 3 }
             })
             .sum();
+        // A query that matches nothing still needs a row to say so.
+        let wanted = wanted.max(1);
         let height = (chrome + wanted as u16).min(max).max(MIN_PANEL_ROWS);
         let visible = height.saturating_sub(chrome).max(1) as usize;
-        let (body, owners) = picker_rows(picker, visible, inner_width);
+        let (rows, owners) =
+            picker_rows(picker, &matches, app.picker_index(), visible, inner_width);
+
+        let mut body = vec![query_row(&picker.query, inner_width), Line::default()];
+        if matches.is_empty() {
+            body.push(Line::from(Span::styled(
+                "  no session matches",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            body.extend(rows);
+        }
 
         return Some(Panel {
             kind: PanelKind::Picker,
             title: " load session ",
             colour: Color::Blue,
             body,
-            hint: Some("↑/↓ choose · Enter load · Esc cancel"),
+            hint: Some("type to filter · ↑/↓ choose · Enter load · Esc cancel"),
             height,
-            header: 0,
+            // The query row and the blank under it.
+            header: 2,
             offset: 0,
             owners,
         });
@@ -403,6 +420,16 @@ fn draw_prepared_panel(
         PanelKind::Picker => {
             metrics.picker_list = Some(list);
             metrics.picker_rows = owners;
+            // The cursor sits in the query row above the list, the same as the
+            // model picker's — see the `Models` arm below.
+            if let Some(picker) = app.picker() {
+                let col = picker
+                    .query
+                    .layout(content.width.saturating_sub(2))
+                    .cursor
+                    .1;
+                frame.set_cursor_position(Position::new(content.x + 2 + col, content.y));
+            }
         }
         PanelKind::Models => {
             metrics.models_list = Some(list);
@@ -524,30 +551,40 @@ fn picker_entry(
 
 /// Lay out the picker to fit `visible` rows, keeping the selection on screen.
 ///
-/// Returns the rows and, for each of them, the session it belongs to — entries
-/// are no longer one row tall, so a click has to be mapped back through a table
-/// rather than by adding an offset.
+/// `matches` are the sessions the query left, and `selected` is a position in
+/// *that* list. Returns the rows and, for each of them, the position it belongs
+/// to — entries are no longer one row tall, so a click has to be mapped back
+/// through a table rather than by adding an offset. Positions rather than
+/// session indices so a click reaches [`crate::app::App::picker_select`]
+/// unchanged, exactly as the model picker's rows do.
 fn picker_rows(
     picker: &crate::app::Picker,
+    matches: &[usize],
+    selected: usize,
     visible: usize,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
-    let entries: Vec<Vec<Line<'static>>> = picker
-        .sessions
+    // Nothing matched: the caller renders a placeholder instead, and the walk
+    // below would index an empty list.
+    if matches.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let entries: Vec<Vec<Line<'static>>> = matches
         .iter()
         .enumerate()
-        .map(|(i, name)| {
+        .map(|(pos, &i)| {
+            let name = &picker.sessions[i];
             let lines = picker.previews.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let model = picker.models.get(i).map_or("", String::as_str);
-            picker_entry(name, model, lines, i == picker.selected, width)
+            picker_entry(name, model, lines, pos == selected, width)
         })
         .collect();
 
     // Walk back from the selection while the entries still fit, so the selection
     // is visible by construction rather than by arithmetic that assumed every
     // entry was the same height.
-    let mut first = picker.selected;
-    let mut used = entries[picker.selected].len();
+    let mut first = selected;
+    let mut used = entries[selected].len();
     while first > 0 {
         let next = used + entries[first - 1].len();
         if next > visible {
@@ -1075,6 +1112,7 @@ fn tail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let activity = match app.status {
             Status::Waiting => Some("thinking…"),
             Status::Running => Some("running…"),
+            Status::Compacting => Some("compacting…"),
             _ => None,
         };
         if let Some(activity) = activity {
@@ -1919,6 +1957,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Status::AwaitingChoice(_) => (" answer ", Color::Yellow),
         Status::AwaitingExecute { .. } => (" execute ", Color::Green),
         Status::Running => (" running ", Color::Blue),
+        Status::Compacting => (" compacting ", Color::Cyan),
     };
 
     let mut spans = vec![
@@ -1970,12 +2009,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.picker().is_some() {
         // The picker coexists with `Idle`, so without this the bar offers to
         // send a prompt while the panel below it is asking you to choose.
-        "  ↑/↓ choose · Enter load · Esc cancel"
+        "  type to filter · ↑/↓ choose · Enter load · Esc cancel"
     } else if app.model_picker().is_some() {
         "  type to filter · ↑/↓ choose · Enter select · Esc cancel"
     } else if matches!(
         app.status,
-        Status::Waiting | Status::Streaming | Status::Running
+        Status::Waiting | Status::Streaming | Status::Running | Status::Compacting
     ) {
         // Busy without a modal: the one useful key is Esc.
         "  Esc cancel · Ctrl+C quit"
@@ -3762,6 +3801,62 @@ mod tests {
             metrics.picker_rows.first().copied(),
             Some(0),
             "the first rendered row belongs to the first session"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_shows_the_query_and_narrows_to_it() {
+        let (mut app, dir) = app_with_picker(&["alpha", "beta", "gamma"]);
+        let (rows, _) = render(&mut app, 60, 20);
+        assert!(
+            rows.join("\n").contains("type to filter"),
+            "an empty query must invite typing:\n{}",
+            rows.join("\n")
+        );
+
+        app.picker_query_input(|input| input.insert_str("bet"));
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = rows.join("\n");
+        assert!(screen.contains("bet"), "the query must show:\n{screen}");
+        assert!(screen.contains("beta"), "the match must show:\n{screen}");
+        assert!(!screen.contains("alpha"), "filtered out:\n{screen}");
+        assert!(!screen.contains("gamma"), "filtered out:\n{screen}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_says_when_nothing_matches() {
+        let (mut app, dir) = app_with_picker(&["alpha", "beta"]);
+        app.picker_query_input(|input| input.insert_str("zzz"));
+        let (rows, _) = render(&mut app, 60, 20);
+        assert!(
+            rows.join("\n").contains("no session matches"),
+            "an empty list must say so rather than render blank:\n{}",
+            rows.join("\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The row map holds positions in the filtered list, so a click on the one
+    /// remaining row reaches the session the filter left rather than the one
+    /// that happens to sit at that ordinal in the whole list.
+    #[test]
+    fn a_click_on_a_filtered_picker_maps_to_the_match() {
+        let (mut app, dir) = app_with_picker(&["alpha", "beta", "gamma"]);
+        app.picker_query_input(|input| input.insert_str("gamma"));
+        let (_, metrics) = render(&mut app, 60, 20);
+
+        assert_eq!(
+            metrics.picker_rows.first().copied(),
+            Some(0),
+            "the only rendered row is position 0 of the matches"
+        );
+        assert!(app.picker_select(0), "and it is selectable");
+        assert_eq!(
+            app.picker_matches(),
+            vec![2],
+            "position 0 is the third session"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

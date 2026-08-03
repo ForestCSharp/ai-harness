@@ -10,7 +10,7 @@ use crate::fetch::FetchOutcome;
 use crate::files::ReadOutcome;
 use crate::input::Input;
 use crate::ledger::Ledger;
-use crate::openrouter::{Message, ModelInfo, Usage};
+use crate::openrouter::{Completion, Message, ModelInfo, Usage};
 use crate::protocol::{self, Action};
 use crate::sandbox::Sandbox;
 
@@ -153,6 +153,20 @@ const MAX_RUNNING_LINES: usize = 200;
 /// provider does. Adjustable with `--max-turn-bytes`.
 const DEFAULT_MAX_TURN_BYTES: usize = 512 * 1024;
 
+/// Fraction of the model's context window at which the conversation is
+/// compacted without being asked.
+pub const DEFAULT_COMPACT_AT: f64 = 0.8;
+
+/// Where automatic compaction fires when the model's window is unknown — the
+/// catalog has not landed, the fetch failed, or the model is not in it.
+///
+/// A fraction of an unknown number is not a threshold, so this is the fallback.
+/// Four bytes per token is a poor estimator but a conservative one for source
+/// and English; 384 KB is roughly 96k tokens. Deliberately well clear of the
+/// 100 KB `max_turn_bytes` the tightest existing test uses, so that test keeps
+/// measuring what it means to.
+const COMPACT_FALLBACK_BYTES: usize = 384 * 1024;
+
 impl RunningCommand {
     fn new(command: String) -> Self {
         Self {
@@ -270,6 +284,30 @@ pub struct Picker {
     /// for a session whose file does not say, since loading adopts the saved
     /// model and the picker is where you would want to know which one that is.
     pub models: Vec<String>,
+    /// What has been typed to narrow the list. Reuses the prompt's editor, the
+    /// same way the model picker does for its free-text row.
+    pub query: Input,
+}
+
+impl Picker {
+    /// Whether every one of `terms` appears in session `i`'s name or the model
+    /// it was saved with. `terms` are expected lowercase; both fields are
+    /// lowered here.
+    ///
+    /// Lives here rather than on `App` for the reason
+    /// [`crate::openrouter::ModelInfo::matches`] does: the matching rule sits
+    /// with the data it matches on. Name and model are exactly what a picker row
+    /// shows, so what you type narrows what you can see.
+    pub fn matches(&self, i: usize, terms: &[String]) -> bool {
+        let name = self.sessions[i].to_lowercase();
+        let model = self
+            .models
+            .get(i)
+            .map_or(String::new(), |m| m.to_lowercase());
+        terms
+            .iter()
+            .all(|term| name.contains(term.as_str()) || model.contains(term.as_str()))
+    }
 }
 
 /// OpenRouter's model catalog, fetched once in the background at startup.
@@ -328,6 +366,12 @@ pub enum Status {
     },
     /// An approved command is executing.
     Running,
+    /// The conversation is being shortened to fit the context window.
+    ///
+    /// Busy like any other in-flight work, so `submit` refuses a second
+    /// `/compact` and `Esc` cancels — which, because a compaction touches
+    /// nothing until its summary lands, leaves the conversation untouched.
+    Compacting,
 }
 
 pub struct App {
@@ -356,6 +400,9 @@ pub struct App {
     /// conversation. This is the other half of the budget: a turn that has
     /// gathered this much has gone wrong, whatever it thinks it is doing.
     pub max_turn_bytes: usize,
+    /// Fraction of the model's context window at which the conversation is
+    /// compacted without being asked. Zero disables it; `/compact` still works.
+    pub compact_at: f64,
     /// Size of `history` when the current prompt started, so the budget measures
     /// what this turn added rather than what the session already held.
     turn_start_bytes: usize,
@@ -405,6 +452,19 @@ pub struct App {
     /// 64 KB of a single file, where a walk has no such bound. Running one
     /// inline would stall the redraw and `Esc` for as long as it took.
     pending_search: Option<crate::search::Request>,
+    /// A compaction worked out but whose summary `main` still has to fetch.
+    ///
+    /// Parked rather than run here for the reason a fetch is — it needs a
+    /// request — and holding it as a plan rather than a mutation is what makes
+    /// a cancelled or failed compaction a no-op: nothing has touched `history`
+    /// until the summary comes back.
+    pending_compaction: Option<crate::compact::Job>,
+    /// Whether this turn has already answered an overflow by compacting.
+    ///
+    /// The whole anti-loop mechanism. Set when an overflow triggers a
+    /// compaction, cleared only by a new prompt, so a second overflow in the
+    /// same turn gives up instead of compacting forever.
+    overflow_compacted: bool,
     /// Cumulative token spend for the session. Survives `/clear`: the tokens
     /// were really bought, whether or not the conversation was kept.
     pub ledger: Ledger,
@@ -417,6 +477,10 @@ pub struct App {
     /// Consecutive malformed replies in the current streak; reset on success.
     pub retries: usize,
     pub max_retries: usize,
+    /// Whether a valid element hiding behind a prose preamble is recovered
+    /// rather than rejected. See [`App::recover_preamble`]; `--strict-replies`
+    /// turns it off.
+    pub strip_preamble: bool,
     /// History length before the current streak of malformed replies, so a
     /// give-up can roll the whole failed exchange back out of context.
     retry_anchor: Option<usize>,
@@ -489,6 +553,7 @@ impl App {
             iterations: 0,
             max_iterations,
             max_turn_bytes: DEFAULT_MAX_TURN_BYTES,
+            compact_at: DEFAULT_COMPACT_AT,
             turn_start_bytes: 0,
             debug: false,
             sandbox: None,
@@ -500,12 +565,15 @@ impl App {
             auto_approve: false,
             pending_fetch: None,
             pending_search: None,
+            pending_compaction: None,
+            overflow_compacted: false,
             ledger: Ledger::default(),
             price_in: None,
             price_out: None,
             request_started: None,
             retries: 0,
             max_retries: DEFAULT_MAX_RETRIES,
+            strip_preamble: true,
             retry_anchor: None,
             completion_cursor: 0,
             streaming: None,
@@ -614,7 +682,8 @@ impl App {
     }
 
     pub fn cost_status(&self) -> String {
-        self.ledger.status_line(self.price_in, self.price_out)
+        self.ledger
+            .status_line(self.price_in, self.price_out, self.context_limit())
     }
 
     /// Interrupt the in-flight turn: invalidate its updates, drop the live
@@ -628,6 +697,10 @@ impl App {
         // is all that is needed; a spawned one is stopped by its cancel signal.
         self.pending_fetch = None;
         self.pending_search = None;
+        // A parked compaction has not touched `history`, so dropping it leaves
+        // the conversation byte-identical — there is nothing to undo.
+        self.pending_compaction = None;
+        self.overflow_compacted = false;
         // Cancelling out of a retry loop abandons the turn, so the failed
         // attempts should leave no more behind than giving up on them does.
         self.roll_back_retries();
@@ -751,6 +824,7 @@ impl App {
             Command::Plan(task) => return self.toggle_plan_mode(task),
             Command::Help => self.push_notice(crate::command::help_text()),
             Command::Clear => self.reset_conversation(),
+            Command::Compact => self.compact_now(),
             Command::Quit => self.should_quit = true,
             Command::Save(name) => self.save_session(name),
             Command::Load(name) => self.load_session_command(name),
@@ -1038,6 +1112,7 @@ impl App {
                 selected: 0,
                 previews,
                 models,
+                query: Input::default(),
             });
         }
     }
@@ -1046,33 +1121,87 @@ impl App {
         self.picker.as_ref()
     }
 
-    /// Move the highlight, clamped to the list (no wrap).
-    pub fn picker_move(&mut self, delta: isize) {
-        if let Some(picker) = &mut self.picker {
-            let last = picker.sessions.len().saturating_sub(1);
-            let next = (picker.selected as isize + delta).clamp(0, last as isize);
-            picker.selected = next as usize;
+    /// The sessions matching what has been typed, as indices into
+    /// `picker.sessions`, in picker order.
+    ///
+    /// Derived rather than stored, like [`App::model_matches`], so the list can
+    /// never drift from the query. Indices rather than names because the picker
+    /// keeps its previews and models in parallel vectors that an index reaches
+    /// and a name does not.
+    pub fn picker_matches(&self) -> Vec<usize> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        let terms: Vec<String> = picker
+            .query
+            .text()
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        (0..picker.sessions.len())
+            .filter(|&i| picker.matches(i, &terms))
+            .collect()
+    }
+
+    /// Index of the highlighted match, clamped to what is actually offered.
+    pub fn picker_index(&self) -> usize {
+        let count = self.picker_matches().len();
+        let selected = self.picker.as_ref().map_or(0, |picker| picker.selected);
+        if count == 0 {
+            0
+        } else {
+            selected.min(count - 1)
         }
     }
 
-    /// Focus a row directly, for mouse hover/click. Returns whether `i` was a
+    /// Move the highlight, clamped to the list (no wrap). The list is the
+    /// filtered matches, so the boundary is computed from them.
+    pub fn picker_move(&mut self, delta: isize) {
+        let last = self.picker_matches().len().saturating_sub(1);
+        let current = self.picker_index() as isize;
+        if let Some(picker) = &mut self.picker {
+            picker.selected = (current + delta).clamp(0, last as isize) as usize;
+        }
+    }
+
+    /// Focus a row directly, for mouse hover/click. `i` is a position in the
+    /// filtered list, which is what the row map holds. Returns whether it was a
     /// real row, so a click on empty space below the list does nothing.
     pub fn picker_select(&mut self, i: usize) -> bool {
-        if let Some(picker) = &mut self.picker
-            && i < picker.sessions.len()
-        {
+        if i >= self.picker_matches().len() {
+            return false;
+        }
+        if let Some(picker) = &mut self.picker {
             picker.selected = i;
             return true;
         }
         false
     }
 
+    /// Edit the query. Any edit resets the highlight to the top, for the reason
+    /// given on [`App::model_query_input`]: the list under it has just changed.
+    pub fn picker_query_input(&mut self, edit: impl FnOnce(&mut Input)) {
+        if let Some(picker) = &mut self.picker {
+            edit(&mut picker.query);
+            picker.selected = 0;
+        }
+    }
+
     /// Load the highlighted session and close the picker.
     pub fn picker_confirm(&mut self) {
-        let Some(picker) = self.picker.take() else {
-            return;
-        };
-        if let Some(name) = picker.sessions.into_iter().nth(picker.selected) {
+        // Resolve the highlighted match to a session index before taking the
+        // picker, since the matches are derived from it.
+        let chosen = self
+            .picker_matches()
+            .get(self.picker_index())
+            .copied()
+            .and_then(|i| {
+                self.picker
+                    .as_ref()
+                    .and_then(|picker| picker.sessions.get(i).cloned())
+            });
+        self.picker = None;
+        if let Some(name) = chosen {
             self.load_named(name);
         }
     }
@@ -1343,6 +1472,9 @@ impl App {
         self.iterations = 0;
         self.retries = 0;
         self.retry_anchor = None;
+        // A new prompt re-arms the overflow retry. Nothing within a turn does,
+        // which is what keeps a compact-and-resend from becoming a loop.
+        self.overflow_compacted = false;
         self.turn_start_bytes = self.history_bytes();
         self.status = Status::Waiting;
         self.follow = true;
@@ -1364,9 +1496,12 @@ impl App {
             self.ledger.record(usage);
         }
 
-        let action = match protocol::parse_reply(&content) {
-            Ok(action) => action,
-            Err(err) => return self.retry_after(content, err),
+        let (content, action) = match protocol::parse_reply(&content) {
+            Ok(action) => (content, action),
+            Err(err) => match self.recover_preamble(&content, &err) {
+                Some(recovered) => recovered,
+                None => return self.retry_after(content, err),
+            },
         };
 
         // Only a valid reply counts as progress against the loop budget.
@@ -1534,6 +1669,19 @@ impl App {
                 });
             }
         }
+
+        // Automatic compaction happens here and nowhere else within a turn. The
+        // reply is committed, a valid one has already cleared `retry_anchor`,
+        // nothing is in flight, and the next prompt re-seeds the byte budget.
+        // Growth *within* a turn is already bounded by `max_turn_bytes`, and an
+        // actual mid-turn overflow is answered by `push_error` rather than
+        // guessed at here.
+        if self.status == Status::Idle && self.should_compact() {
+            self.begin_compaction(
+                crate::compact::Reason::Automatic,
+                crate::compact::Then::Idle,
+            );
+        }
         None
     }
 
@@ -1626,6 +1774,40 @@ impl App {
         }
     }
 
+    /// Recover a reply that is one valid element behind a sentence of prose.
+    ///
+    /// The commonest way a model breaks the contract by far, and the most
+    /// wasteful: the element it wrote was right, and rejecting the reply costs a
+    /// round-trip, a rollback, and — in the session this was written from — the
+    /// model re-issuing reads it had already done. In one 111-request session,
+    /// ten of the thirteen rejections were this.
+    ///
+    /// Deliberately narrow. Only [`protocol::ProtocolError::NotATag`] is
+    /// recovered, so two elements, trailing content, a fabricated result, and
+    /// every attribute error are rejected exactly as before; the element behind
+    /// the prose still has to parse on its own, by the same rules. Returns the
+    /// stripped reply along with the action, because it is the stripped text
+    /// that goes into history: sending the model its own preamble back is how a
+    /// habit gets reinforced.
+    fn recover_preamble(
+        &mut self,
+        content: &str,
+        error: &protocol::ProtocolError,
+    ) -> Option<(String, Action)> {
+        if !self.strip_preamble || !matches!(error, protocol::ProtocolError::NotATag { .. }) {
+            return None;
+        }
+        let element = protocol::sole_element(content)?;
+        let action = protocol::parse_reply(element).ok()?;
+        let dropped = content.len() - element.len();
+        // A notice rather than nothing: the relaxation has to stay visible, or
+        // protocol drift is exactly what it hides.
+        self.push_notice(format!(
+            "Dropped {dropped} bytes of prose before the element.",
+        ));
+        Some((element.to_string(), action))
+    }
+
     /// Roll an abandoned retry loop out of context, back to where history was
     /// last clean. A no-op if no retry is in progress.
     ///
@@ -1692,7 +1874,7 @@ impl App {
         // so the user still sees exactly what came back.
         self.history
             .push(Message::assistant(protocol::elide_results(&content)));
-        let correction = protocol::encode_correction(&error);
+        let correction = protocol::encode_correction(&error, &content);
         self.frame(Direction::Sent, correction.clone());
         self.history.push(Message::user(correction));
         self.push_notice(format!(
@@ -1893,6 +2075,223 @@ impl App {
         self.pending_search.take()
     }
 
+    /// The context window of the model in use, when the catalog knows it.
+    ///
+    /// `None` covers four different situations — the catalog is still loading,
+    /// the fetch failed, the model is not in it (`set_model` deliberately does
+    /// not validate), or the entry quotes no window. They collapse to one answer
+    /// because the caller does the same thing in all four.
+    pub fn context_limit(&self) -> Option<u32> {
+        self.catalog
+            .models()
+            .iter()
+            .find(|m| m.id == self.model)?
+            .context_length
+    }
+
+    /// Whether the conversation has grown enough to shorten it unasked.
+    fn should_compact(&self) -> bool {
+        if self.compact_at <= 0.0 {
+            return false;
+        }
+        match self.context_limit() {
+            // A measured figure against a real limit. One round-trip stale,
+            // which at a turn boundary means "short by the last reply".
+            Some(limit) => {
+                self.ledger.last_prompt_tokens as f64 >= f64::from(limit) * self.compact_at
+            }
+            // Nothing to take a fraction of, so fall back to the only
+            // forward-looking measure there is.
+            None => self.history_bytes() >= COMPACT_FALLBACK_BYTES,
+        }
+    }
+
+    /// How the trigger would describe itself, for the notice.
+    fn compaction_measure(&self) -> String {
+        match self.context_limit() {
+            Some(limit) => format!(
+                "{} of {} tokens",
+                crate::ledger::compact(self.ledger.last_prompt_tokens),
+                crate::ledger::compact(u64::from(limit))
+            ),
+            None => format!("{} KB of conversation", self.history_bytes() / 1024),
+        }
+    }
+
+    /// Work out a compaction and park it for `main` to fetch a summary for.
+    ///
+    /// Returns whether there was anything worth compacting. The caller needs to
+    /// know: `push_error` uses a `false` here to fall through to giving up,
+    /// rather than parking a no-op that would strand the harness in
+    /// [`Status::Compacting`] with nothing coming back.
+    fn begin_compaction(
+        &mut self,
+        reason: crate::compact::Reason,
+        then: crate::compact::Then,
+    ) -> bool {
+        // `retry_anchor` is a raw index into `history`, and compaction is about
+        // to renumber it. Rolling the retry streak back first takes the index
+        // rather than leaving it to point somewhere wrong — and `Vec::truncate`
+        // past the end is a silent no-op, so a stale one would fail quietly.
+        // This is what `cancel` already does with a half-finished streak.
+        self.roll_back_retries();
+        debug_assert!(self.retry_anchor.is_none());
+
+        let Some(plan) = crate::compact::plan(&self.history, reason) else {
+            return false;
+        };
+        let request = crate::compact::summary_request(&plan);
+        self.frame(
+            Direction::Sent,
+            // Not the request body: framing that would copy the whole prefix
+            // into the transcript, and thence into `session.json`, doubling the
+            // very thing being compacted.
+            format!(
+                "[compaction: summarising {} messages, {} KB]",
+                plan.collapsed.len(),
+                plan.before_bytes / 1024
+            ),
+        );
+        self.pending_compaction = Some(crate::compact::Job {
+            plan,
+            request,
+            then,
+        });
+        self.status = Status::Compacting;
+        self.follow = true;
+        true
+    }
+
+    /// Take the compaction the dispatch parked, if there is one.
+    pub fn take_pending_compaction(&mut self) -> Option<crate::compact::Job> {
+        self.pending_compaction.take()
+    }
+
+    /// `/compact` — shorten the conversation now.
+    fn compact_now(&mut self) {
+        if !self.begin_compaction(crate::compact::Reason::Manual, crate::compact::Then::Idle) {
+            self.push_notice(format!(
+                "Nothing worth compacting yet — {} messages, {} KB, and the recent \
+                 part is kept verbatim either way.",
+                self.history.len().saturating_sub(1),
+                self.history_bytes() / 1024
+            ));
+        }
+    }
+
+    /// Finish a compaction: replace the conversation with its shorter form.
+    ///
+    /// `summary` is the model's prose, or the reason there is none. Either way
+    /// the mechanical pass lands — a failed summary still shortens the
+    /// conversation, which on the overflow path is the difference between a
+    /// resend that fits and one that does not.
+    ///
+    /// Returns messages to send when the compaction was answering an overflow.
+    pub fn apply_summary(
+        &mut self,
+        job: crate::compact::Job,
+        result: Result<Completion, String>,
+    ) -> Option<Vec<Message>> {
+        let (summary, trouble) = match result {
+            Ok(completion) => {
+                if let Some(usage) = &completion.usage {
+                    // `record_side`, not `record`: this request's prompt is not
+                    // the conversation, and `last_prompt_tokens` is the figure
+                    // the trigger reads.
+                    self.ledger.record_side(usage);
+                }
+                self.frame(Direction::Received, completion.content.clone());
+                let text = completion.content.trim().to_string();
+                if text.is_empty() {
+                    (None, Some("the summary came back empty".to_string()))
+                } else if protocol::parse_reply(&text).is_ok() {
+                    // The model answered the contract instead of the
+                    // instruction. Its reply is an action, not a summary.
+                    (
+                        None,
+                        Some("the summary came back as a protocol element".to_string()),
+                    )
+                } else {
+                    // Scrub any result element it wrote into the prose, with the
+                    // machinery that already exists for exactly that.
+                    (Some(protocol::elide_results(&text)), None)
+                }
+            }
+            Err(message) => (None, Some(message)),
+        };
+
+        // Written while `history` is still the pre-compaction conversation, and
+        // only now — a compaction that was cancelled or never answered leaves no
+        // stray file behind.
+        self.write_archive(&job);
+
+        // `turn_bytes` is derived from a byte snapshot, so replacing `history`
+        // underneath it would saturate the subtraction to zero and hand a
+        // runaway turn a fresh budget. Carry the spend across instead.
+        let spent = self.turn_bytes();
+        let before = self.history.len();
+        self.history = crate::compact::apply(&self.history, &job.plan, summary.as_deref());
+        self.turn_start_bytes = self.history_bytes().saturating_sub(spent);
+        // Re-derives the protocol contract and, in plan mode, the plan contract
+        // with its current path.
+        self.refresh_contract();
+
+        match trouble {
+            Some(reason) => self.push_notice(format!(
+                "Compacted {before} messages to {} ({reason}), so the older detail \
+                 was dropped without a summary.",
+                self.history.len()
+            )),
+            None => self.push_notice(format!(
+                "Compacted {before} messages to {} at {}.",
+                self.history.len(),
+                self.compaction_measure()
+            )),
+        }
+
+        // `fingerprint` is (history.len(), transcript.len()) and `maybe_autosave`
+        // skips a write when they are unchanged, on the assumption that both only
+        // grow. Compaction is the second thing that breaks that, so it saves
+        // outright rather than hoping.
+        self.persist_current();
+
+        match job.then {
+            crate::compact::Then::Resend => {
+                self.status = Status::Waiting;
+                self.follow = true;
+                Some(self.history.clone())
+            }
+            crate::compact::Then::Idle => {
+                self.status = Status::Idle;
+                self.follow = true;
+                None
+            }
+        }
+    }
+
+    /// Keep the conversation as it stands, beside the session it belongs to.
+    fn write_archive(&mut self, job: &crate::compact::Job) {
+        let archive = crate::session::Archive {
+            version: crate::session::VERSION,
+            saved_at: crate::session::now_secs(),
+            model: self.model.clone(),
+            reason: job.plan.reason.label().to_string(),
+            last_prompt_tokens: self.ledger.last_prompt_tokens,
+            context_length: self.context_limit(),
+            kept_from: job.plan.keep_from,
+            history: self.history.clone(),
+        };
+        if let Err(e) =
+            crate::session::write_archive(&self.sessions_dir, &self.current_session, &archive)
+        {
+            // Reported rather than fatal: a full context window is the more
+            // urgent problem, and unlike a preview this is worth seeing.
+            self.transcript.push(Entry::Error(format!(
+                "could not archive the conversation: {e:#}"
+            )));
+        }
+    }
+
     /// Record a finished search and hand the results back to the model.
     pub fn push_search_result(&mut self, outcome: crate::search::SearchOutcome) -> Vec<Message> {
         let encoded = protocol::encode_search_result(&outcome);
@@ -1949,11 +2348,30 @@ impl App {
         }
         self.transcript.push(Entry::Error(message));
         if overflowed {
+            // Answer it once, by compacting and sending the same request again.
+            // `overflow_compacted` is what stops that being a loop: it is set
+            // here and cleared only by a new prompt, so a second overflow in
+            // this turn falls through to the notice. A conversation with
+            // nothing left to compact falls through too — `begin_compaction`
+            // says so rather than parking a no-op that would strand the harness
+            // in `Compacting` waiting for a summary nobody asked for.
+            if !self.overflow_compacted
+                && self.begin_compaction(
+                    crate::compact::Reason::Overflow,
+                    crate::compact::Then::Resend,
+                )
+            {
+                self.overflow_compacted = true;
+                self.push_notice("The conversation did not fit; compacting it and trying again.");
+                // Status is `Compacting` — do not fall through to `Idle`.
+                self.follow = true;
+                return;
+            }
             self.push_notice(
-                "The conversation no longer fits in the model's context window. \
-                 Nothing was lost — but this will keep happening until the \
-                 conversation is shorter. Use /clear to start fresh, or /save \
-                 and open a new session.",
+                "The conversation still does not fit in the model's context window. \
+                 Nothing was lost — compacting has already run, and the conversation \
+                 as it was is saved in this session's folder. Use /clear to start \
+                 fresh, or /save and open a new session.",
             );
         }
         self.status = Status::Idle;
@@ -2011,6 +2429,10 @@ impl App {
         self.iterations = 0;
         self.retries = 0;
         self.retry_anchor = None;
+        // The compaction block is a `User` message, so the retain above already
+        // dropped it; these are the bookkeeping that would otherwise outlive it.
+        self.pending_compaction = None;
+        self.overflow_compacted = false;
         self.status = Status::Idle;
         self.push_notice("Conversation cleared.");
         // "Clear" clears the file too: overwrite the current session with the
@@ -2667,6 +3089,93 @@ mod tests {
                 assert!(!reason.is_empty(), "the reason must say what went wrong");
             }
             other => panic!("expected a malformed entry, got {other:?}"),
+        }
+    }
+
+    /// The commonest protocol slip there is: the model narrates, then writes a
+    /// perfectly good element. Rejecting that costs a round-trip and a rollback
+    /// to arrive back where it started.
+    #[test]
+    fn a_narrated_element_runs_instead_of_earning_a_retry() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        let resend = app.push_response(
+            "Let me look at that.\n\n<ai-harness-shell>ls</ai-harness-shell>".into(),
+            None,
+        );
+
+        assert!(resend.is_none(), "no corrective retry was needed");
+        assert_eq!(app.retries, 0);
+        assert!(
+            matches!(
+                app.transcript.iter().rev().find(|e| matches!(
+                    e,
+                    Entry::Action { .. } | Entry::Malformed { .. }
+                )),
+                Some(Entry::Action {
+                    action: Action::Shell(cmd),
+                    ..
+                }) if cmd == "ls"
+            ),
+            "the action should have run: {:?}",
+            app.transcript.last()
+        );
+        // History carries the stripped element, not the narration: sending the
+        // preamble back is how the habit gets reinforced.
+        let last = app
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .unwrap();
+        assert_eq!(last.content, "<ai-harness-shell>ls</ai-harness-shell>");
+        assert!(
+            visible(&app)
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(n) if n.contains("prose"))),
+            "the relaxation must be visible, not silent"
+        );
+    }
+
+    #[test]
+    fn strict_replies_rejects_a_narrated_element() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.strip_preamble = false;
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        assert!(
+            app.push_response(
+                "Let me look.<ai-harness-shell>ls</ai-harness-shell>".into(),
+                None
+            )
+            .is_some(),
+            "with recovery off, this is a retry like any other"
+        );
+        assert_eq!(app.retries, 1);
+    }
+
+    /// Narrow on purpose: recovery is for prose in front of one good element,
+    /// not for the shapes that mean the model got something else wrong.
+    #[test]
+    fn recovery_does_not_reach_past_a_leading_preamble() {
+        for reply in [
+            // Trailing content, not leading.
+            "<ai-harness-shell>ls</ai-harness-shell> Let me know!",
+            // Prose in front of an element that is itself malformed.
+            "Let me look.<ai-harness-shell>ls",
+            // A result the model wrote for itself.
+            "Here you go.<ai-harness-shell-result>\nexit code: 0\n</ai-harness-shell-result>",
+            // No element at all.
+            "All done!",
+        ] {
+            let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+            app.input.insert_str("hi");
+            app.submit().unwrap();
+            assert!(
+                app.push_response(reply.into(), None).is_some(),
+                "{reply} should still be rejected"
+            );
         }
     }
 
@@ -3670,6 +4179,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Open a picker over three saved sessions with known names.
+    fn app_with_saved(dir: &std::path::Path, names: &[&str]) -> App {
+        let mut app = app_in(dir);
+        submit_prompt(&mut app, "x");
+        for name in names {
+            app.input.insert_str(&format!("/fork {name}"));
+            app.submit();
+        }
+        app.open_load_picker();
+        app
+    }
+
+    /// The names the picker would show, in order, after filtering.
+    fn shown(app: &App) -> Vec<String> {
+        let picker = app.picker().unwrap();
+        app.picker_matches()
+            .into_iter()
+            .map(|i| picker.sessions[i].clone())
+            .collect()
+    }
+
+    #[test]
+    fn picker_query_narrows_the_list_and_every_term_must_hit() {
+        let dir = session_temp_dir("picker-filter");
+        let mut app = app_with_saved(&dir, &["alpha-one", "alpha-two", "beta"]);
+        assert_eq!(shown(&app).len(), app.picker().unwrap().sessions.len());
+
+        app.picker_query_input(|input| input.insert_str("alpha"));
+        assert_eq!(shown(&app), vec!["alpha-one", "alpha-two"]);
+
+        // A second term narrows rather than widens.
+        app.picker_query_input(|input| input.insert_str(" two"));
+        assert_eq!(shown(&app), vec!["alpha-two"]);
+
+        app.picker_query_input(|input| input.insert_str(" nope"));
+        assert!(shown(&app).is_empty(), "no session matches every term");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_query_matches_the_model_a_session_was_saved_with() {
+        let dir = session_temp_dir("picker-filter-model");
+        let mut app = app_with_saved(&dir, &["one"]);
+        let model = app.picker().unwrap().models[0].clone();
+        assert!(!model.is_empty(), "the fixture saves a model");
+
+        // Case-insensitively, and on a fragment: the row shows the whole id.
+        app.picker_query_input(|input| input.insert_str(&model.to_uppercase()));
+        assert_eq!(shown(&app).len(), app.picker().unwrap().sessions.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_move_clamps_to_the_filtered_list() {
+        let dir = session_temp_dir("picker-filter-move");
+        let mut app = app_with_saved(&dir, &["alpha-one", "alpha-two", "beta"]);
+        app.picker_move(100);
+        let unfiltered = app.picker_index();
+        assert!(unfiltered >= 2, "the whole list is reachable");
+
+        app.picker_query_input(|input| input.insert_str("beta"));
+        assert_eq!(app.picker_index(), 0, "an edit resets the highlight");
+        app.picker_move(100);
+        assert_eq!(app.picker_index(), 0, "clamped to the one match");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_select_is_bounded_by_the_matches_not_the_sessions() {
+        let dir = session_temp_dir("picker-filter-select");
+        let mut app = app_with_saved(&dir, &["alpha-one", "alpha-two", "beta"]);
+        app.picker_query_input(|input| input.insert_str("beta"));
+        assert!(app.picker_select(0));
+        assert!(
+            !app.picker_select(1),
+            "a row the filter removed is not selectable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_confirm_loads_the_filtered_match_not_the_same_ordinal() {
+        let dir = session_temp_dir("picker-filter-confirm");
+        let mut app = app_with_saved(&dir, &["alpha", "beta", "wanted"]);
+        // Position 0 of the filtered list is a different session from position 0
+        // of the whole list, which is the mistake this guards against.
+        app.picker_query_input(|input| input.insert_str("wanted"));
+        app.picker_confirm();
+
+        assert!(app.picker().is_none(), "picker closes after loading");
+        assert_eq!(app.current_session, "wanted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picker_confirm_does_nothing_when_the_query_matches_nothing() {
+        let dir = session_temp_dir("picker-filter-none");
+        let mut app = app_with_saved(&dir, &["alpha"]);
+        let before = app.current_session.clone();
+        app.picker_query_input(|input| input.insert_str("no-such-session"));
+        app.picker_confirm();
+
+        assert!(app.picker().is_none(), "confirming still closes it");
+        assert_eq!(app.current_session, before, "nothing was loaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn apply_session_adopts_the_saved_model() {
         let dir = session_temp_dir("mismatch");
@@ -4116,13 +4732,15 @@ mod tests {
     #[test]
     fn completions_narrow_as_you_type() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        // "c" is ambiguous between clear and cost; one more character settles it.
+        // "c" is ambiguous three ways; one more character narrows, two settle it.
         app.input.insert_str("/c");
-        assert_eq!(names(&app), vec!["clear", "cost"]);
-        app.input.insert_str("l");
-        assert_eq!(names(&app), vec!["clear"]);
+        assert_eq!(names(&app), vec!["clear", "compact", "cost"]);
+        app.input.insert_str("o");
+        assert_eq!(names(&app), vec!["compact", "cost"]);
+        app.input.insert_str("s");
+        assert_eq!(names(&app), vec!["cost"]);
         app.input.insert_str("x");
-        assert!(app.completions().is_empty(), "no command starts with clx");
+        assert!(app.completions().is_empty(), "no command starts with costx");
     }
 
     #[test]
@@ -4963,6 +5581,7 @@ mod file_tests {
         app.perform_read("m.rs", None, None);
         let before = app.history.len();
 
+        // Too short to compact, so this falls straight through to the notice.
         app.push_error("This model's maximum context length is 128000 tokens".into());
 
         assert_eq!(app.history.len(), before, "the read result must survive");
@@ -4976,6 +5595,469 @@ mod file_tests {
                 .any(|e| matches!(e, Entry::Notice(t) if t.contains("/clear"))),
             "an overflow should say how to recover"
         );
+    }
+
+    // --- Context compaction ---
+
+    const OVERFLOW: &str = "This model's maximum context length is 128000 tokens";
+
+    fn catalog_entry_with_limit(id: &str, limit: u32) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            context_length: Some(limit),
+            pricing: None,
+        }
+    }
+
+    /// An app whose conversation is long enough to be worth compacting: many
+    /// exchanges, each carrying a chunky read result.
+    fn app_with_long_history() -> (App, std::path::PathBuf) {
+        let (mut app, dir) = app_with_files(&[]);
+        for i in 0..12 {
+            app.history
+                .push(Message::user(protocol::encode_query(&format!("ask {i}"))));
+            let outcome = crate::files::ReadOutcome::whole_file(
+                &format!("src/f{i}.rs"),
+                "x".repeat(8 * 1024),
+            );
+            app.history
+                .push(Message::user(protocol::encode_read_result(&outcome)));
+            app.history.push(Message::assistant(format!(
+                "<{}>done {i}</{}>",
+                protocol::RESPONSE_TAG,
+                protocol::RESPONSE_TAG
+            )));
+        }
+        app.status = Status::Idle;
+        (app, dir)
+    }
+
+    fn response_reply(text: &str) -> String {
+        format!(
+            "<{}>{text}</{}>",
+            protocol::RESPONSE_TAG,
+            protocol::RESPONSE_TAG
+        )
+    }
+
+    fn summary(text: &str) -> Result<Completion, String> {
+        Ok(Completion {
+            content: text.to_string(),
+            usage: None,
+        })
+    }
+
+    #[test]
+    fn the_context_limit_comes_from_the_model_in_use() {
+        let mut app = App::new("alpha/one".into(), None, 10, std::env::temp_dir());
+        // Still loading.
+        assert_eq!(app.context_limit(), None);
+
+        app.set_catalog(Ok(vec![catalog_entry_with_limit("alpha/one", 200_000)]));
+        assert_eq!(app.context_limit(), Some(200_000));
+
+        // A model the catalog does not carry — `set_model` deliberately does
+        // not validate, so this is reachable.
+        app.model = "who/knows".into();
+        assert_eq!(app.context_limit(), None);
+
+        // A catalog that failed, and an entry quoting no window.
+        let mut failed = App::new("m".into(), None, 10, std::env::temp_dir());
+        failed.set_catalog(Err("no network".into()));
+        assert_eq!(failed.context_limit(), None);
+
+        let mut unquoted = App::new("m".into(), None, 10, std::env::temp_dir());
+        unquoted.set_catalog(Ok(vec![ModelInfo {
+            id: "m".into(),
+            name: "m".into(),
+            context_length: None,
+            pricing: None,
+        }]));
+        assert_eq!(unquoted.context_limit(), None);
+    }
+
+    #[test]
+    fn crossing_the_threshold_parks_a_compaction() {
+        let (mut app, _dir) = app_with_long_history();
+        app.set_catalog(Ok(vec![catalog_entry_with_limit("m", 200_000)]));
+        app.ledger.last_prompt_tokens = 170_000;
+
+        app.push_response(response_reply("all done"), None);
+
+        assert!(matches!(app.status, Status::Compacting));
+        let job = app
+            .take_pending_compaction()
+            .expect("a job should be parked");
+        assert_eq!(job.plan.reason, crate::compact::Reason::Automatic);
+        assert_eq!(job.then, crate::compact::Then::Idle);
+    }
+
+    #[test]
+    fn a_conversation_under_the_threshold_is_left_alone() {
+        let (mut app, _dir) = app_with_long_history();
+        app.set_catalog(Ok(vec![catalog_entry_with_limit("m", 200_000)]));
+        app.ledger.last_prompt_tokens = 100_000;
+
+        app.push_response(response_reply("all done"), None);
+        assert!(matches!(app.status, Status::Idle));
+        assert!(app.take_pending_compaction().is_none());
+    }
+
+    /// A fraction of an unknown number is not a threshold, so bytes stand in.
+    #[test]
+    fn an_unknown_context_limit_falls_back_to_bytes() {
+        let (mut app, _dir) = app_with_files(&[]);
+        assert_eq!(app.context_limit(), None);
+        app.push_response(response_reply("done"), None);
+        assert!(app.take_pending_compaction().is_none(), "small is fine");
+
+        let (mut big, _dir) = app_with_files(&[]);
+        for i in 0..12 {
+            big.history
+                .push(Message::user(protocol::encode_query(&format!("ask {i}"))));
+            let outcome = crate::files::ReadOutcome::whole_file(
+                &format!("f{i}.rs"),
+                "x".repeat(COMPACT_FALLBACK_BYTES / 8),
+            );
+            big.history
+                .push(Message::user(protocol::encode_read_result(&outcome)));
+        }
+        big.status = Status::Idle;
+        big.push_response(response_reply("done"), None);
+        assert!(
+            big.take_pending_compaction().is_some(),
+            "past the byte fallback it should fire"
+        );
+    }
+
+    /// Compaction renumbers history, so it must never land while a turn is
+    /// still holding an action mid-flight.
+    #[test]
+    fn compaction_never_fires_mid_turn() {
+        let (mut app, dir) = app_with_long_history();
+        std::fs::write(dir.join("m.rs"), "contents\n").unwrap();
+        app.set_catalog(Ok(vec![catalog_entry_with_limit("m", 200_000)]));
+        app.ledger.last_prompt_tokens = 170_000;
+
+        // A read continues the loop rather than ending the turn.
+        app.push_response(read_reply("m.rs"), None);
+        assert!(matches!(app.status, Status::Waiting));
+        assert!(
+            app.take_pending_compaction().is_none(),
+            "the turn is still running"
+        );
+    }
+
+    #[test]
+    fn zero_disables_automatic_compaction_but_not_the_command() {
+        let (mut app, _dir) = app_with_long_history();
+        app.set_catalog(Ok(vec![catalog_entry_with_limit("m", 200_000)]));
+        app.ledger.last_prompt_tokens = 199_000;
+        app.compact_at = 0.0;
+
+        app.push_response(response_reply("done"), None);
+        assert!(app.take_pending_compaction().is_none(), "disabled");
+
+        app.dispatch_command(Command::Compact);
+        assert!(
+            app.take_pending_compaction().is_some(),
+            "/compact is a manual override, not subject to the threshold"
+        );
+    }
+
+    #[test]
+    fn an_overflow_compacts_and_resends_once() {
+        let (mut app, _dir) = app_with_long_history();
+        app.history
+            .push(Message::user(protocol::encode_query("the last straw")));
+        let before = app.history_bytes();
+
+        app.push_error(OVERFLOW.into());
+        assert!(matches!(app.status, Status::Compacting));
+        let job = app.take_pending_compaction().expect("parked");
+        assert_eq!(job.then, crate::compact::Then::Resend);
+
+        let messages = app
+            .apply_summary(job, summary("they read twelve files"))
+            .expect("a resend should hand messages back");
+        // Bytes, not messages: the mechanical pass empties result bodies and the
+        // summary block adds one message, so the count can rise while the thing
+        // that actually overflowed — the size — falls sharply.
+        assert!(
+            app.history_bytes() < before,
+            "the resend must be smaller: {} vs {before}",
+            app.history_bytes()
+        );
+        assert_eq!(messages.len(), app.history.len());
+        assert!(matches!(app.status, Status::Waiting));
+        assert!(
+            app.history
+                .last()
+                .unwrap()
+                .content
+                .contains("the last straw"),
+            "the request that overflowed is still the one being sent"
+        );
+    }
+
+    #[test]
+    fn a_second_overflow_in_the_same_turn_gives_up() {
+        let (mut app, _dir) = app_with_long_history();
+        app.push_error(OVERFLOW.into());
+        let job = app
+            .take_pending_compaction()
+            .expect("the first one compacts");
+        app.apply_summary(job, summary("a summary"));
+
+        app.push_error(OVERFLOW.into());
+        assert!(matches!(app.status, Status::Idle), "it must stop, not loop");
+        assert!(app.take_pending_compaction().is_none());
+        assert!(
+            visible(&app)
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(t) if t.contains("still does not fit"))),
+            "giving up should say so"
+        );
+    }
+
+    #[test]
+    fn a_new_prompt_re_arms_the_overflow_retry() {
+        let (mut app, _dir) = app_with_long_history();
+        app.push_error(OVERFLOW.into());
+        let job = app.take_pending_compaction().unwrap();
+        app.apply_summary(job, summary("a summary"));
+
+        // The resend goes out and its reply lands, closing the turn — without
+        // that, `send_prompt` refuses as busy and never re-arms anything.
+        app.push_response(response_reply("ok"), None);
+        app.send_prompt("something new".into());
+        assert!(!app.overflow_compacted, "a new prompt re-arms the retry");
+        for _ in 0..12 {
+            app.history
+                .push(Message::user(protocol::encode_query("filler")));
+            let outcome = crate::files::ReadOutcome::whole_file("f.rs", "y".repeat(8 * 1024));
+            app.history
+                .push(Message::user(protocol::encode_read_result(&outcome)));
+        }
+
+        app.push_error(OVERFLOW.into());
+        assert!(
+            app.take_pending_compaction().is_some(),
+            "a new turn gets its own retry"
+        );
+    }
+
+    #[test]
+    fn a_failed_summary_still_shortens_the_conversation() {
+        let (mut app, _dir) = app_with_long_history();
+        let before = app.history.len();
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+
+        app.apply_summary(job, Err("the summariser timed out".into()));
+        assert!(app.history.len() <= before);
+        assert!(
+            app.history_bytes() < 12 * 8 * 1024,
+            "the mechanical pass stands alone"
+        );
+        assert!(
+            visible(&app)
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(t) if t.contains("without a summary"))),
+            "the user should be told the summary is missing"
+        );
+    }
+
+    /// The model answered the contract instead of the instruction, so its reply
+    /// is an action rather than a summary of anything.
+    #[test]
+    fn a_summary_that_is_a_protocol_element_is_refused() {
+        let (mut app, _dir) = app_with_long_history();
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+
+        app.apply_summary(
+            job,
+            summary("<ai-harness-response>hi</ai-harness-response>"),
+        );
+        let joined: String = app.history.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            !joined.contains(protocol::COMPACTION_TAG),
+            "an action is not a summary: {joined}"
+        );
+    }
+
+    /// `turn_bytes` is derived from a byte snapshot, so replacing history under
+    /// it would saturate to zero and hand a runaway turn a fresh budget.
+    #[test]
+    fn compaction_preserves_the_turn_byte_budget() {
+        let (mut app, _dir) = app_with_long_history();
+        // Start a fresh turn, so what this turn spent is the modest amount below
+        // rather than the whole fixture — the realistic shape, where compaction
+        // takes old conversation and not the turn in progress.
+        app.send_prompt("carry on".into());
+        let outcome = crate::files::ReadOutcome::whole_file("new.rs", "z".repeat(2048));
+        app.history
+            .push(Message::user(protocol::encode_read_result(&outcome)));
+        let spent = app.turn_bytes();
+        assert!(spent > 2000, "this turn should have spent something");
+
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+        app.apply_summary(job, summary("a summary"));
+
+        assert_eq!(
+            app.turn_bytes(),
+            spent,
+            "a runaway turn must not get a fresh budget out of being compacted"
+        );
+    }
+
+    /// `retry_anchor` is a raw index, and `Vec::truncate` past the end is a
+    /// silent no-op — so a stale one fails quietly rather than loudly.
+    #[test]
+    fn compaction_leaves_no_retry_anchor() {
+        let (mut app, _dir) = app_with_long_history();
+        app.push_response("not a protocol reply at all".into(), None);
+        assert!(app.retry_anchor.is_some(), "a retry streak is open");
+
+        app.dispatch_command(Command::Compact);
+        assert!(
+            app.retry_anchor.is_none(),
+            "compaction must take the index, not leave it pointing wrong"
+        );
+    }
+
+    #[test]
+    fn compaction_rewrites_the_contract_and_keeps_plan_mode() {
+        let (mut app, _dir) = app_with_long_history();
+        app.toggle_plan_mode(None);
+        let plan_path = app.plan_path().unwrap().display().to_string();
+        assert!(app.history[0].content.contains(&plan_path));
+
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+        app.apply_summary(job, summary("a summary"));
+
+        assert_eq!(app.history[0].role, crate::openrouter::Role::System);
+        assert!(
+            app.history[0].content.contains(&plan_path),
+            "plan mode must survive with its path intact"
+        );
+    }
+
+    /// `fingerprint` is (history.len(), transcript.len()) and autosave skips a
+    /// write when they are unchanged — which compaction breaks by shrinking.
+    #[test]
+    fn compaction_persists_the_shortened_session() {
+        let (mut app, dir) = app_with_long_history();
+        app.sessions_dir = dir.join("sessions");
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+        app.apply_summary(job, summary("a summary"));
+
+        let saved = crate::session::load(&app.sessions_dir, &app.current_session)
+            .expect("compaction should have saved");
+        assert_eq!(saved.history.len(), app.history.len());
+        let bytes: usize = saved.history.iter().map(|m| m.content.len()).sum();
+        assert!(
+            bytes < 12 * 8 * 1024,
+            "the file must hold the short form, got {bytes}"
+        );
+    }
+
+    #[test]
+    fn the_archive_holds_the_conversation_as_it_was() {
+        let (mut app, dir) = app_with_long_history();
+        app.sessions_dir = dir.join("sessions");
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+        app.apply_summary(job, summary("a summary"));
+
+        let path =
+            crate::session::archive_file(&app.sessions_dir, &app.current_session, 1).unwrap();
+        let raw = std::fs::read_to_string(&path).expect("an archive should exist");
+        assert!(
+            raw.contains("src/f0.rs"),
+            "the detail compaction dropped is what the archive is for"
+        );
+        assert!(raw.contains("\"reason\": \"manual\""), "{raw:.200}");
+    }
+
+    #[test]
+    fn clearing_drops_the_compaction_block() {
+        let (mut app, _dir) = app_with_long_history();
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+        app.apply_summary(job, summary("a summary"));
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.content.contains(protocol::COMPACTION_TAG))
+        );
+
+        app.reset_conversation();
+        assert_eq!(app.history.len(), 1, "only the contract survives");
+    }
+
+    #[test]
+    fn compacting_with_nothing_to_do_says_so() {
+        let (mut app, _dir) = app_with_files(&[]);
+        app.dispatch_command(Command::Compact);
+
+        assert!(app.take_pending_compaction().is_none());
+        assert!(
+            visible(&app)
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(t) if t.contains("Nothing worth compacting"))),
+            "a no-op should explain itself rather than look broken"
+        );
+    }
+
+    #[test]
+    fn the_summarising_call_is_billed_without_moving_the_context_reading() {
+        let (mut app, _dir) = app_with_long_history();
+        app.ledger.record(&Usage {
+            prompt_tokens: 90_000,
+            completion_tokens: 100,
+            prompt_tokens_details: None,
+        });
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().unwrap();
+
+        app.apply_summary(
+            job,
+            Ok(Completion {
+                content: "a summary".into(),
+                usage: Some(Usage {
+                    prompt_tokens: 5_000,
+                    completion_tokens: 400,
+                    prompt_tokens_details: None,
+                }),
+            }),
+        );
+
+        assert_eq!(app.ledger.requests, 2, "the side request costs real money");
+        assert_eq!(
+            app.ledger.last_prompt_tokens, 90_000,
+            "but it is not the conversation, and the trigger reads this"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_compaction_leaves_the_conversation_untouched() {
+        let (mut app, _dir) = app_with_long_history();
+        let before = app.history.clone();
+        app.dispatch_command(Command::Compact);
+        assert!(matches!(app.status, Status::Compacting));
+
+        app.cancel();
+        assert_eq!(
+            app.history, before,
+            "nothing was applied, so nothing to undo"
+        );
+        assert!(app.take_pending_compaction().is_none());
     }
 
     /// Any other error keeps the old behaviour: the trailing turn goes, so a

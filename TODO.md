@@ -8,18 +8,29 @@
     share the same denylist, cap the result size.
     Done in `src/search.rs`. Two follow-ups fell out of it:
       - Replace the hardcoded skip list with `.gitignore` parsing.
-      - A quote-aware attribute-name tokenizer plus an `allowed_attrs(tag)` table,
-        replacing the `takes_attrs` gate in `parse_reply`. Today an unknown
-        attribute alongside a recognised one is silently ignored — `<grep dir=src
-        case=yes>` is accepted — which predates this change but has more surface
-        now that two more elements take attributes.
+      - [x] A quote-aware attribute-name tokenizer plus an `allowed_attrs(tag)`
+        table, replacing the `takes_attrs` gate in `parse_reply`. Done: every
+        attribute is tokenized before any is read, so one the element does not
+        take is reported by name instead of ignored. This was not hypothetical —
+        `<read offset=1090 line=50>` dropped the `line=`, ran to the 64KB cap,
+        and put 16k tokens of file into a session's context permanently. The
+        tokenizer also trims the stray trailing `"` and `,` models put on bare
+        values, which were costing a round-trip each.
 
-[ ] Context compaction. The whole conversation is resent every turn and `/clear`
+[x] Context compaction. The whole conversation is resent every turn and `/clear`
     is the only escape, so a long session eventually dies against the model's
     limit. Both numbers are already there — `context_length` from the catalog
     (`src/openrouter.rs`) and the live context size in the status bar. Auto-compact
     at ~80%: summarise the old prefix into a harness→model block, keep recent turns
     verbatim, preserve the plan and any pending action. Add `/compact` to force it.
+    Done in `src/compact.rs`. Both passes (mechanical + model summary) run, an
+    overflow compacts and resends once, and the pre-compaction conversation is
+    archived to `compaction-NNN.json` in the session folder. Follow-ups:
+      - A settings file. `--compact-at` is the only knob, deliberately: which
+        passes run, the threshold, and which model writes the summary all want
+        configuring, and three more CLI flags for one feature is the wrong shape.
+      - Nothing reads the archives back. A `/restore` or an inspection command is
+        the obvious next step; the numbering exists to allow it.
 
 [ ] Load `AGENTS.md` from the project root at startup, appended to the contract in
     the same slot `--system` uses (never replacing it). `--system` is per-launch

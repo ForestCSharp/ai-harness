@@ -15,6 +15,9 @@ pub enum Command {
     Plan(Option<String>),
     Help,
     Clear,
+    /// Summarise the older part of the conversation to free context. The
+    /// measured alternative to `Clear`, which throws it all away.
+    Compact,
     Quit,
     /// Save the session; `None` uses a generated name.
     Save(Option<String>),
@@ -68,6 +71,7 @@ pub fn parse(input: &str) -> Input {
         "plan" => Command::Plan(arg),
         "help" | "h" | "?" => Command::Help,
         "clear" | "reset" => Command::Clear,
+        "compact" => Command::Compact,
         "quit" | "exit" | "q" => Command::Quit,
         "save" => Command::Save(arg),
         "load" => Command::Load(arg),
@@ -107,6 +111,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "clear",
         description: "clear the conversation, keeping the system prompt",
+    },
+    Spec {
+        name: "compact",
+        description: "summarise the older part of the conversation to free context",
     },
     Spec {
         name: "save",
@@ -321,7 +329,7 @@ mod tests {
 
         // A prefix shared by two commands offers both.
         let names: Vec<_> = matching("c").iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["clear", "cost"]);
+        assert_eq!(names, vec!["clear", "compact", "cost"]);
 
         let names: Vec<_> = matching("cl").iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["clear"]);

@@ -55,6 +55,22 @@ impl Ledger {
         self.requests += 1;
     }
 
+    /// Fold in a request that was not the conversation.
+    ///
+    /// Everything [`Ledger::record`] does except set `last_prompt_tokens`. A
+    /// side request — the summarising call a compaction makes — costs real
+    /// money and belongs in the totals, but its prompt is not the conversation,
+    /// and `last_prompt_tokens` documents itself as how big the conversation is
+    /// *right now*. Recording one through `record` would overwrite the exact
+    /// figure the compaction trigger reads, so compacting would move the number
+    /// that decides whether to compact.
+    pub fn record_side(&mut self, usage: &Usage) {
+        self.prompt_tokens += u64::from(usage.prompt_tokens);
+        self.completion_tokens += u64::from(usage.completion_tokens);
+        self.cached_tokens += u64::from(usage.cached_tokens());
+        self.requests += 1;
+    }
+
     /// Share of prompt tokens served from cache, `None` if nothing was billed
     /// yet. Zero is a real answer — it means nothing is being cached.
     pub fn cache_hit_rate(&self) -> Option<f64> {
@@ -89,16 +105,26 @@ impl Ledger {
         )
     }
 
-    /// A short indicator for the status bar, e.g. `66k ctx  36.7k tok  $0.04`.
+    /// A short indicator for the status bar, e.g. `context: 66k (34%)  total: 36.7k tok  $0.04`.
     ///
     /// Context first, because it is the one that can end the session: spend
     /// grows steadily and forgivingly, while the context window is a wall.
-    pub fn status_line(&self, price_in: Option<f64>, price_out: Option<f64>) -> String {
+    pub fn status_line(
+        &self,
+        price_in: Option<f64>,
+        price_out: Option<f64>,
+        context_limit: Option<u32>,
+    ) -> String {
         let mut text = String::new();
         if self.last_prompt_tokens > 0 {
-            text.push_str(&format!("{} ctx  ", compact(self.last_prompt_tokens)));
+            text.push_str(&format!("context: {}", compact(self.last_prompt_tokens)));
+            if let Some(limit) = context_limit {
+                let pct = (self.last_prompt_tokens as f64 / f64::from(limit)) * 100.0;
+                text.push_str(&format!(" ({:.0}%)", pct));
+            }
+            text.push_str("  ");
         }
-        text.push_str(&format!("{} tok", compact(self.total_tokens())));
+        text.push_str(&format!("total: {} tok", compact(self.total_tokens())));
         if let Some(cost) = self.cost(price_in, price_out) {
             text.push_str(&format!("  {}", money(cost)));
         }
@@ -156,7 +182,7 @@ impl Ledger {
 ///
 /// Truncates rather than rounding, so a value just under a unit boundary cannot
 /// render as `1000.0k` instead of crossing to `M`.
-fn compact(n: u64) -> String {
+pub(crate) fn compact(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
         1_000..=999_999 => format!("{}.{}k", n / 1_000, (n % 1_000) / 100),
@@ -208,6 +234,25 @@ mod tests {
             completion_tokens: completion,
             prompt_tokens_details: None,
         }
+    }
+
+    /// `last_prompt_tokens` is what the compaction trigger reads, so a side
+    /// request moving it would mean compacting changes the number that decides
+    /// whether to compact.
+    #[test]
+    fn a_side_request_is_billed_but_does_not_move_the_context_reading() {
+        let mut ledger = Ledger::default();
+        ledger.record(&usage(1000, 50));
+        assert_eq!(ledger.last_prompt_tokens, 1000);
+
+        ledger.record_side(&usage(200, 80));
+        assert_eq!(
+            ledger.last_prompt_tokens, 1000,
+            "the conversation is still 1000"
+        );
+        assert_eq!(ledger.prompt_tokens, 1200, "but the spend is real");
+        assert_eq!(ledger.completion_tokens, 130);
+        assert_eq!(ledger.requests, 2);
     }
 
     #[test]
@@ -286,8 +331,11 @@ mod tests {
         let mut ledger = Ledger::default();
         ledger.record(&usage(34_500, 2_200));
         // Context first: it is the figure that can end the session.
-        assert_eq!(ledger.status_line(None, None), "34.5k ctx  36.7k tok");
-        assert!(ledger.status_line(Some(1.0), Some(1.0)).contains('$'));
+        assert_eq!(
+            ledger.status_line(None, None, None),
+            "context: 34.5k  total: 36.7k tok"
+        );
+        assert!(ledger.status_line(Some(1.0), Some(1.0), None).contains('$'));
     }
 
     /// The cumulative total counts every re-send of the conversation; the
@@ -302,7 +350,11 @@ mod tests {
 
         assert_eq!(ledger.last_prompt_tokens, 9_000);
         assert_eq!(ledger.prompt_tokens, 13_000);
-        assert!(ledger.status_line(None, None).starts_with("9.0k ctx"));
+        assert!(
+            ledger
+                .status_line(None, None, None)
+                .starts_with("context: 9.0k")
+        );
     }
 
     /// Zero is a real answer — it means the provider is not caching this

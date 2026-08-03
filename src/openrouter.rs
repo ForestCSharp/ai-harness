@@ -306,9 +306,15 @@ impl Client {
     }
 
     /// Drain a streaming request to a single completion, for callers that only
-    /// want the final text. The UI streams instead (see [`Client::open_stream`]);
-    /// this is used by tests and keeps a simple non-streaming entry point.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// want the final text.
+    ///
+    /// The conversation itself streams (see [`Client::open_stream`]) because the
+    /// user is watching it arrive. This is for requests they are not: the
+    /// summarising call a compaction makes, whose reply is context rather than
+    /// something to read token by token.
+    ///
+    /// Takes no cancel future, unlike the streaming path — a caller that needs
+    /// to abandon one selects over this whole future instead.
     pub async fn complete(&self, messages: &[Message]) -> Result<Completion> {
         let stream = self.open_stream(messages).await?;
         futures_util::pin_mut!(stream);

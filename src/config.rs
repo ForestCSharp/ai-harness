@@ -50,6 +50,15 @@ pub struct Args {
     #[arg(long, default_value_t = 512 * 1024, env = "AI_HARNESS_MAX_TURN_BYTES")]
     pub max_turn_bytes: usize,
 
+    /// Fraction of the model's context window at which the conversation is
+    /// compacted automatically. 0 disables it; `/compact` still works.
+    ///
+    /// When the model's window is unknown — the catalog has not landed, the
+    /// fetch failed, or the model is not in it — this falls back to a fixed
+    /// byte size, since a fraction of an unknown number is not a threshold.
+    #[arg(long, default_value_t = crate::app::DEFAULT_COMPACT_AT, env = "AI_HARNESS_COMPACT_AT")]
+    pub compact_at: f64,
+
     /// Ask before each file read or search. Off by default: none of the three
     /// mutates anything or leaves the working directory, so they run without
     /// interrupting you.
@@ -90,6 +99,19 @@ pub struct Args {
     /// Corrective retries allowed when a reply breaks the protocol.
     #[arg(long, default_value_t = crate::app::DEFAULT_MAX_RETRIES, env = "AI_HARNESS_MAX_RETRIES")]
     pub max_retries: usize,
+
+    /// Reject a reply that puts prose in front of an otherwise valid element,
+    /// instead of dropping the prose and running the element.
+    ///
+    /// Off by default, so the prose is dropped. A narrated element is the
+    /// commonest way a model breaks the contract and the least interesting: the
+    /// action it wrote was right, and rejecting it costs a round-trip and a
+    /// rollback to arrive back where it started. The recovery is narrow — the
+    /// element still has to parse on its own, and every other violation is
+    /// rejected as before — and it says so in the transcript each time, so drift
+    /// stays visible. Turn this on to see the protocol enforced exactly.
+    #[arg(long, env = "AI_HARNESS_STRICT_REPLIES")]
+    pub strict_replies: bool,
 
     /// Directory holding session folders.
     ///
@@ -199,6 +221,21 @@ mod tests {
             Args::try_parse_from(["ai-harness", "--confirm-search"]).is_err(),
             "a separate search flag would be a surface nobody finds"
         );
+    }
+
+    #[test]
+    fn compaction_defaults_on_and_zero_turns_it_off() {
+        assert_eq!(args(&[]).compact_at, crate::app::DEFAULT_COMPACT_AT);
+        assert_eq!(args(&["--compact-at", "0"]).compact_at, 0.0);
+        assert_eq!(args(&["--compact-at", "0.5"]).compact_at, 0.5);
+    }
+
+    /// Named for what turning it on gets you, like `--confirm-reads`, rather
+    /// than for the recovery it disables.
+    #[test]
+    fn preamble_recovery_is_on_until_strictness_is_asked_for() {
+        assert!(!args(&[]).strict_replies);
+        assert!(args(&["--strict-replies"]).strict_replies);
     }
 
     #[test]

