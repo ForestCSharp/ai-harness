@@ -270,7 +270,10 @@ impl Question {
 /// it coexists with `Status::Idle`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
-    /// Saved session names, snapshotted when the picker opened.
+    /// Saved session names, snapshotted when the picker opened, most recently
+    /// worked in first. Typing narrows this list but does not reorder it: there
+    /// is no relevance ranking to reorder by, and a list that rearranged itself
+    /// under a query would move the row you were reaching for.
     pub sessions: Vec<String>,
     pub selected: usize,
     /// Each session's last few lines, parallel to `sessions`.
@@ -481,6 +484,10 @@ pub struct App {
     /// rather than rejected. See [`App::recover_preamble`]; `--strict-replies`
     /// turns it off.
     pub strip_preamble: bool,
+    /// Whether a streamed reasoning trace is rendered. Governs display only —
+    /// [`App::reasoning`] fills either way, so `/reasoning` mid-turn shows what
+    /// has arrived rather than starting from wherever the model has got to.
+    pub show_reasoning: bool,
     /// History length before the current streak of malformed replies, so a
     /// give-up can roll the whole failed exchange back out of context.
     retry_anchor: Option<usize>,
@@ -491,6 +498,11 @@ pub struct App {
     /// authoritative text arrives with the final completion, so this is cleared
     /// before the reply is committed.
     pub streaming: Option<String>,
+    /// The model's reasoning so far, on models that stream it. Display-only in
+    /// the strongest sense: it is never parsed, never added to `history`, never
+    /// written to a session, and cleared with `streaming` when the turn ends.
+    /// What the model reasoned is not what the model said.
+    pub reasoning: Option<String>,
     /// Identifies the current in-flight task. Bumped whenever a task is spawned,
     /// and again on cancel, so updates from an abandoned task can be dropped.
     generation: u64,
@@ -574,9 +586,11 @@ impl App {
             retries: 0,
             max_retries: DEFAULT_MAX_RETRIES,
             strip_preamble: true,
+            show_reasoning: true,
             retry_anchor: None,
             completion_cursor: 0,
             streaming: None,
+            reasoning: None,
             generation: 0,
             sessions_dir,
             current_session: crate::session::default_name(),
@@ -725,10 +739,28 @@ impl App {
         self.follow = true;
     }
 
+    /// Append a chunk of streamed reasoning to the live view.
+    ///
+    /// Buffered whether or not `show_reasoning` is on: the flag governs
+    /// rendering, so turning it on mid-turn shows the trace so far rather than
+    /// starting from wherever the model has got to.
+    pub fn push_reasoning(&mut self, delta: &str) {
+        self.status = Status::Streaming;
+        self.reasoning
+            .get_or_insert_with(String::new)
+            .push_str(delta);
+        self.follow = true;
+    }
+
     /// Discard the live streaming view. The full reply text is committed
     /// separately via [`App::push_response`].
+    ///
+    /// The reasoning goes with it, and is committed nowhere: this is the single
+    /// point every path out of a turn passes through — the reply landing, an
+    /// error, a cancel — so a trace cannot outlive the turn it belongs to.
     pub fn finish_stream(&mut self) {
         self.streaming = None;
+        self.reasoning = None;
     }
 
     /// Commands offered for the partially-typed name in the prompt.
@@ -806,6 +838,18 @@ impl App {
                 self.debug = !self.debug;
                 let state = if self.debug { "on" } else { "off" };
                 self.push_notice(format!("Debug mode {state}."));
+            }
+            Command::Reasoning => {
+                self.show_reasoning = !self.show_reasoning;
+                // Says what it does with what has already arrived, because the
+                // buffer is unaffected either way: turning it back on mid-turn
+                // shows the trace so far rather than the remainder of it.
+                let state = if self.show_reasoning {
+                    "on — the model's reasoning shows while it streams"
+                } else {
+                    "off — reasoning still arrives, it is just not shown"
+                };
+                self.push_notice(format!("Reasoning {state}."));
             }
             Command::Auto => {
                 self.auto_approve = !self.auto_approve;
@@ -1094,21 +1138,39 @@ impl App {
     }
 
     /// Open the session picker, or post a notice when nothing is saved yet.
+    ///
+    /// Ordered by when each session was last worked in, most recent first.
+    /// `session::list` sorts by name, which is the right answer for looking one
+    /// up and the wrong one for choosing: names are timestamps until they are
+    /// renamed, so alphabetical order buries the session you were in a minute
+    /// ago among ones you have not opened in weeks. Ties — two sessions saved in
+    /// the same second, which the fixtures do — fall back to the name, so the
+    /// order is total rather than dependent on directory iteration.
     pub fn open_load_picker(&mut self) {
-        let sessions = crate::session::list(&self.sessions_dir);
-        if sessions.is_empty() {
+        let mut listed: Vec<(String, crate::session::Head)> =
+            crate::session::list(&self.sessions_dir)
+                .into_iter()
+                .map(|name| {
+                    let head = crate::session::head(&self.sessions_dir, &name);
+                    (name, head)
+                })
+                .collect();
+        if listed.is_empty() {
             self.push_notice("No saved sessions. Use /save [name] to create one.");
         } else {
-            let previews = sessions
+            listed.sort_by(|(a_name, a), (b_name, b)| {
+                b.saved_at.cmp(&a.saved_at).then_with(|| a_name.cmp(b_name))
+            });
+            let previews = listed
                 .iter()
-                .map(|name| crate::session::preview(&self.sessions_dir, name))
+                .map(|(name, _)| crate::session::preview(&self.sessions_dir, name))
                 .collect();
-            let models = sessions
+            let models = listed
                 .iter()
-                .map(|name| crate::session::model(&self.sessions_dir, name).unwrap_or_default())
+                .map(|(_, head)| head.model.clone().unwrap_or_default())
                 .collect();
             self.picker = Some(Picker {
-                sessions,
+                sessions: listed.into_iter().map(|(name, _)| name).collect(),
                 selected: 0,
                 previews,
                 models,
@@ -4200,6 +4262,79 @@ mod tests {
             .collect()
     }
 
+    /// Names are timestamps until they are renamed, so alphabetical order buries
+    /// the session you were in a minute ago among ones you have not opened in
+    /// weeks. The one you want is nearly always the last one you were in.
+    #[test]
+    fn the_picker_lists_the_most_recently_worked_in_session_first() {
+        let dir = session_temp_dir("picker-recency");
+        // Saved oldest-first under names that sort the other way, so neither
+        // alphabetical order nor insertion order can pass this by accident.
+        for (name, saved_at) in [("aaa", 100), ("mmm", 300), ("zzz", 200)] {
+            let mut session = crate::session::Session::new(
+                "m".into(),
+                vec![Message::system("x")],
+                vec![],
+                vec![],
+                Ledger::default(),
+            );
+            session.saved_at = saved_at;
+            crate::session::save(&dir, name, &session).unwrap();
+        }
+
+        let mut app = app_in(&dir);
+        app.open_load_picker();
+        assert_eq!(app.picker().unwrap().sessions, vec!["mmm", "zzz", "aaa"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session whose file cannot be read for a time sorts oldest rather than
+    /// landing at the top, where an unreadable one would be the default choice.
+    #[test]
+    fn a_session_with_no_saved_time_sorts_last() {
+        let dir = session_temp_dir("picker-recency-unknown");
+        for (name, saved_at) in [("dated", 100), ("undated", 0)] {
+            let mut session = crate::session::Session::new(
+                "m".into(),
+                vec![Message::system("x")],
+                vec![],
+                vec![],
+                Ledger::default(),
+            );
+            session.saved_at = saved_at;
+            crate::session::save(&dir, name, &session).unwrap();
+        }
+
+        let mut app = app_in(&dir);
+        app.open_load_picker();
+        assert_eq!(app.picker().unwrap().sessions, vec!["dated", "undated"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Filtering narrows the list, it does not reorder it — so the recency order
+    /// is still what you are looking at once you start typing.
+    #[test]
+    fn filtering_keeps_the_recency_order() {
+        let dir = session_temp_dir("picker-recency-filter");
+        for (name, saved_at) in [("keep-a", 100), ("drop", 200), ("keep-b", 300)] {
+            let mut session = crate::session::Session::new(
+                "m".into(),
+                vec![Message::system("x")],
+                vec![],
+                vec![],
+                Ledger::default(),
+            );
+            session.saved_at = saved_at;
+            crate::session::save(&dir, name, &session).unwrap();
+        }
+
+        let mut app = app_in(&dir);
+        app.open_load_picker();
+        app.picker_query_input(|input| input.insert_str("keep"));
+        assert_eq!(shown(&app), vec!["keep-b", "keep-a"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn picker_query_narrows_the_list_and_every_term_must_hit() {
         let dir = session_temp_dir("picker-filter");
@@ -4688,6 +4823,81 @@ mod tests {
             }
             other => panic!("expected a committed action, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reasoning_accumulates_beside_the_reply_never_into_it() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+
+        app.push_reasoning("the user wants");
+        app.push_reasoning(" a greeting");
+        assert_eq!(app.reasoning.as_deref(), Some("the user wants a greeting"));
+        assert!(app.streaming.is_none(), "reasoning is not the reply");
+        assert_eq!(app.status, Status::Streaming, "tokens are arriving");
+
+        app.push_delta("Hello");
+        assert_eq!(app.streaming.as_deref(), Some("Hello"));
+        assert_eq!(
+            app.reasoning.as_deref(),
+            Some("the user wants a greeting"),
+            "the trace stays up while the reply arrives under it"
+        );
+    }
+
+    /// Whatever ends the turn, the trace ends with it. The committed reply is
+    /// the reply alone, and nothing in `history` mentions the reasoning.
+    #[test]
+    fn the_reasoning_trace_does_not_outlive_its_turn() {
+        for end in ["commit", "cancel"] {
+            let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+            app.input.insert_str("hi");
+            app.submit().unwrap();
+            app.push_reasoning("SECRET CHAIN OF THOUGHT");
+
+            match end {
+                "commit" => {
+                    app.finish_stream();
+                    app.push_response(
+                        "<ai-harness-response>Hello there.</ai-harness-response>".into(),
+                        None,
+                    );
+                }
+                _ => app.cancel(),
+            }
+
+            assert!(app.reasoning.is_none(), "{end}: the trace must be cleared");
+            assert!(
+                !app.history
+                    .iter()
+                    .any(|m| m.content.contains("SECRET CHAIN OF THOUGHT")),
+                "{end}: reasoning must never reach the conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reasoning_toggle_says_what_it_does_and_keeps_buffering() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        assert!(app.show_reasoning, "shown by default");
+
+        app.run_command(Command::Reasoning);
+        assert!(!app.show_reasoning);
+        match last_visible(&app) {
+            Entry::Notice(text) => assert!(
+                text.contains("not shown"),
+                "\"off\" alone does not say the deltas still arrive: {text}"
+            ),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+
+        // Buffered while hidden, so turning it back on shows the trace so far
+        // rather than starting from wherever the model has got to.
+        app.push_reasoning("thought while hidden");
+        app.run_command(Command::Reasoning);
+        assert!(app.show_reasoning, "the toggle must go both ways");
+        assert_eq!(app.reasoning.as_deref(), Some("thought while hidden"));
     }
 
     #[test]

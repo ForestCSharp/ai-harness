@@ -181,6 +181,14 @@ impl Usage {
 pub enum StreamEvent {
     /// A chunk of assistant content to append.
     Delta(String),
+    /// A chunk of the model's reasoning, on models that stream it.
+    ///
+    /// Its own variant rather than a flag on [`Self::Delta`] so that every
+    /// consumer has to say what it does with reasoning. It must never reach the
+    /// assistant content: that is what the protocol parses and what goes into
+    /// the conversation, and a chain of thought in either would be read as the
+    /// model's answer.
+    Reasoning(String),
     /// The stream finished. Usage arrives here, in the final chunk.
     Done { usage: Option<Usage> },
 }
@@ -324,6 +332,10 @@ impl Client {
         while let Some(event) = stream.next().await {
             match event? {
                 StreamEvent::Delta(delta) => content.push_str(&delta),
+                // Dropped, not appended. The caller here is the compaction
+                // summariser, and a chain of thought folded into the summary
+                // would become conversation the model answers from.
+                StreamEvent::Reasoning(_) => {}
                 // Usage arrives in its own chunk, followed by a `[DONE]` whose
                 // usage is None; keep the populated one.
                 StreamEvent::Done { usage: Some(u) } => usage = Some(u),
@@ -455,22 +467,37 @@ fn parse_sse_event(block: &str) -> Option<Result<StreamEvent>> {
         return Some(Err(anyhow!("OpenRouter stream error: {}", err.message)));
     }
 
-    let delta = chunk
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.delta.content)
-        .unwrap_or_default();
+    let delta = chunk.choices.into_iter().next().map(|c| c.delta);
+    let (content, reasoning) = delta.map_or_else(
+        || (String::new(), String::new()),
+        |d| {
+            (
+                d.content.unwrap_or_default(),
+                d.reasoning.unwrap_or_default(),
+            )
+        },
+    );
+
+    if !content.is_empty() {
+        // Content wins when a chunk somehow carries both, and that chunk's
+        // reasoning is dropped. One event per chunk is this function's contract
+        // and `sse_events`' too, and widening it to a list for a case OpenRouter
+        // does not produce — reasoning arrives in its own chunks, ahead of
+        // content — would complicate the stream to close a gap nobody can see.
+        // Reasoning is a live view that is thrown away at the end of the turn,
+        // so the cost of losing a fragment of it is a slightly gappy trace.
+        return Some(Ok(StreamEvent::Delta(content)));
+    }
+    if !reasoning.is_empty() {
+        return Some(Ok(StreamEvent::Reasoning(reasoning)));
+    }
 
     // A usage-only final chunk carries no content; report it as Done so the
     // caller records token counts.
-    if delta.is_empty() {
-        if let Some(usage) = chunk.usage {
-            return Some(Ok(StreamEvent::Done { usage: Some(usage) }));
-        }
-        return None;
+    if let Some(usage) = chunk.usage {
+        return Some(Ok(StreamEvent::Done { usage: Some(usage) }));
     }
-    Some(Ok(StreamEvent::Delta(delta)))
+    None
 }
 
 #[derive(Serialize)]
@@ -507,7 +534,10 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
-    // `reasoning` deltas are intentionally not accumulated into content.
+    /// The model's reasoning, on models that stream it. Carried separately and
+    /// never accumulated into `content` — see [`StreamEvent::Reasoning`].
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -679,6 +709,14 @@ mod tests {
     fn delta(text: &str) -> String {
         format!(
             r#"{{"choices":[{{"delta":{{"content":{}}}}}]}}"#,
+            json_str(text)
+        )
+    }
+
+    /// A reasoning-delta chunk, as a reasoning model streams it.
+    fn reasoning(text: &str) -> String {
+        format!(
+            r#"{{"choices":[{{"delta":{{"reasoning":{}}}}}]}}"#,
             json_str(text)
         )
     }
@@ -866,6 +904,64 @@ mod tests {
         server.join().unwrap();
         assert_eq!(completion.content, "ok");
         assert!(completion.usage.is_none());
+    }
+
+    /// The invariant the whole feature rests on. `complete` is the compaction
+    /// summariser, and a chain of thought folded into the summary would become
+    /// conversation the model then answers from.
+    #[tokio::test]
+    async fn reasoning_never_reaches_the_assembled_content() {
+        let (client, server) = serve_sse(vec![
+            reasoning("the user probably means"),
+            reasoning(" the other thing"),
+            delta("Hello."),
+        ]);
+        let completion = client.complete(&[Message::user("hi")]).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(completion.content, "Hello.");
+    }
+
+    #[tokio::test]
+    async fn open_stream_separates_reasoning_from_content() {
+        let (client, server) = serve_sse(vec![
+            reasoning("first I"),
+            reasoning(" think"),
+            delta("then I "),
+            delta("answer"),
+        ]);
+        let messages = [Message::user("hi")];
+        let stream = client.open_stream(&messages).await.unwrap();
+        futures_util::pin_mut!(stream);
+
+        let (mut thought, mut said) = (String::new(), String::new());
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                StreamEvent::Reasoning(r) => thought.push_str(&r),
+                StreamEvent::Delta(d) => said.push_str(&d),
+                StreamEvent::Done { .. } => {}
+            }
+        }
+        server.join().unwrap();
+        assert_eq!(thought, "first I think");
+        assert_eq!(said, "then I answer");
+    }
+
+    /// One event per chunk is the contract; a chunk carrying both keeps the
+    /// content, since that is the half that cannot be dropped.
+    #[test]
+    fn a_chunk_with_both_yields_the_content() {
+        let event =
+            parse_sse_event(r#"data: {"choices":[{"delta":{"content":"hi","reasoning":"hmm"}}]}"#);
+        assert_eq!(event.unwrap().unwrap(), StreamEvent::Delta("hi".into()));
+    }
+
+    #[test]
+    fn parse_sse_event_reads_a_reasoning_delta() {
+        let event = parse_sse_event(r#"data: {"choices":[{"delta":{"reasoning":"hmm"}}]}"#);
+        assert_eq!(
+            event.unwrap().unwrap(),
+            StreamEvent::Reasoning("hmm".into())
+        );
     }
 
     #[tokio::test]
@@ -1114,6 +1210,7 @@ mod tests {
 
         let mut deltas = 0usize;
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut usage = None;
         while let Some(event) = stream.next().await {
             match event.unwrap() {
@@ -1121,6 +1218,7 @@ mod tests {
                     deltas += 1;
                     content.push_str(&d);
                 }
+                StreamEvent::Reasoning(r) => reasoning.push_str(&r),
                 StreamEvent::Done { usage: u } => {
                     if u.is_some() {
                         usage = u;
@@ -1129,7 +1227,10 @@ mod tests {
             }
         }
 
-        println!("received {deltas} deltas, usage: {usage:?}\nassembled: {content:?}");
+        println!(
+            "received {deltas} deltas, {} bytes of reasoning, usage: {usage:?}\nassembled: {content:?}",
+            reasoning.len()
+        );
         assert!(deltas > 1, "a streamed reply should arrive in many chunks");
         assert!(content.contains('5'), "unexpected reply: {content}");
     }

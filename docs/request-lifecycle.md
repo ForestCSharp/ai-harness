@@ -58,6 +58,8 @@ UI never blocks. It calls `client.open_stream`, then `stream_reply`
 
 - every content delta → `Update::Delta(text)` on the channel, sent with `.await`
   so a slow UI **back-pressures the HTTP read** rather than dropping tokens,
+- every reasoning delta → `Update::Reasoning(text)`, a second event kind that
+  stops at the screen (see below),
 - usage arrives in its own final chunk,
 - at the end, one `Update::ReplyEnd(Ok(Completion))` — or `Err` if the connection
   broke.
@@ -68,11 +70,22 @@ Meanwhile the main loop keeps spinning, draining those updates in `handle_update
 - **`Delta`** → `app.push_delta` ([src/app.rs:164](../src/app.rs)): appends to the
   `streaming` buffer and flips status to `Streaming`. On the next redraw you see
   the text growing live below the transcript with a `▌` cursor.
+- **`Reasoning`** → `app.push_reasoning`: appends to a **separate** buffer, drawn
+  as a dim capped window above the reply.
 - **`ReplyEnd(Ok)`** → `finish_stream()` ([src/app.rs:174](../src/app.rs)) throws
-  away the live buffer, then hands the *full* text to `push_response`.
+  away both live buffers, then hands the *full* text to `push_response`.
 
 The live buffer is display-only; the authoritative text is what `push_response`
 receives.
+
+Reasoning is `StreamEvent::Reasoning`, its own variant rather than a flag on
+`Delta`, so that every consumer of the stream has to say what it does with it.
+That is not ceremony: `Client::complete` — the compaction summariser — has an arm
+that drops reasoning explicitly, and without the separate variant a chain of
+thought would have been folded into a summary that then becomes conversation the
+model answers from. `stream_reply`'s reasoning arm likewise never touches
+`content`. Nothing downstream of step 3 ever sees it: it is not parsed, not added
+to `history`, and not written to a session.
 
 ## 3. The reply is parsed — the decision point
 

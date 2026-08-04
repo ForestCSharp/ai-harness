@@ -221,6 +221,37 @@ element behind the prose still has to parse on its own, and trailing content, tw
 elements, an invented result, or an attribute the element does not take are all
 rejected as before. `--strict-replies` turns the recovery off.
 
+## Reasoning
+
+Models that stream their reasoning have it shown, dimmed, in a capped window
+above the reply as it arrives:
+
+```
+┌─ ⠋ reasoning ────────────────────────────────────
+│ ⋯ 14 earlier line(s)
+│ Keying on the path alone would retire a read of a
+│ different part of the same file.
+│ I should read the function before answering.
+└──────────────────────────────────────────────────
+```
+
+Without this a reasoning model leaves you watching a `thinking…` spinner for a
+minute or more while the API is streaming text the whole time that says what it
+is doing. The window is capped and reports what scrolled past, for the same
+reason a running command's output is: a trace can be far larger than the screen,
+and the newest part is the part worth seeing.
+
+The trace is a live view and nothing else. It is **never parsed** — it does not
+go near the protocol — **never sent back** to the model, and **never saved** with
+the session. It is gone the moment the reply lands, and it is gone on a cancel or
+an error too. What a model reasoned is not what it said, and the harness keeps
+only what it said.
+
+`/reasoning` toggles the window and `--no-reasoning` starts with it hidden. Both
+govern drawing only: the text still arrives and is still buffered, so turning it
+back on mid-turn shows the trace so far rather than picking up from wherever the
+model has got to.
+
 ## Slash commands
 
 Commands are handled locally and never sent to the model.
@@ -229,6 +260,7 @@ Commands are handled locally and never sent to the model.
 | --- | --- |
 | `/debug` | Toggle showing the raw protocol sent and received |
 | `/auto` | Toggle running actions without the approval modal (see [Sandboxing](#sandboxing)) |
+| `/reasoning` | Toggle showing the model's reasoning while it streams (see [Reasoning](#reasoning)) |
 | `/plan [task]` | Toggle plan mode; with a task, start planning it (see [Plan mode](#plan-mode)) |
 | `/clear` | Clear the conversation, keeping the system prompt |
 | `/compact` | Summarise the older part of the conversation to free context (see [Context compaction](#context-compaction)) |
@@ -618,7 +650,8 @@ context window that triggers [compaction](#context-compaction) (`0` disables it)
 searches behind the approval modal along with everything else, and
 `--confirm-fetch` does the same for URL fetches.
 `--strict-replies` rejects a reply that narrates before its element rather than
-dropping the narration.
+dropping the narration, and `--no-reasoning` starts with the reasoning window
+hidden.
 `--auto-approve` goes the other way and removes the modal entirely — read
 [Sandboxing](#sandboxing) before using it. Every flag also has an environment
 variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
@@ -711,6 +744,13 @@ because it is the same thing: where you answer.
 The panel sizes itself to its contents on the same rule the prompt follows, and
 gives way before the transcript does: past its cap it scrolls internally rather
 than squeezing the conversation out of view.
+
+The `/load` picker is the exception, and takes the whole screen bar the status
+line. Every other panel says one thing, so sizing to it keeps the conversation
+you are deciding about in view; the picker is a list you filter, and one that
+resized on every keystroke moved the row you were reading towards. Rows come and
+go inside a frame that stays where it is. The transcript is not what you are
+reading while you choose which conversation to be in.
 
 ## Layout of the code
 
@@ -835,9 +875,14 @@ never overwrite each other.
   name — loading switches to it), and the session's last few lines, so the list
   can be read rather than navigated — names are timestamps until you `/rename`
   them, and a timestamp says nothing about what a session was. Sessions saved
-  before previews existed show a bare name until their next save. Typing narrows
-  on the name and the model, matching the `/model` picker: every whitespace-
-  separated term must appear, so terms narrow rather than widen.
+  before previews existed show a bare name until their next save.
+
+  The list is ordered by when each session was last worked in, most recent
+  first, since that is nearly always the one you want. Typing narrows it on the
+  name and the model, matching the `/model` picker: every whitespace-separated
+  term must appear, so terms narrow rather than widen. Filtering does not
+  reorder — a list that rearranged itself under a query would move the row you
+  were reaching for.
 - `/clear` — wipe the conversation, **including its saved file** (it is
   overwritten to the cleared state). Use `/fork` first if you want to keep it.
   The model you are on is session state, not conversation state, so it survives.

@@ -57,10 +57,17 @@
     one approval — and the relaxation must not reach any other element, since strict
     whole-reply parsing is the point of the protocol.
 
-[ ] Show reasoning deltas. `src/openrouter.rs` deliberately drops them, which is
+[x] Show reasoning deltas. `src/openrouter.rs` deliberately drops them, which is
     right for the parser, but a reasoning model leaves you watching `thinking…` for
     text the API is already streaming. Render dimmed; never parse it, never feed it
     back.
+    Done. `StreamEvent::Reasoning` is its own variant rather than a flag on
+    `Delta`, so every consumer has to say what it does with it — which is how
+    `Client::complete`, the compaction summariser, came to have an arm that drops
+    it explicitly. Rendered in a dim capped window built like `running_window`,
+    since a trace is the same problem as a build log. `/reasoning` and
+    `--no-reasoning` govern drawing only; the buffer fills either way, so turning
+    it on mid-turn shows the trace so far.
 
 ---
 

@@ -47,6 +47,8 @@ const TICK: Duration = Duration::from_millis(80);
 enum Update {
     /// A chunk of streamed reply text.
     Delta(String),
+    /// A chunk of the model's streamed reasoning. Shown, never kept.
+    Reasoning(String),
     /// The model reply finished, or the error that replaced it.
     ReplyEnd(Result<Completion, String>),
     /// A piece of output from the command running now. Display-only: the
@@ -130,6 +132,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     app.debug = args.debug || cfg!(debug_assertions);
     app.max_retries = args.max_retries;
     app.strip_preamble = !args.strict_replies;
+    app.show_reasoning = !args.no_reasoning;
     // Reads resolve paths in-process against the sandbox root, so the app needs
     // the sandbox itself, not just its root.
     app.sandbox = Some(sandbox.clone());
@@ -263,6 +266,7 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
         Update::Models(result) => app.set_catalog(result),
         // Live tokens accumulate in the display-only streaming buffer.
         Update::Delta(delta) => app.push_delta(&delta),
+        Update::Reasoning(delta) => app.push_reasoning(&delta),
         // The reply is complete. Drop the live view and commit the full text
         // through the normal path — a malformed reply earns a corrective retry,
         // which comes back as messages to resend.
@@ -1165,6 +1169,18 @@ async fn stream_reply(
                     // never dropped when the UI falls behind.
                     if tx
                         .send(Tagged { generation, update: Update::Delta(delta) })
+                        .await
+                        .is_err()
+                    {
+                        return Some(Err("UI closed".to_string()));
+                    }
+                }
+                // Forwarded to the screen and nowhere else. Note what this arm
+                // does *not* do: it never touches `content`, which is the text
+                // the protocol parses and the conversation keeps.
+                Some(Ok(StreamEvent::Reasoning(delta))) => {
+                    if tx
+                        .send(Tagged { generation, update: Update::Reasoning(delta) })
                         .await
                         .is_err()
                     {

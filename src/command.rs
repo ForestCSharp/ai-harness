@@ -11,6 +11,8 @@ pub enum Command {
     Debug,
     /// Toggle running actions without the approval modal.
     Auto,
+    /// Toggle showing the model's reasoning while it streams.
+    Reasoning,
     /// Toggle plan mode. `Some` carries the task to start planning immediately.
     Plan(Option<String>),
     Help,
@@ -68,6 +70,7 @@ pub fn parse(input: &str) -> Input {
     Input::Command(match name.to_ascii_lowercase().as_str() {
         "debug" => Command::Debug,
         "auto" | "auto-approve" => Command::Auto,
+        "reasoning" | "thinking" => Command::Reasoning,
         "plan" => Command::Plan(arg),
         "help" | "h" | "?" => Command::Help,
         "clear" | "reset" => Command::Clear,
@@ -103,6 +106,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "auto",
         description: "toggle running actions without the approval modal",
+    },
+    Spec {
+        name: "reasoning",
+        description: "toggle showing the model's reasoning while it streams",
     },
     Spec {
         name: "plan",

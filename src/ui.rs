@@ -93,8 +93,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, cache: &mut TranscriptCache) -> Me
     let panel = prepare_panel(app, area);
     let panel_rows = panel.as_ref().map_or(input_rows + 2, |p| p.height);
 
+    // `Min(0)`, not `Min(1)`: the session picker takes the whole screen, and the
+    // transcript is not what you are reading while you choose which conversation
+    // to be in. Every other panel is capped well short of that, so the floor
+    // this gives up is one nothing else was standing on.
     let [transcript_area, menu_area, status_area, panel_area] = Layout::vertical([
-        Constraint::Min(1),
+        Constraint::Min(0),
         Constraint::Length(menu_rows),
         Constraint::Length(1),
         Constraint::Length(panel_rows),
@@ -262,18 +266,13 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         // Borders (2) + footer (1) + the query row + a blank after it, the same
         // shape the model picker has.
         let chrome = 5u16;
-        // An entry is a name, a rule, its preview, and a trailing blank, so the
-        // natural height is a sum rather than a count.
-        let wanted: usize = matches
-            .iter()
-            .map(|&i| {
-                let lines = picker.previews.get(i).map_or(0, Vec::len);
-                if lines == 0 { 2 } else { lines + 3 }
-            })
-            .sum();
-        // A query that matches nothing still needs a row to say so.
-        let wanted = wanted.max(1);
-        let height = (chrome + wanted as u16).min(max).max(MIN_PANEL_ROWS);
+        // The one panel whose height is fixed rather than derived from its
+        // contents. Every other panel says one thing and sizing to it keeps the
+        // transcript visible; this one is a list you filter, and a list that
+        // resized on every keystroke moved the row you were reading towards. So
+        // it takes the whole screen bar the status line, and rows appear and
+        // disappear inside a frame that does not move.
+        let height = area.height.saturating_sub(1).max(MIN_PANEL_ROWS);
         let visible = height.saturating_sub(chrome).max(1) as usize;
         let (rows, owners) =
             picker_rows(picker, &matches, app.picker_index(), visible, inner_width);
@@ -1085,6 +1084,14 @@ fn tail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ));
     }
 
+    // Reasoning sits above the reply, in the order the two arrive: the model
+    // thinks, then answers. It is live state like the running window below —
+    // shown while it is happening and gone when the turn ends.
+    if let Some(reasoning) = app.reasoning.as_ref().filter(|_| app.show_reasoning) {
+        lines.push(Line::default());
+        lines.extend(reasoning_window(app, reasoning, width));
+    }
+
     // The live reply renders in place of the spinner once tokens arrive.
     if let Some(text) = &app.streaming {
         lines.push(Line::default());
@@ -1202,6 +1209,64 @@ fn running_window(
         width,
         edge,
     ));
+    lines
+}
+
+/// Reasoning rows shown in the live window. Fewer than a command's: this is the
+/// model working up to an answer, not the answer, and it should say what is
+/// happening without taking the screen to say it.
+const REASONING_WINDOW_ROWS: usize = 8;
+
+/// The live reasoning window: what the model is thinking, while it thinks it.
+///
+/// The same shape as [`running_window`] — a spinner header, a capped tail, and a
+/// count of what scrolled past — because it is the same problem: output that
+/// arrives faster than it can be read and may be far larger than the screen.
+/// Dim and italic throughout, so it reads as the margin note it is; the reply
+/// renders below it in ordinary text and stays the thing you are looking at.
+///
+/// The text is never parsed, never sent back, and thrown away when the turn
+/// ends. See [`crate::app::App::reasoning`].
+fn reasoning_window(app: &App, text: &str, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    // Border verticals take a column each, plus a space of padding inside.
+    let inner = width.saturating_sub(4).max(1);
+    let spinner = SPINNER[(app.tick / 2) % SPINNER.len()];
+
+    let mut lines = vec![rule(
+        vec![
+            Span::styled("┌─ ", dim),
+            Span::styled(format!("{spinner} "), dim),
+            Span::styled("reasoning", dim.add_modifier(Modifier::BOLD)),
+            Span::styled(" ", dim),
+        ],
+        width,
+        dim,
+    )];
+
+    // Wrapped first, then capped, so the count is in rows rather than logical
+    // lines that might each take three — the same reasoning as `running_window`.
+    let body_style = dim.add_modifier(Modifier::ITALIC);
+    let mut body: Vec<Line> = Vec::new();
+    for line in text.lines() {
+        for row in wrap::text(line, inner) {
+            body.push(Line::from(vec![
+                Span::styled("│ ", dim),
+                Span::styled(row, body_style),
+            ]));
+        }
+    }
+    let hidden = body.len().saturating_sub(REASONING_WINDOW_ROWS);
+    if hidden > 0 {
+        body.drain(..hidden);
+        lines.push(Line::from(vec![
+            Span::styled("│ ", dim),
+            Span::styled(format!("⋯ {hidden} earlier line(s)"), dim),
+        ]));
+    }
+    lines.append(&mut body);
+
+    lines.push(rule(vec![Span::styled("└─", dim)], width, dim));
     lines
 }
 
@@ -3148,6 +3213,73 @@ mod tests {
         assert!(metrics.content_height > 0);
     }
 
+    /// The point of the feature: a reasoning model streams for a long time
+    /// before its first content token, and a spinner says less than the text
+    /// the API is already sending.
+    #[test]
+    fn reasoning_replaces_the_spinner_and_sits_above_the_reply() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_reasoning("weighing the options");
+
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = transcript_only(&rows);
+        assert!(screen.contains("reasoning"), "missing header:\n{screen}");
+        assert!(screen.contains("weighing the options"), "{screen}");
+        assert!(
+            !screen.contains("thinking…"),
+            "the window says what the spinner said, with more:\n{screen}"
+        );
+
+        // And the reply lands underneath it, not in place of it.
+        app.push_delta("Hello.");
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = transcript_only(&rows);
+        let thought = screen.find("weighing the options").expect("trace");
+        let said = screen.find("Hello.").expect("reply");
+        assert!(thought < said, "reasoning goes above the reply:\n{screen}");
+    }
+
+    #[test]
+    fn a_long_trace_is_capped_and_says_what_it_hid() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        for i in 0..40 {
+            app.push_reasoning(&format!("step {i}\n"));
+        }
+
+        let (rows, _) = render(&mut app, 60, 24);
+        let screen = transcript_only(&rows);
+        assert!(
+            screen.contains("earlier line(s)"),
+            "a long trace must report what scrolled past:\n{screen}"
+        );
+        assert!(
+            screen.contains("step 39"),
+            "the newest must show:\n{screen}"
+        );
+        assert!(
+            !screen.contains("step 0\n"),
+            "the oldest must not:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reasoning_is_not_drawn_when_it_is_turned_off() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.show_reasoning = false;
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_reasoning("weighing the options");
+
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = transcript_only(&rows);
+        assert!(!screen.contains("weighing the options"), "{screen}");
+        assert!(!screen.contains("reasoning"), "{screen}");
+    }
+
     #[test]
     fn the_live_view_grows_as_tokens_arrive() {
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
@@ -3759,8 +3891,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Unlike every other panel, this one takes the screen rather than sizing to
+    /// its contents — see `prepare_panel`. A deep selection still has to be in
+    /// view, which is the part the height was originally derived to guarantee.
     #[test]
-    fn a_previewed_picker_caps_with_the_selection_still_visible() {
+    fn a_previewed_picker_fills_the_screen_with_the_selection_visible() {
         let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let (mut app, dir) = app_with_previews(&refs);
@@ -3774,14 +3909,39 @@ mod tests {
             "the deep selection must be in view:\n{}",
             rows.join("\n")
         );
-        assert!(
-            metrics.transcript_height >= MIN_TRANSCRIPT_ROWS.saturating_sub(2),
-            "the transcript kept {} rows",
-            metrics.transcript_height
+        assert_eq!(
+            metrics.transcript_height, 0,
+            "the picker takes the whole screen bar the status line"
         );
         for row in &rows {
             assert!(row.chars().count() <= 60, "row overflows: {row:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reason the height is fixed: rows come and go as you type, and a panel
+    /// that resized under them moved the row you were reading towards.
+    #[test]
+    fn filtering_the_picker_does_not_move_it() {
+        let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut app, dir) = app_with_previews(&refs);
+
+        let height = |app: &mut App| {
+            let (rows, _) = render(app, 60, 24);
+            // The panel's top border, wherever it has ended up.
+            let top = rows
+                .iter()
+                .position(|r| r.contains("load session"))
+                .unwrap();
+            rows.len() - top
+        };
+
+        let full = height(&mut app);
+        app.picker_query_input(|input| input.insert_str("s0"));
+        assert_eq!(height(&mut app), full, "narrowing must not resize it");
+        app.picker_query_input(|input| input.insert_str("zzz"));
+        assert_eq!(height(&mut app), full, "and neither must matching nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3864,8 +4024,9 @@ mod tests {
     #[test]
     fn picker_highlights_the_selection_and_a_click_maps_to_it() {
         let (mut app, dir) = app_with_picker(&["one", "two", "three"]);
-        app.picker_move(1); // second row (names are listed sorted)
-        // The marker sits on whatever the second sorted entry is.
+        app.picker_move(1); // second row
+        // Whichever entry that is: the fixtures are saved in the same second, so
+        // the recency order they are listed in falls back to the name.
         let selected = app.picker().unwrap().sessions[1].clone();
         let (rows, metrics) = render(&mut app, 60, 20);
         assert!(

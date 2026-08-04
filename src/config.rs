@@ -100,6 +100,17 @@ pub struct Args {
     #[arg(long, default_value_t = crate::app::DEFAULT_MAX_RETRIES, env = "AI_HARNESS_MAX_RETRIES")]
     pub max_retries: usize,
 
+    /// Do not show the model's reasoning while it streams. Toggle with
+    /// `/reasoning`.
+    ///
+    /// On by default: a reasoning model can think for a minute, and a spinner
+    /// is a worse answer to "what is it doing" than the text the API is already
+    /// sending. The trace is never parsed, never sent back to the model, and
+    /// never saved with the session — this governs whether it is drawn, not
+    /// whether it arrives.
+    #[arg(long, env = "AI_HARNESS_NO_REASONING")]
+    pub no_reasoning: bool,
+
     /// Reject a reply that puts prose in front of an otherwise valid element,
     /// instead of dropping the prose and running the element.
     ///
@@ -236,6 +247,12 @@ mod tests {
     fn preamble_recovery_is_on_until_strictness_is_asked_for() {
         assert!(!args(&[]).strict_replies);
         assert!(args(&["--strict-replies"]).strict_replies);
+    }
+
+    #[test]
+    fn reasoning_shows_until_it_is_turned_off() {
+        assert!(!args(&[]).no_reasoning);
+        assert!(args(&["--no-reasoning"]).no_reasoning);
     }
 
     #[test]
