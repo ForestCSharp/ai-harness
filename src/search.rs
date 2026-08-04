@@ -78,7 +78,7 @@ const MAX_REGEX_SIZE: usize = 1 << 20;
 /// file holds an entire prior conversation, so without it a grep for any term
 /// the user has typed would match the transcript of them typing it and hand
 /// that back as a result.
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     ".hg",
     ".svn",

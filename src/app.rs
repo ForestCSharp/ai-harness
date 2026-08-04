@@ -349,6 +349,53 @@ pub struct ModelPicker {
     pub selected: usize,
 }
 
+/// The checkpoint `/undo` is offering to restore, and what doing so would do.
+///
+/// Derived from the manifest the restore itself will read, rather than from a
+/// second guess at it, so the panel is a promise about what is about to happen
+/// rather than an estimate of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUndo {
+    pub turn: usize,
+    /// The prompt that opened the turn, so the panel names what is being undone
+    /// in the user's own words rather than by a number.
+    pub prompt: String,
+    /// Whether the checkpoint was capped when taken, and how.
+    pub partial: Option<String>,
+    pub plan: crate::checkpoint::Restored,
+}
+
+/// One place the conversation can be rewound to: a prompt still in `history`.
+///
+/// Derived by [`App::rewind_rows`] on every call, never stored — see the reason
+/// there, which is the same one `picker_matches` and `model_matches` give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindRow {
+    /// The session's turn ordinal, which is also the checkpoint's number.
+    pub turn: usize,
+    /// Where this prompt sits in `history` *now*. Rewinding truncates to it.
+    pub history_index: usize,
+    /// Where it sits in the transcript, which rewinding also truncates to.
+    /// `None` when the transcript no longer goes back that far — `/clear`
+    /// empties it without resetting the turn count.
+    pub transcript_index: Option<usize>,
+    /// How many files this turn's checkpoint holds; 0 when it changed nothing.
+    pub changed: usize,
+    pub prompt: String,
+}
+
+/// The `/rewind` list overlay. A UI overlay like [`Picker`], not a conversation
+/// status: it coexists with `Status::Idle`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewind {
+    /// Snapshotted when the list opened, oldest first — the order the
+    /// conversation happened in, which is the order the transcript above shows.
+    pub rows: Vec<RewindRow>,
+    /// Highlighted row. Opens on the last: the newest prompt is "undo nothing",
+    /// and every move up reaches further back.
+    pub selected: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Idle,
@@ -366,6 +413,15 @@ pub enum Status {
     /// has the same shape as an approval, and so does the key handling.
     AwaitingExecute {
         selected: Choice,
+    },
+    /// `/undo` is asking whether to restore a checkpoint.
+    ///
+    /// Confirmed rather than done outright because a restore *deletes* the files
+    /// the turn created. Reuses [`Choice`] like `AwaitingExecute`, which has the
+    /// same shape in the panel and in the key handling.
+    AwaitingUndo {
+        selected: Choice,
+        undo: Box<PendingUndo>,
     },
     /// An approved command is executing.
     Running,
@@ -409,6 +465,23 @@ pub struct App {
     /// Size of `history` when the current prompt started, so the budget measures
     /// what this turn added rather than what the session already held.
     turn_start_bytes: usize,
+    /// Which turn of this session is in progress — the count of prompts sent,
+    /// not of checkpoints taken. Checkpoint folders are named by it, which is
+    /// what lets a row in the `/rewind` list find its checkpoint.
+    pub turn_number: usize,
+    /// The prompt that opened the current turn, to name its checkpoint.
+    turn_prompt: String,
+    /// The `/rewind` list, when open.
+    rewind: Option<Rewind>,
+    /// The checkpoint for this turn, opened by the first mutating action.
+    ///
+    /// Lazily, because most turns mutate nothing and a folder per question would
+    /// be litter. `None` also whenever checkpointing could not start, which is
+    /// reported once rather than on every action.
+    checkpoint: Option<crate::checkpoint::Checkpoint>,
+    /// How many checkpoints to keep. `None` keeps everything, the default: what
+    /// is worth being able to undo depends on the work, not on us.
+    pub keep_checkpoints: Option<usize>,
     /// When true, the transcript also shows raw protocol frames.
     pub debug: bool,
     /// Filesystem access for `<ai-harness-read>`. Set by `main` once the
@@ -567,6 +640,11 @@ impl App {
             max_turn_bytes: DEFAULT_MAX_TURN_BYTES,
             compact_at: DEFAULT_COMPACT_AT,
             turn_start_bytes: 0,
+            turn_number: 0,
+            rewind: None,
+            turn_prompt: String::new(),
+            checkpoint: None,
+            keep_checkpoints: None,
             debug: false,
             sandbox: None,
             confirm_reads: false,
@@ -839,6 +917,9 @@ impl App {
                 let state = if self.debug { "on" } else { "off" };
                 self.push_notice(format!("Debug mode {state}."));
             }
+            Command::Undo => self.begin_undo(),
+            Command::Rewind => self.open_rewind(),
+            Command::Checkpoints(arg) => self.checkpoints_command(arg),
             Command::Reasoning => {
                 self.show_reasoning = !self.show_reasoning;
                 // Says what it does with what has already arrived, because the
@@ -1020,6 +1101,7 @@ impl App {
             self.prompt_history.clone(),
             self.ledger.clone(),
         )
+        .keeping(self.keep_checkpoints, self.turn_number)
     }
 
     /// Replace the in-memory session with a loaded one. Pure — does no I/O.
@@ -1036,7 +1118,14 @@ impl App {
         self.transcript = session.transcript;
         self.prompt_history = session.prompt_history;
         self.ledger = session.ledger;
+        self.keep_checkpoints = session.keep_checkpoints;
+        self.turn_number = session.turn_number;
         self.finish_stream();
+        // The loaded session's checkpoints are its own; the one this turn opened
+        // belongs to the conversation being left behind, and so does the list of
+        // places to rewind to.
+        self.checkpoint = None;
+        self.rewind = None;
         self.status = Status::Idle;
         self.scroll = 0;
         self.follow = true;
@@ -1538,6 +1627,12 @@ impl App {
         // which is what keeps a compact-and-resend from becoming a loop.
         self.overflow_compacted = false;
         self.turn_start_bytes = self.history_bytes();
+        // The turn this prompt opens. Counts prompts, not checkpoints, so a
+        // checkpoint's number is the ordinal of the thing that was typed — which
+        // is what lets `/rewind` line a row up with the checkpoint to restore.
+        self.turn_number += 1;
+        self.turn_prompt = text;
+        self.checkpoint = None;
         self.status = Status::Waiting;
         self.follow = true;
         Some(self.history.clone())
@@ -1952,6 +2047,7 @@ impl App {
         match &mut self.status {
             Status::AwaitingApproval(pending) => pending.selected = pending.selected.toggled(),
             Status::AwaitingExecute { selected } => *selected = selected.toggled(),
+            Status::AwaitingUndo { selected, .. } => *selected = selected.toggled(),
             _ => {}
         }
     }
@@ -1960,6 +2056,7 @@ impl App {
         match &mut self.status {
             Status::AwaitingApproval(pending) => pending.selected = choice,
             Status::AwaitingExecute { selected } => *selected = choice,
+            Status::AwaitingUndo { selected, .. } => *selected = choice,
             _ => {}
         }
     }
@@ -1980,9 +2077,427 @@ impl App {
             },
             None => pending.action.clone(),
         };
+        // Before the action runs, and here rather than at dispatch, because this
+        // is the one place that knows an action is really about to happen.
+        self.checkpoint_before(&action);
         self.status = Status::Running;
         self.follow = true;
         Some(action)
+    }
+
+    /// The folder holding this session's checkpoints.
+    fn checkpoint_folder(&self) -> Option<std::path::PathBuf> {
+        crate::session::dir(&self.sessions_dir, &self.current_session).ok()
+    }
+
+    /// Offer to restore the newest checkpoint.
+    ///
+    /// Asks rather than acts: a restore deletes the files the turn created, and
+    /// that is not something to discover afterwards.
+    fn begin_undo(&mut self) {
+        if self.is_busy() {
+            return self.push_notice("Wait for the current turn to finish before /undo.");
+        }
+        let Some(folder) = self.checkpoint_folder() else {
+            return self.push_notice("Nothing to undo.");
+        };
+        let Some(turn) = crate::checkpoint::saved(&folder).last().map(|m| m.turn) else {
+            return self
+                .push_notice("Nothing to undo — no turn has changed a file in this session yet.");
+        };
+        let Some((manifest, plan)) = crate::checkpoint::preview(&folder, turn) else {
+            return self.push_notice("Nothing to undo.");
+        };
+        self.status = Status::AwaitingUndo {
+            // Defaults to Deny: this is the one modal that destroys work if the
+            // answer is wrong, and Enter should not be the dangerous key.
+            selected: Choice::Deny,
+            undo: Box::new(PendingUndo {
+                turn,
+                prompt: manifest.prompt,
+                partial: manifest.partial,
+                plan,
+            }),
+        };
+        self.follow = true;
+    }
+
+    /// The checkpoint `/undo` is offering to restore, if the modal is up.
+    pub fn pending_undo(&self) -> Option<&PendingUndo> {
+        match &self.status {
+            Status::AwaitingUndo { undo, .. } => Some(undo),
+            _ => None,
+        }
+    }
+
+    /// Which button the undo modal has focused, if it is up.
+    pub fn undo_choice(&self) -> Option<Choice> {
+        match &self.status {
+            Status::AwaitingUndo { selected, .. } => Some(*selected),
+            _ => None,
+        }
+    }
+
+    /// One point the conversation can be rewound to: a prompt still in history.
+    ///
+    /// Derived from `history` on every call rather than recorded when the turn
+    /// ran. A stored index is exactly what compaction invalidates — the hazard
+    /// `retry_anchor` is documented against — and `Vec::truncate` past the end
+    /// is a silent no-op, so a stale one fails quietly. Scanning is cheap and
+    /// cannot be stale.
+    ///
+    /// Turn numbers come from the suffix property: `encode_query` is only called
+    /// by `send_prompt`, and a compaction only ever collapses or drops a
+    /// *prefix*, so the prompts still in history are the last *n* the session
+    /// sent.
+    pub fn rewind_rows(&self) -> Vec<RewindRow> {
+        let open = format!("<{}>", protocol::QUERY_TAG);
+        let live: Vec<(usize, String)> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == crate::openrouter::Role::User)
+            .filter_map(|(i, m)| {
+                let rest = m.content.strip_prefix(&open)?;
+                let text = rest.split_once("</").map_or(rest, |(text, _)| text);
+                Some((i, text.to_string()))
+            })
+            .collect();
+
+        // The transcript is scanned separately rather than assumed parallel: it
+        // is not compacted, so it usually holds prompts `history` no longer
+        // does, and `/clear` empties it without touching the turn count. Both
+        // are suffixes of the same sequence, so both map back the same way —
+        // but from their own lengths.
+        let shown: Vec<usize> = self
+            .transcript
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, Entry::User(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let shown_first = self.turn_number.saturating_sub(shown.len()) + 1;
+
+        let first = self.turn_number.saturating_sub(live.len()) + 1;
+        let folder = self.checkpoint_folder();
+        live.into_iter()
+            .enumerate()
+            .map(|(k, (index, prompt))| {
+                let turn = first + k;
+                RewindRow {
+                    turn,
+                    history_index: index,
+                    transcript_index: turn
+                        .checked_sub(shown_first)
+                        .and_then(|k| shown.get(k).copied()),
+                    changed: folder.as_ref().map_or(0, |f| {
+                        crate::checkpoint::saved(f)
+                            .iter()
+                            .find(|m| m.turn == turn)
+                            .map_or(0, |m| m.files.len())
+                    }),
+                    prompt,
+                }
+            })
+            .collect()
+    }
+
+    /// Carry out the offered restore.
+    ///
+    /// The files go back, and the conversation is cut to where the turn began —
+    /// both the model's copy and the one on screen. Leaving the turn in the
+    /// model's context would leave it certain about writes that are no longer on
+    /// disk, the failure `retire_superseded_reads` and the retry rollback exist
+    /// to prevent; leaving it on screen would show the user work that no longer
+    /// exists anywhere.
+    pub fn confirm_undo(&mut self) {
+        let Status::AwaitingUndo { undo, .. } = &self.status else {
+            return;
+        };
+        let turn = undo.turn;
+        self.status = Status::Idle;
+        self.rewind_to(turn);
+    }
+
+    /// Rewind to the start of turn `from_turn`: restore the files every turn
+    /// from there onwards changed, and cut the conversation back to match.
+    ///
+    /// The single entry point for both `/undo` and `/rewind`, so the two cannot
+    /// drift apart in what they do — only in how far back they reach and in what
+    /// they ask first.
+    fn rewind_to(&mut self, from_turn: usize) {
+        let (Some(folder), Some(sandbox)) = (self.checkpoint_folder(), self.sandbox.clone()) else {
+            return self.push_notice("Nothing to undo.");
+        };
+        // The boundaries are looked up now, in the live conversation, rather
+        // than read back from something written when the turn ran.
+        let rows = self.rewind_rows();
+        // Turns of *conversation*, counted the way `rewind_plan` counts them for
+        // the panel — not turns that happen to have a checkpoint. Rewinding past
+        // two turns that changed no files still puts the conversation back two
+        // turns, and a notice reporting 0 after a panel promising 2 would be the
+        // promise and the report disagreeing about the same act.
+        let turns = rows.iter().filter(|row| row.turn >= from_turn).count();
+        let row = rows.into_iter().find(|row| row.turn == from_turn);
+        let done = crate::checkpoint::restore_to(&folder, &sandbox, from_turn);
+        self.checkpoint = None;
+
+        match row.as_ref().map(|row| row.history_index) {
+            Some(index) => self.history.truncate(index),
+            // The prompt was compacted away, so there is no longer a point in
+            // the conversation to cut back to. The files still go back; say what
+            // did not, rather than leaving it to be discovered.
+            None => self.push_notice(
+                "The conversation was compacted past this point, so only the files \
+                 were restored.",
+            ),
+        }
+        // The screen rewinds with the rest. A transcript still showing turns
+        // whose writes have been reverted and whose messages the model can no
+        // longer see is showing work that no longer exists anywhere — and the
+        // point of a rewind is to be back where you were, which includes what is
+        // in front of you. The notice pushed below is what marks that it
+        // happened.
+        if let Some(index) = row.and_then(|row| row.transcript_index) {
+            self.transcript.truncate(index);
+        }
+        self.scroll = 0;
+        self.follow = true;
+        self.last_saved = self.fingerprint();
+
+        let mut said = format!(
+            "Rewound {turns} turn(s): {} file(s) restored, {} removed.",
+            done.restored.len(),
+            done.removed.len()
+        );
+        if !done.failed.is_empty() {
+            said.push_str(&format!(" {} could not be undone.", done.failed.len()));
+        }
+        self.push_notice(said);
+        for failure in &done.failed {
+            self.transcript.push(Entry::Error(failure.clone()));
+        }
+    }
+
+    /// Open the `/rewind` list, or say why there is nothing to open it on.
+    fn open_rewind(&mut self) {
+        if self.is_busy() {
+            return self.push_notice("Wait for the current turn to finish before /rewind.");
+        }
+        let rows = self.rewind_rows();
+        if rows.is_empty() {
+            return self.push_notice("Nothing to rewind — this conversation has no prompts yet.");
+        }
+        self.rewind = Some(Rewind {
+            selected: rows.len() - 1,
+            rows,
+        });
+        self.follow = true;
+    }
+
+    /// The `/rewind` list, when it is open.
+    pub fn rewind(&self) -> Option<&Rewind> {
+        self.rewind.as_ref()
+    }
+
+    /// Move the highlight, clamped to the list (no wrap), like the pickers.
+    pub fn rewind_move(&mut self, delta: isize) {
+        if let Some(rewind) = &mut self.rewind {
+            let last = rewind.rows.len().saturating_sub(1) as isize;
+            rewind.selected = (rewind.selected as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// Focus a row directly, for mouse hover and click.
+    pub fn rewind_select(&mut self, i: usize) -> bool {
+        if let Some(rewind) = &mut self.rewind
+            && i < rewind.rows.len()
+        {
+            rewind.selected = i;
+            return true;
+        }
+        false
+    }
+
+    /// What rewinding to the highlighted row would do: how many turns it undoes,
+    /// and which files that touches.
+    ///
+    /// A row is a *target* — rewinding to it undoes that turn and everything
+    /// after it — so the newest row undoes one turn, which is exactly what
+    /// `/undo` does. There is no "do nothing" row; Esc is how you do nothing.
+    ///
+    /// Turns are counted from the rows, so the number is turns of *conversation*
+    /// rather than of checkpoints: rewinding past two turns that changed no
+    /// files still puts the conversation back two turns, and the summary should
+    /// say so. The files come from the same function the restore walks, so what
+    /// is promised and what happens cannot drift.
+    pub fn rewind_plan(&self) -> Option<(usize, crate::checkpoint::Restored)> {
+        let rewind = self.rewind.as_ref()?;
+        let row = rewind.rows.get(rewind.selected)?;
+        let turns = rewind.rows.len() - rewind.selected;
+        let files = self
+            .checkpoint_folder()
+            .map(|folder| crate::checkpoint::plan_rewind(&folder, row.turn))
+            .unwrap_or_default();
+        Some((turns, files))
+    }
+
+    /// Rewind to the highlighted row and close the list.
+    ///
+    /// No second confirmation: the panel has been showing what this would do the
+    /// whole time the row was highlighted, so pressing Enter is the informed
+    /// decision. `/undo` confirms instead, having shown nothing beforehand.
+    pub fn rewind_confirm(&mut self) {
+        let Some(rewind) = self.rewind.take() else {
+            return;
+        };
+        let Some(turn) = rewind.rows.get(rewind.selected).map(|row| row.turn) else {
+            return;
+        };
+        self.rewind_to(turn);
+    }
+
+    /// Open the list over rows built by hand, for the UI tests: they need a list
+    /// on screen without a session folder full of checkpoints behind it.
+    #[cfg(test)]
+    pub fn open_rewind_over(&mut self, rows: Vec<RewindRow>) {
+        self.rewind = Some(Rewind {
+            selected: rows.len().saturating_sub(1),
+            rows,
+        });
+    }
+
+    pub fn rewind_cancel(&mut self) {
+        if self.rewind.take().is_some() {
+            self.push_notice("Rewind cancelled; nothing was changed.");
+        }
+    }
+
+    pub fn cancel_undo(&mut self) {
+        if matches!(self.status, Status::AwaitingUndo { .. }) {
+            self.status = Status::Idle;
+            self.push_notice("Undo cancelled; nothing was changed.");
+        }
+    }
+
+    /// `/checkpoints` — list them, or set how many turns to keep.
+    fn checkpoints_command(&mut self, arg: Option<String>) {
+        let Some(folder) = self.checkpoint_folder() else {
+            return self.push_notice("No checkpoints.");
+        };
+        let Some(arg) = arg else {
+            let saved = crate::checkpoint::saved(&folder);
+            if saved.is_empty() {
+                return self.push_notice("No checkpoints — no turn has changed a file yet.");
+            }
+            let kept = match self.keep_checkpoints {
+                Some(n) => format!("keeping the last {n}"),
+                None => "keeping all".to_string(),
+            };
+            let mut lines = vec![format!("{} checkpoint(s), {kept}:", saved.len())];
+            for manifest in saved.iter().rev() {
+                let partial = match &manifest.partial {
+                    Some(reason) => format!(" (partial: {reason})"),
+                    None => String::new(),
+                };
+                lines.push(format!(
+                    "  {:>3}  {} file(s){partial}  {}",
+                    manifest.turn,
+                    manifest.files.len(),
+                    manifest.prompt
+                ));
+            }
+            lines.push("/undo restores the newest.".to_string());
+            return self.push_notice(lines.join("\n"));
+        };
+
+        let keep = match arg.trim().to_ascii_lowercase().as_str() {
+            "all" | "unlimited" => None,
+            other => match other.parse::<usize>() {
+                // 0 would mean "keep none", which is a way of saying "delete the
+                // safety net"; `/checkpoints all` is the only way back up, so
+                // refuse rather than make it easy to type by accident.
+                Ok(0) | Err(_) => {
+                    return self.push_notice(
+                        "usage: /checkpoints [<n>|all] — n is how many turns to keep",
+                    );
+                }
+                Ok(n) => Some(n),
+            },
+        };
+        self.keep_checkpoints = keep;
+        let dropped = crate::checkpoint::prune(&folder, keep);
+        let said = match keep {
+            Some(n) => format!("Keeping the last {n} checkpoint(s); dropped {dropped}."),
+            None => "Keeping every checkpoint.".to_string(),
+        };
+        self.push_notice(said);
+        self.last_saved = self.fingerprint();
+    }
+
+    /// Snapshot what `action` is about to change, opening this turn's checkpoint
+    /// if it is the first mutating action.
+    ///
+    /// Two paths, because two different things are knowable. A write names its
+    /// file, so exactly that file is copied — exact, and nearly free. A shell
+    /// command could touch anything, so the workspace is walked within
+    /// [`crate::checkpoint::Caps`]. The second is the case the feature exists
+    /// for: an auto-approved `rm -rf .` is inside the sandbox boundary, not
+    /// outside it.
+    ///
+    /// Every failure here is reported and then stepped over. A checkpoint is a
+    /// safety net, and refusing to run an approved action because the net could
+    /// not be hung would be a worse answer than saying so.
+    fn checkpoint_before(&mut self, action: &Action) {
+        let target = match action {
+            Action::Write { path, .. } => Some(path.clone()),
+            Action::Shell(_) => None,
+            // Nothing else changes a file: a read, a search and a fetch do not,
+            // an edit has already become a write, and the rest never reach an
+            // approval at all.
+            _ => return,
+        };
+        let Some(sandbox) = self.sandbox.clone() else {
+            return;
+        };
+        if self.checkpoint.is_none() {
+            let folder = match crate::session::dir(&self.sessions_dir, &self.current_session) {
+                Ok(folder) => folder,
+                Err(e) => return self.push_notice(format!("No checkpoint for this turn: {e:#}")),
+            };
+            let prompt = self.turn_prompt.clone();
+            match crate::checkpoint::open(&folder, self.turn_number, &prompt) {
+                Ok(checkpoint) => self.checkpoint = Some(checkpoint),
+                Err(e) => {
+                    return self.push_notice(format!(
+                        "No checkpoint for this turn ({e:#}); /undo will not cover it."
+                    ));
+                }
+            }
+        }
+        let Some(checkpoint) = &mut self.checkpoint else {
+            return;
+        };
+
+        let captured = match &target {
+            Some(path) => crate::files::resolve_target(&sandbox, path)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .and_then(|path| checkpoint.capture_file(&sandbox, &path)),
+            None => checkpoint.capture_workspace(&sandbox, crate::checkpoint::Caps::default()),
+        };
+        let partial = checkpoint.partial().map(str::to_string);
+        if let Err(e) = captured {
+            self.push_notice(format!(
+                "Checkpoint incomplete ({e:#}); /undo may not cover this."
+            ));
+        } else if let Some(reason) = partial {
+            // Said at the time rather than at `/undo` time, when it would be too
+            // late to decide differently about running the command.
+            self.push_notice(format!(
+                "Checkpoint is partial — the workspace is {reason}. /undo will not \
+                 restore everything this command touches."
+            ));
+        }
     }
 
     /// The question waiting on the user, if any.
@@ -4249,8 +4764,22 @@ mod tests {
             app.input.insert_str(&format!("/fork {name}"));
             app.submit();
         }
+        // The picker orders by recency, and `/fork` stamps each session with the
+        // wall clock — so a loop that straddles a second boundary would reorder
+        // the list and flake the assertions below. Pinned descending, so the
+        // listed order is the given one.
+        for (i, name) in names.iter().enumerate() {
+            pin_saved_at(dir, name, 2_000_000_000 - i as u64);
+        }
         app.open_load_picker();
         app
+    }
+
+    /// Rewrite a saved session's `saved_at`, so a test can pin picker order.
+    fn pin_saved_at(dir: &std::path::Path, name: &str, at: u64) {
+        let mut session = crate::session::load(dir, name).expect("the fixture saved it");
+        session.saved_at = at;
+        crate::session::save(dir, name, &session).unwrap();
     }
 
     /// The names the picker would show, in order, after filtering.
@@ -4942,9 +5471,9 @@ mod tests {
     #[test]
     fn completions_narrow_as_you_type() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        // "c" is ambiguous three ways; one more character narrows, two settle it.
+        // "c" is ambiguous four ways; one more character narrows, two settle it.
         app.input.insert_str("/c");
-        assert_eq!(names(&app), vec!["clear", "compact", "cost"]);
+        assert_eq!(names(&app), vec!["clear", "compact", "checkpoints", "cost"]);
         app.input.insert_str("o");
         assert_eq!(names(&app), vec!["compact", "cost"]);
         app.input.insert_str("s");
@@ -5839,6 +6368,11 @@ mod file_tests {
                 protocol::RESPONSE_TAG
             )));
         }
+        // The loop fabricates prompts straight into `history` rather than going
+        // through `send_prompt`, so the turn counter has to be told. It matters
+        // for anything that lines a prompt up with its checkpoint: one prompt
+        // from `app_with_files`, plus the twelve above.
+        app.turn_number = 13;
         app.status = Status::Idle;
         (app, dir)
     }
@@ -6426,6 +6960,488 @@ mod file_tests {
 
     fn write_reply(path: &str, contents: &str) -> String {
         format!("<ai-harness-write file={path}>\n{contents}</ai-harness-write>")
+    }
+
+    /// This session's checkpoint folder, for the tests below.
+    fn checkpoints(app: &App) -> Vec<crate::checkpoint::Manifest> {
+        crate::checkpoint::saved(&app.checkpoint_folder().unwrap())
+    }
+
+    #[test]
+    fn a_turn_that_changes_nothing_leaves_no_checkpoint() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "one\n")]);
+        app.push_response(read_reply("m.rs"), None);
+        app.approve();
+        assert!(
+            checkpoints(&app).is_empty(),
+            "a read must not open a checkpoint"
+        );
+    }
+
+    #[test]
+    fn approving_a_write_captures_the_file_as_it_was() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "before\n")]);
+        app.push_response(write_reply("m.rs", "after\n"), None);
+        app.approve();
+
+        let saved = checkpoints(&app);
+        assert_eq!(saved.len(), 1, "one checkpoint for the turn");
+        assert!(saved[0].files.contains_key("m.rs"), "{:?}", saved[0].files);
+        assert!(saved[0].files["m.rs"].existed);
+    }
+
+    /// Five edits in one turn are one turn's worth of undo, and the state to go
+    /// back to is the one the turn started from.
+    #[test]
+    fn several_writes_in_a_turn_share_one_checkpoint() {
+        let (mut app, _dir) = app_with_files(&[("a.rs", "a1\n"), ("b.rs", "b1\n")]);
+        for (path, body) in [("a.rs", "a2\n"), ("b.rs", "b2\n"), ("a.rs", "a3\n")] {
+            app.push_response(write_reply(path, body), None);
+            app.approve();
+            app.push_write_result(crate::exec::WriteOutcome {
+                path: path.into(),
+                bytes: body.len(),
+                error: None,
+                timed_out: false,
+                cancelled: false,
+            });
+        }
+        let saved = checkpoints(&app);
+        assert_eq!(saved.len(), 1, "one turn, one checkpoint");
+        assert_eq!(saved[0].files.len(), 2);
+    }
+
+    /// Both copies of the conversation rewind: the model's, so it stops
+    /// believing in writes that are gone, and the one on screen, so the user is
+    /// not reading work that no longer exists anywhere.
+    #[test]
+    fn undo_rewinds_the_files_the_model_and_the_screen_together() {
+        let (mut app, dir) = app_with_files(&[("m.rs", "before\n")]);
+        // Where the prompt sits now, which is what a rewind truncates to.
+        let row = app.rewind_rows().last().unwrap().clone();
+        app.push_response(write_reply("m.rs", "after\n"), None);
+        app.approve();
+        std::fs::write(dir.join("m.rs"), "after\n").unwrap(); // the write lands
+        assert!(app.history.len() > row.history_index);
+        assert!(app.transcript.len() > row.transcript_index.unwrap());
+
+        app.status = Status::Idle; // the turn finished
+        app.run_command(Command::Undo);
+        assert!(app.pending_undo().is_some(), "undo asks before it acts");
+        app.confirm_undo();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(
+            app.history.len(),
+            row.history_index,
+            "the model's copy rewinds to before the prompt"
+        );
+        // The prompt and everything it caused are off the screen, and what is
+        // left is the notice saying so.
+        assert!(
+            !visible(&app)
+                .iter()
+                .any(|e| matches!(e, Entry::User(text) if text == &row.prompt)),
+            "the undone prompt should be off the screen too"
+        );
+        assert!(
+            matches!(last_visible(&app), Entry::Notice(n) if n.contains("Rewound")),
+            "with a notice left to mark that it happened"
+        );
+        assert!(
+            checkpoints(&app).is_empty(),
+            "the undone turn's checkpoint is spent"
+        );
+    }
+
+    #[test]
+    fn undo_deletes_a_file_the_turn_created() {
+        let (mut app, dir) = app_with_files(&[]);
+        app.push_response(write_reply("new.rs", "fresh\n"), None);
+        app.approve();
+        std::fs::write(dir.join("new.rs"), "fresh\n").unwrap();
+
+        app.status = Status::Idle;
+        app.run_command(Command::Undo);
+        let undo = app.pending_undo().expect("modal");
+        assert_eq!(undo.plan.removed, vec!["new.rs"], "listed as a deletion");
+        assert!(undo.plan.restored.is_empty());
+        app.confirm_undo();
+        assert!(!dir.join("new.rs").exists(), "the new file must be gone");
+    }
+
+    /// The case the whole feature exists for. The sandbox root is what a command
+    /// is confined *to*, so an approved `rm -rf .` is inside the boundary — and
+    /// the harness cannot know in advance what it will reach, which is why a
+    /// shell command snapshots the workspace rather than one file.
+    #[test]
+    fn undo_brings_back_a_workspace_a_command_deleted() {
+        let (mut app, dir) = app_with_files(&[("a.rs", "one\n"), ("b.rs", "two\n")]);
+        app.push_response(
+            "<ai-harness-shell>rm -rf ./*</ai-harness-shell>".into(),
+            None,
+        );
+        app.approve();
+
+        // The command runs. Its reach is exactly what could not be predicted.
+        for name in ["a.rs", "b.rs"] {
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        assert!(!dir.join("a.rs").exists());
+
+        app.status = Status::Idle;
+        app.run_command(Command::Undo);
+        app.confirm_undo();
+
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
+        assert_eq!(std::fs::read_to_string(dir.join("b.rs")).unwrap(), "two\n");
+    }
+
+    /// The layout that actually ships: sessions under `.ai_harness/` inside the
+    /// workspace, where it is the walk's skip list that keeps a snapshot out of
+    /// them. `app_with_files` puts them elsewhere, so without this the shipped
+    /// arrangement would be the one arrangement no test covers.
+    #[test]
+    fn the_shipped_layout_keeps_checkpoints_out_of_the_snapshot() {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let unique = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ai-harness-shipped-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
+
+        let sessions = root.join(crate::config::HARNESS_DIR).join("sessions");
+        let mut app = App::new("m".into(), None, 10, sessions);
+        app.sandbox = Some(Sandbox::new(&root).unwrap());
+        app.input.insert_str("clean up");
+        app.submit().unwrap();
+
+        // Two turns: a write, then a command that removes everything.
+        app.push_response(write_reply("src/main.rs", "fn main() { todo!() }\n"), None);
+        app.approve();
+        std::fs::write(root.join("src/main.rs"), "fn main() { todo!() }\n").unwrap();
+
+        app.status = Status::Idle;
+        app.input.insert_str("now delete it all");
+        app.submit().unwrap();
+        app.push_response(
+            "<ai-harness-shell>rm -rf ./*</ai-harness-shell>".into(),
+            None,
+        );
+        app.approve();
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        std::fs::remove_file(root.join("README.md")).unwrap();
+
+        let saved = checkpoints(&app);
+        assert_eq!(saved.len(), 2, "one checkpoint per changing turn");
+        assert!(
+            !saved[1]
+                .files
+                .keys()
+                .any(|f| f.starts_with(crate::config::HARNESS_DIR)),
+            "the snapshot must not contain the harness's own folder: {:?}",
+            saved[1].files.keys().collect::<Vec<_>>()
+        );
+
+        app.status = Status::Idle;
+        app.run_command(Command::Undo);
+        app.confirm_undo();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "fn main() { todo!() }\n",
+            "the second turn is undone, leaving the first turn's write in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "# demo\n"
+        );
+
+        // And undoing again walks back through the first turn.
+        app.run_command(Command::Undo);
+        app.confirm_undo();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "fn main() {}\n",
+            "repeating /undo goes back another turn"
+        );
+        assert!(checkpoints(&app).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rewind_rows_are_the_conversation_in_order_newest_last() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "one\n")]);
+        for text in ["second", "third"] {
+            app.status = Status::Idle;
+            app.input.insert_str(text);
+            app.submit().unwrap();
+        }
+        let rows = app.rewind_rows();
+        let prompts: Vec<&str> = rows.iter().map(|r| r.prompt.as_str()).collect();
+        assert_eq!(prompts, vec!["what is in that file?", "second", "third"]);
+        assert_eq!(
+            rows.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        // Ascending, so the newest is last — which is where the list opens.
+        assert!(rows[0].history_index < rows[2].history_index);
+    }
+
+    #[test]
+    fn a_rewind_row_says_how_many_files_its_turn_changed() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "one\n")]);
+        app.push_response(write_reply("m.rs", "two\n"), None);
+        app.approve();
+        app.status = Status::Idle;
+        app.input
+            .insert_str("and now something that changes nothing");
+        app.submit().unwrap();
+
+        let rows = app.rewind_rows();
+        assert_eq!(rows[0].changed, 1, "the write turn");
+        assert_eq!(rows[1].changed, 0, "the turn that only asked");
+    }
+
+    /// The regression this whole change exists for. The turn boundary used to be
+    /// stored in the manifest as a raw index; `compact::apply` renumbers history,
+    /// and `truncate` past the end is a silent no-op, so the conversation quietly
+    /// failed to rewind. Deriving the boundary from live history fixes it.
+    #[test]
+    fn a_rewind_still_cuts_the_conversation_after_a_compaction() {
+        let (mut app, dir) = app_with_long_history();
+        std::fs::write(dir.join("m.rs"), "before\n").unwrap();
+        app.input.insert_str("change the file");
+        app.submit().unwrap();
+        app.push_response(write_reply("m.rs", "after\n"), None);
+        app.approve();
+        std::fs::write(dir.join("m.rs"), "after\n").unwrap();
+
+        // Compact, which rebuilds history from scratch underneath us.
+        app.status = Status::Idle;
+        app.dispatch_command(Command::Compact);
+        let job = app.take_pending_compaction().expect("a compaction to run");
+        let (bytes_before, index_before) = (
+            app.history_bytes(),
+            app.rewind_rows().last().unwrap().history_index,
+        );
+        app.apply_summary(job, summary("a summary of what went before"));
+        // Bytes, not message count: the mechanical pass empties result bodies
+        // while the summary block adds a message, so the count can hold steady.
+        assert!(app.history_bytes() < bytes_before, "history was rewritten");
+        assert_ne!(
+            app.rewind_rows().last().unwrap().history_index,
+            index_before,
+            "and the prompt moved — which is what invalidated the stored index"
+        );
+
+        let target = app.rewind_rows().last().expect("the prompt survives").turn;
+        app.status = Status::Idle;
+        app.rewind_to(target);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "before\n",
+            "the files go back"
+        );
+        assert!(
+            !app.history
+                .iter()
+                .any(|m| m.content.contains("change the file")),
+            "and the conversation really is cut back, not silently left alone"
+        );
+    }
+
+    #[test]
+    fn rewinding_several_turns_lands_on_the_oldest_of_them() {
+        let (mut app, dir) = app_with_files(&[("m.rs", "v0\n")]);
+        for i in 1..=3 {
+            app.status = Status::Idle;
+            app.input.insert_str(&format!("change {i}"));
+            app.submit().unwrap();
+            app.push_response(write_reply("m.rs", &format!("v{i}\n")), None);
+            app.approve();
+            std::fs::write(dir.join("m.rs"), format!("v{i}\n")).unwrap();
+        }
+
+        app.status = Status::Idle;
+        app.run_command(Command::Rewind);
+        let rewind = app.rewind().expect("the list opens");
+        assert_eq!(
+            rewind.selected,
+            rewind.rows.len() - 1,
+            "it opens on the newest prompt"
+        );
+        // Three moves up from the newest lands on the first of the three writes.
+        app.rewind_move(-2);
+        let (turns, plan) = app.rewind_plan().expect("a plan for the highlighted row");
+        assert_eq!(turns, 3, "undoing all three");
+        assert_eq!(plan.restored, vec!["m.rs"], "one file, not three");
+
+        app.rewind_confirm();
+        assert!(app.rewind().is_none(), "the list closes");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "v0\n",
+            "back to before the first of the three"
+        );
+    }
+
+    /// Without this a resumed session would restart the count at 1 and number a
+    /// new checkpoint onto a folder still holding the only copy of a file.
+    /// The screen goes back as far as the files do, not one turn's worth.
+    #[test]
+    fn rewinding_several_turns_takes_the_screen_back_with_them() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "v0\n")]);
+        for i in 1..=3 {
+            app.status = Status::Idle;
+            app.input.insert_str(&format!("change {i}"));
+            app.submit().unwrap();
+            app.push_response(response_reply(&format!("did {i}")), None);
+        }
+
+        app.status = Status::Idle;
+        app.run_command(Command::Rewind);
+        app.rewind_move(-2); // back to "change 1"
+        app.rewind_confirm();
+
+        let left = visible(&app);
+        let prompts: Vec<&String> = left
+            .iter()
+            .filter_map(|e| match e {
+                Entry::User(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            vec!["what is in that file?"],
+            "only the turns before the rewind point are still on screen"
+        );
+        assert!(
+            !left.iter().any(|e| matches!(e, Entry::Action { .. })),
+            "and so are the replies they caused"
+        );
+        // The notice reports what the panel promised, in the same unit: turns of
+        // conversation, not turns that happened to have a checkpoint.
+        assert!(
+            matches!(last_visible(&app), Entry::Notice(n) if n.contains("Rewound 3 turn(s)")),
+            "got {:?}",
+            last_visible(&app)
+        );
+    }
+
+    #[test]
+    fn rewind_turn_numbers_survive_a_save_and_load() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "one\n")]);
+        for i in 0..2 {
+            app.status = Status::Idle;
+            app.input.insert_str(&format!("ask {i}"));
+            app.submit().unwrap();
+        }
+        assert_eq!(app.turn_number, 3, "the fixture's prompt plus two");
+
+        let json = serde_json::to_string(&app.to_session()).unwrap();
+        let restored: crate::session::Session = serde_json::from_str(&json).unwrap();
+        let (mut fresh, _dir2) = app_with_files(&[]);
+        fresh.apply_session(restored);
+        assert_eq!(fresh.turn_number, 3, "counting resumes where it left off");
+        assert_eq!(
+            fresh.rewind_rows().last().unwrap().turn,
+            3,
+            "and the rows line up with the checkpoints on disk"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_rewind_changes_nothing() {
+        let (mut app, dir) = app_with_files(&[("m.rs", "before\n")]);
+        app.push_response(write_reply("m.rs", "after\n"), None);
+        app.approve();
+        std::fs::write(dir.join("m.rs"), "after\n").unwrap();
+        let history = app.history.clone();
+
+        app.status = Status::Idle;
+        app.run_command(Command::Rewind);
+        app.rewind_cancel();
+        assert!(app.rewind().is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(app.history, history);
+    }
+
+    #[test]
+    fn cancelling_undo_changes_nothing() {
+        let (mut app, dir) = app_with_files(&[("m.rs", "before\n")]);
+        app.push_response(write_reply("m.rs", "after\n"), None);
+        app.approve();
+        std::fs::write(dir.join("m.rs"), "after\n").unwrap();
+        let history = app.history.clone();
+
+        app.status = Status::Idle;
+        app.run_command(Command::Undo);
+        app.cancel_undo();
+        assert!(app.pending_undo().is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(app.history, history);
+        assert_eq!(checkpoints(&app).len(), 1, "the checkpoint is still there");
+    }
+
+    #[test]
+    fn undo_with_nothing_to_undo_says_so() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "one\n")]);
+        app.status = Status::Idle;
+        app.run_command(Command::Undo);
+        assert!(app.pending_undo().is_none());
+        assert!(matches!(last_visible(&app), Entry::Notice(n) if n.contains("Nothing to undo")));
+    }
+
+    #[test]
+    fn checkpoints_retention_prunes_and_survives_a_round_trip() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "one\n")]);
+        // Four turns, each changing the file, so there are four checkpoints.
+        for i in 0..4 {
+            app.status = Status::Idle; // the previous turn finished
+            app.input.insert_str(&format!("turn {i}"));
+            app.submit().unwrap();
+            app.push_response(write_reply("m.rs", &format!("v{i}\n")), None);
+            app.approve();
+        }
+        assert_eq!(checkpoints(&app).len(), 4, "nothing is pruned by default");
+
+        app.status = Status::Idle;
+        app.run_command(Command::Checkpoints(Some("2".into())));
+        assert_eq!(app.keep_checkpoints, Some(2));
+        assert_eq!(checkpoints(&app).len(), 2, "pruned immediately");
+
+        // And it is a property of the session, not of the process.
+        let json = serde_json::to_string(&app.to_session()).unwrap();
+        let restored: crate::session::Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.keep_checkpoints, Some(2));
+    }
+
+    #[test]
+    fn checkpoints_rejects_a_count_that_would_delete_the_safety_net() {
+        let (mut app, _dir) = app_with_files(&[("m.rs", "one\n")]);
+        app.status = Status::Idle;
+        app.run_command(Command::Checkpoints(Some("0".into())));
+        assert_eq!(app.keep_checkpoints, None, "unchanged");
+        assert!(matches!(last_visible(&app), Entry::Notice(n) if n.contains("usage:")));
+
+        app.run_command(Command::Checkpoints(Some("all".into())));
+        assert_eq!(app.keep_checkpoints, None);
     }
 
     /// The diff stored on the newest `Entry::Action`.

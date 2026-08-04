@@ -1,4 +1,5 @@
 mod app;
+mod checkpoint;
 mod command;
 mod compact;
 mod config;
@@ -133,6 +134,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     app.max_retries = args.max_retries;
     app.strip_preamble = !args.strict_replies;
     app.show_reasoning = !args.no_reasoning;
+    app.keep_checkpoints = args.keep_checkpoints;
     // Reads resolve paths in-process against the sandbox root, so the app needs
     // the sandbox itself, not just its root.
     app.sandbox = Some(sandbox.clone());
@@ -385,8 +387,20 @@ fn handle_event(
                     app.keep_planning();
                 }
             }
+            // Same footer again, third meaning.
+            MouseEventKind::Down(MouseButton::Left) if app.pending_undo().is_some() => {
+                if ui::hit(metrics.allow_button, mouse.column, mouse.row) {
+                    app.confirm_undo();
+                } else if ui::hit(metrics.deny_button, mouse.column, mouse.row) {
+                    app.cancel_undo();
+                }
+            }
             // Hovering a button focuses it, so click and keyboard agree.
-            MouseEventKind::Moved if app.pending().is_some() || app.executing().is_some() => {
+            MouseEventKind::Moved
+                if app.pending().is_some()
+                    || app.executing().is_some()
+                    || app.pending_undo().is_some() =>
+            {
                 if ui::hit(metrics.allow_button, mouse.column, mouse.row) {
                     app.set_choice(Choice::Allow);
                 } else if ui::hit(metrics.deny_button, mouse.column, mouse.row) {
@@ -414,6 +428,29 @@ fn handle_event(
                     mouse.row,
                 ) {
                     app.question_select(i);
+                }
+            }
+            // Clicking a rewind row goes there; hovering focuses it, so the
+            // summary above updates under the cursor.
+            MouseEventKind::Down(MouseButton::Left) if app.rewind().is_some() => {
+                if let Some(i) = row_at(
+                    metrics.rewind_list,
+                    metrics.rewind_offset,
+                    mouse.column,
+                    mouse.row,
+                ) && app.rewind_select(i)
+                {
+                    app.rewind_confirm();
+                }
+            }
+            MouseEventKind::Moved if app.rewind().is_some() => {
+                if let Some(i) = row_at(
+                    metrics.rewind_list,
+                    metrics.rewind_offset,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    app.rewind_select(i);
                 }
             }
             // Clicking a session row loads it; hovering focuses it.
@@ -741,6 +778,24 @@ fn handle_key(
         return;
     }
 
+    // The undo panel, on the same pattern. Esc cancels it, and unlike the two
+    // above there is a deliberate asymmetry: `y` is not bound. This is the one
+    // modal that deletes files, so confirming it takes moving to the button.
+    if app.pending_undo().is_some() {
+        match key.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
+            KeyCode::Enter => match app.undo_choice() {
+                Some(Choice::Allow) => app.confirm_undo(),
+                _ => app.cancel_undo(),
+            },
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.cancel_undo(),
+            KeyCode::PageUp => app.scroll_up(page),
+            KeyCode::PageDown => app.scroll_down(page, max_scroll),
+            _ => {}
+        }
+        return;
+    }
+
     // The model's question owns the keyboard while it is up, for the same reason
     // the approval modal does. Placed before the Esc-cancel branch below so Esc
     // dismisses the question — which the model is told about and can act on —
@@ -791,6 +846,23 @@ fn handle_key(
             // reaches us as Ctrl+H.
             KeyCode::Char('h') if ctrl => app.question_input(|input| input.delete_word_before()),
             KeyCode::Char('w') if ctrl => app.question_input(|input| input.delete_word_before()),
+            _ => {}
+        }
+        return;
+    }
+
+    // The rewind list owns the keyboard while it is open. No text field, so
+    // nothing to type into: it is a list of what already happened.
+    if app.rewind().is_some() {
+        match key.code {
+            KeyCode::Up => app.rewind_move(-1),
+            KeyCode::Down => app.rewind_move(1),
+            KeyCode::PageUp => app.rewind_move(-(page as isize)),
+            KeyCode::PageDown => app.rewind_move(page as isize),
+            KeyCode::Home => app.rewind_move(isize::MIN / 2),
+            KeyCode::End => app.rewind_move(isize::MAX / 2),
+            KeyCode::Enter => app.rewind_confirm(),
+            KeyCode::Esc => app.rewind_cancel(),
             _ => {}
         }
         return;

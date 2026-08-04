@@ -44,6 +44,17 @@ pub struct Session {
     /// files stay readable in both directions.
     #[serde(default)]
     pub ledger: Ledger,
+    /// How many checkpoints this session keeps; `None` keeps everything, which
+    /// is the default. Per session rather than global because how far back it is
+    /// worth being able to undo is a property of the work, not of the machine.
+    /// Added on `ledger`'s precedent, with no `VERSION` bump.
+    #[serde(default)]
+    pub keep_checkpoints: Option<usize>,
+    /// How many turns this session has taken, which is what checkpoint folders
+    /// are numbered by. Carried so a resumed session keeps counting from where
+    /// it left off rather than renumbering onto checkpoints already on disk.
+    #[serde(default)]
+    pub turn_number: usize,
 }
 
 impl Session {
@@ -62,7 +73,18 @@ impl Session {
             transcript,
             prompt_history,
             ledger,
+            keep_checkpoints: None,
+            turn_number: 0,
         }
+    }
+
+    /// Set the checkpoint state this session carries. A builder rather than two
+    /// more constructor arguments: both are optional with a default, and every
+    /// existing caller means the default.
+    pub fn keeping(mut self, keep: Option<usize>, turn_number: usize) -> Self {
+        self.keep_checkpoints = keep;
+        self.turn_number = turn_number;
+        self
     }
 }
 

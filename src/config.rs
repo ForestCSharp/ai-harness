@@ -100,6 +100,15 @@ pub struct Args {
     #[arg(long, default_value_t = crate::app::DEFAULT_MAX_RETRIES, env = "AI_HARNESS_MAX_RETRIES")]
     pub max_retries: usize,
 
+    /// How many turns of checkpoints to keep, for sessions started fresh.
+    ///
+    /// Unset keeps everything, which is the default: a checkpoint exists to be
+    /// there when it is wanted, and how far back that is depends on the work.
+    /// The value is a per-session setting once set with `/checkpoints <n>`, and
+    /// a loaded session brings its own.
+    #[arg(long, env = "AI_HARNESS_KEEP_CHECKPOINTS")]
+    pub keep_checkpoints: Option<usize>,
+
     /// Do not show the model's reasoning while it streams. Toggle with
     /// `/reasoning`.
     ///
@@ -247,6 +256,14 @@ mod tests {
     fn preamble_recovery_is_on_until_strictness_is_asked_for() {
         assert!(!args(&[]).strict_replies);
         assert!(args(&["--strict-replies"]).strict_replies);
+    }
+
+    /// Unset means "keep everything", not "keep none" — a checkpoint exists to
+    /// be there when it is wanted.
+    #[test]
+    fn checkpoints_are_kept_unless_a_limit_is_given() {
+        assert_eq!(args(&[]).keep_checkpoints, None);
+        assert_eq!(args(&["--keep-checkpoints", "5"]).keep_checkpoints, Some(5));
     }
 
     #[test]

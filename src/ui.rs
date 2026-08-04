@@ -48,6 +48,9 @@ pub struct Metrics {
     /// The same, for the `/model` picker. Uniform rows, so an offset is enough.
     pub models_list: Option<Rect>,
     pub models_offset: usize,
+    /// The same again, for the `/rewind` list.
+    pub rewind_list: Option<Rect>,
+    pub rewind_offset: usize,
 }
 
 /// Did `(column, row)` land inside `area`?
@@ -125,6 +128,8 @@ enum PanelKind {
     Question,
     Picker,
     Execute,
+    Undo,
+    Rewind,
     Models,
 }
 
@@ -222,6 +227,77 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         });
     }
 
+    if let Some(undo) = app.pending_undo() {
+        let dim = Style::default().fg(Color::Gray);
+        let mut lines = body_lines(
+            &format!("Undo turn {}: {}", undo.turn, undo.prompt),
+            dim,
+            inner_width,
+        );
+        lines.push(Line::default());
+
+        // Restores and deletions are listed apart and labelled differently. They
+        // are not the same promise: one puts bytes back, the other takes a file
+        // away, and a single merged list would let the second hide in the first.
+        for (label, files, colour) in [
+            ("restore", &undo.plan.restored, Color::Green),
+            ("delete", &undo.plan.removed, Color::Red),
+        ] {
+            if files.is_empty() {
+                continue;
+            }
+            lines.push(Line::from(Span::styled(
+                format!("{label} {} file(s):", files.len()),
+                Style::default().fg(colour).add_modifier(Modifier::BOLD),
+            )));
+            for path in files.iter().take(UNDO_FILES_SHOWN) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", truncate(path, inner_width.saturating_sub(2))),
+                    Style::default().fg(colour),
+                )));
+            }
+            if let Some(rest) = files.len().checked_sub(UNDO_FILES_SHOWN).filter(|n| *n > 0) {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⋯ and {rest} more"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::default());
+        }
+
+        if let Some(reason) = &undo.partial {
+            lines.extend(body_lines(
+                &format!(
+                    "This checkpoint is partial — the workspace was {reason} when it \
+                     was taken, so some changes cannot be undone."
+                ),
+                Style::default().fg(Color::Yellow),
+                inner_width,
+            ));
+            lines.push(Line::default());
+        }
+        lines.extend(body_lines(
+            "The conversation rewinds to before this turn as well, so the model \
+             stops believing it made these changes.",
+            dim,
+            inner_width,
+        ));
+        lines.push(Line::default());
+
+        let height = (lines.len() as u16 + 3).min(max).max(MIN_PANEL_ROWS);
+        return Some(Panel {
+            kind: PanelKind::Undo,
+            title: " undo this turn? ",
+            colour: Color::Yellow,
+            body: lines,
+            hint: None,
+            height,
+            header: 0,
+            offset: 0,
+            owners: Vec::new(),
+        });
+    }
+
     if app.executing().is_some() {
         // The plan itself is in the transcript above, rendered as markdown, so
         // this asks the question and names the file rather than repeating it.
@@ -261,6 +337,54 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             owners: Vec::new(),
         });
     }
+    if let Some(rewind) = app.rewind() {
+        // Borders (2) + footer (1) + the summary row + a blank after it: the
+        // model picker's shape, with the summary where its query row goes.
+        let chrome = 5u16;
+        let height = (chrome + rewind.rows.len() as u16)
+            .min(max)
+            .max(MIN_PANEL_ROWS);
+        let visible = height.saturating_sub(chrome).max(1) as usize;
+        // The selection opens on the last row, so this opens scrolled to the
+        // bottom — the newest prompt — with older ones above, as in the
+        // transcript.
+        let offset = rewind
+            .selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(rewind.rows.len().saturating_sub(visible));
+
+        let (turns, plan) = app.rewind_plan().unwrap_or_default();
+        let summary = format!(
+            "  undo {turns} turn(s) · {} file(s) restored · {} deleted",
+            plan.restored.len(),
+            plan.removed.len()
+        );
+
+        let mut body = vec![
+            Line::from(Span::styled(
+                summary,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+        ];
+        body.extend(rewind_rows(rewind, offset, visible, inner_width));
+
+        return Some(Panel {
+            kind: PanelKind::Rewind,
+            title: " rewind to ",
+            colour: Color::Yellow,
+            body,
+            hint: Some("↑/↓ choose · Enter rewind · Esc cancel"),
+            height,
+            // The summary row and the blank under it.
+            header: 2,
+            offset,
+            owners: Vec::new(),
+        });
+    }
+
     if let Some(picker) = app.picker() {
         let matches = app.picker_matches();
         // Borders (2) + footer (1) + the query row + a blank after it, the same
@@ -396,6 +520,17 @@ fn draw_prepared_panel(
         PanelKind::Execute => {
             if let Some(selected) = app.executing() {
                 let (allow, deny) = draw_buttons(frame, footer, selected, EXECUTE_LABELS);
+                metrics.allow_button = Some(allow);
+                metrics.deny_button = Some(deny);
+            }
+        }
+        PanelKind::Rewind => {
+            metrics.rewind_list = Some(list);
+            metrics.rewind_offset = offset;
+        }
+        PanelKind::Undo => {
+            if let Some(selected) = app.undo_choice() {
+                let (allow, deny) = draw_buttons(frame, footer, selected, UNDO_LABELS);
                 metrics.allow_button = Some(allow);
                 metrics.deny_button = Some(deny);
             }
@@ -658,6 +793,53 @@ fn query_row(query: &crate::input::Input, width: usize) -> Line<'static> {
     }
 }
 
+/// One row per visible rewind point: the prompt, and what that turn changed.
+///
+/// The prompt is what you are choosing between, so the file count is dim and
+/// right-aligned beside it — the same division `model_rows` makes between an id
+/// and its price.
+fn rewind_rows(
+    rewind: &crate::app::Rewind,
+    offset: usize,
+    visible: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for i in offset..rewind.rows.len().min(offset + visible) {
+        let row = &rewind.rows[i];
+        let focused = i == rewind.selected;
+        let style = if focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let aside = Style::default().fg(if focused {
+            Color::Black
+        } else {
+            Color::DarkGray
+        });
+        let note = match row.changed {
+            0 => String::new(),
+            n => format!("{n} file(s)  "),
+        };
+        let marker = if focused { "› " } else { "  " };
+        let room = width.saturating_sub(note.chars().count() + 2);
+        let prompt = truncate(row.prompt.trim(), room);
+        let pad = width
+            .saturating_sub(prompt.chars().count() + note.chars().count() + 2)
+            .max(1);
+        rows.push(Line::from(vec![
+            Span::styled(format!("{marker}{prompt}"), style),
+            Span::styled(" ".repeat(pad), style),
+            Span::styled(note, aside),
+        ]));
+    }
+    rows
+}
+
 /// One row per visible model: the id, and what it costs to use.
 ///
 /// The metadata is right-aligned and dim so the ids stay a scannable column —
@@ -894,6 +1076,11 @@ fn approval_body(
 type Labels = [&'static str; 2];
 const APPROVE_LABELS: Labels = ["  Allow  ", "  Deny  "];
 const EXECUTE_LABELS: Labels = ["  Execute  ", "  Keep planning  "];
+const UNDO_LABELS: Labels = ["  Undo  ", "  Cancel  "];
+
+/// Paths listed per group in the undo panel before the rest are summarised. A
+/// turn that touched forty files needs to be recognisable, not enumerated.
+const UNDO_FILES_SHOWN: usize = 6;
 
 /// The two buttons on a panel's footer row. Returns their areas so the event loop
 /// can hit-test mouse clicks against them.
@@ -2021,6 +2208,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Status::AwaitingApproval(_) => (" approve ", Color::Magenta),
         Status::AwaitingChoice(_) => (" answer ", Color::Yellow),
         Status::AwaitingExecute { .. } => (" execute ", Color::Green),
+        Status::AwaitingUndo { .. } => (" undo ", Color::Yellow),
         Status::Running => (" running ", Color::Blue),
         Status::Compacting => (" compacting ", Color::Cyan),
     };
@@ -2067,6 +2255,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     }
     let hints = if app.pending().is_some() {
         "  ←/→ choose · Enter confirm · y allow · n/Esc deny"
+    } else if app.rewind().is_some() {
+        // Coexists with `Idle`, like the pickers, so without this the bar would
+        // offer to send a prompt while the list below is asking you to choose.
+        "  ↑/↓ choose · Enter rewind · Esc cancel"
+    } else if app.pending_undo().is_some() {
+        "  ←/→ choose · Enter confirm · Esc cancel"
     } else if app.executing().is_some() {
         "  ←/→ choose · Enter confirm · Esc keep planning"
     } else if app.question().is_some() {
@@ -2286,6 +2480,145 @@ mod tests {
     }
 
     /// Drive an app to the point where a shell command awaits approval.
+    /// An app whose `/rewind` list is open over `prompts`, the last of which is
+    /// the newest. `changed` says how many files each turn touched.
+    fn with_rewind(prompts: &[(&str, usize)]) -> App {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.open_rewind_over(
+            prompts
+                .iter()
+                .enumerate()
+                .map(|(i, (prompt, changed))| crate::app::RewindRow {
+                    turn: i + 1,
+                    history_index: i * 2 + 1,
+                    transcript_index: Some(i * 3),
+                    changed: *changed,
+                    prompt: (*prompt).to_string(),
+                })
+                .collect(),
+        );
+        app
+    }
+
+    #[test]
+    fn the_rewind_list_opens_on_the_newest_prompt() {
+        let mut app = with_rewind(&[("first thing", 1), ("second thing", 0), ("newest", 2)]);
+        let (rows, metrics) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("rewind to"), "missing title:\n{screen}");
+        assert!(
+            rows.iter().any(|r| r.contains("› newest")),
+            "the newest prompt carries the marker:\n{screen}"
+        );
+        assert!(screen.contains("first thing"), "older rows show:\n{screen}");
+        assert!(metrics.rewind_list.is_some(), "list rect must be reported");
+    }
+
+    /// The summary is what makes Enter an informed decision, so it has to track
+    /// the highlight rather than the list.
+    #[test]
+    fn the_rewind_summary_follows_the_highlight() {
+        let mut app = with_rewind(&[("first thing", 1), ("second thing", 0), ("newest", 2)]);
+        let (rows, _) = render(&mut app, 70, 20);
+        assert!(
+            rows.join("\n").contains("undo 1 turn(s)"),
+            "the newest row undoes the last turn, like /undo:\n{}",
+            rows.join("\n")
+        );
+
+        app.rewind_move(-2);
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+        assert!(screen.contains("undo 3 turn(s)"), "{screen}");
+        assert!(
+            rows.iter().any(|r| r.contains("› first thing")),
+            "the highlight moved:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_rewind_row_shows_what_its_turn_changed() {
+        let mut app = with_rewind(&[("changed two", 2), ("changed none", 0)]);
+        let (rows, _) = render(&mut app, 70, 20);
+        let screen = rows.join("\n");
+        let changed = rows.iter().find(|r| r.contains("changed two")).unwrap();
+        assert!(changed.contains("2 file(s)"), "{screen}");
+        let untouched = rows.iter().find(|r| r.contains("changed none")).unwrap();
+        assert!(
+            !untouched.contains("file(s)"),
+            "a turn that changed nothing says nothing:\n{screen}"
+        );
+    }
+
+    /// The undo panel, put up directly. Building it through a real turn would be
+    /// a test of the checkpoint module, which has its own.
+    fn awaiting_undo(restored: &[&str], removed: &[&str], partial: Option<&str>) -> App {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.status = crate::app::Status::AwaitingUndo {
+            selected: crate::app::Choice::Deny,
+            undo: Box::new(crate::app::PendingUndo {
+                turn: 3,
+                prompt: "rename the parser".into(),
+                partial: partial.map(str::to_string),
+                plan: crate::checkpoint::Restored {
+                    restored: restored.iter().map(|s| s.to_string()).collect(),
+                    removed: removed.iter().map(|s| s.to_string()).collect(),
+                    failed: Vec::new(),
+                },
+            }),
+        };
+        app
+    }
+
+    /// Restores and deletions are separate promises, and the panel must not let
+    /// the second hide inside the first.
+    #[test]
+    fn the_undo_panel_lists_deletions_apart_from_restores() {
+        let mut app = awaiting_undo(&["src/a.rs"], &["src/new.rs"], None);
+        let (rows, _) = render(&mut app, 70, 24);
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("undo this turn?"), "{screen}");
+        assert!(screen.contains("rename the parser"), "names it:\n{screen}");
+        assert!(screen.contains("restore 1 file(s)"), "{screen}");
+        assert!(screen.contains("delete 1 file(s)"), "{screen}");
+        let restore_at = screen.find("restore 1").unwrap();
+        let delete_at = screen.find("delete 1").unwrap();
+        let new_at = screen.find("src/new.rs").unwrap();
+        assert!(
+            restore_at < delete_at && delete_at < new_at,
+            "the deletion must be under its own heading:\n{screen}"
+        );
+        assert!(
+            screen.contains("Undo") && screen.contains("Cancel"),
+            "buttons"
+        );
+    }
+
+    #[test]
+    fn the_undo_panel_says_when_a_checkpoint_was_capped() {
+        let mut app = awaiting_undo(&["a.rs"], &[], Some("too many files"));
+        let (rows, _) = render(&mut app, 70, 24);
+        assert!(
+            rows.join("\n").contains("partial"),
+            "a capped checkpoint must say so before it is trusted:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// A turn that touched forty files is recognised, not enumerated.
+    #[test]
+    fn the_undo_panel_summarises_a_long_list() {
+        let many: Vec<String> = (0..40).map(|i| format!("src/f{i:02}.rs")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let mut app = awaiting_undo(&refs, &[], None);
+        let (rows, _) = render(&mut app, 70, 24);
+        let screen = rows.join("\n");
+        assert!(screen.contains("restore 40 file(s)"), "{screen}");
+        assert!(screen.contains("and 34 more"), "{screen}");
+    }
+
     fn awaiting_approval(command: &str) -> App {
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("list files");
@@ -3112,7 +3445,10 @@ mod tests {
         let screen = rows.join("\n");
 
         assert!(screen.contains("commands"), "missing menu title:\n{screen}");
-        for name in ["/debug", "/clear", "/save"] {
+        // Entries from the head of the table: the menu is height-capped, so
+        // asserting on one further down would be a test of the cap instead —
+        // which `the_menu_scrolls_to_keep_a_deep_selection_visible` already is.
+        for name in ["/debug", "/auto", "/plan"] {
             assert!(screen.contains(name), "missing {name}:\n{screen}");
         }
         // The prompt must still own the bottom rows.
@@ -3149,14 +3485,14 @@ mod tests {
 
         let (rows, _) = render(&mut app, 70, 20);
         let debug_row = rows.iter().position(|r| r.contains("/debug")).unwrap();
-        let save_row = rows.iter().position(|r| r.contains("/save")).unwrap();
-        assert!(debug_row < save_row, "menu order should follow the table");
+        let plan_row = rows.iter().position(|r| r.contains("/plan")).unwrap();
+        assert!(debug_row < plan_row, "menu order should follow the table");
 
         // Moving the highlight must not reorder or drop entries.
         app.move_completion(1);
         let (rows, _) = render(&mut app, 70, 20);
         let screen = rows.join("\n");
-        assert!(screen.contains("/debug") && screen.contains("/clear"));
+        assert!(screen.contains("/debug") && screen.contains("/plan"));
     }
 
     #[test]
@@ -3732,19 +4068,30 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        for name in names {
-            let session = crate::session::Session::new(
+        for (i, name) in names.iter().enumerate() {
+            let mut session = crate::session::Session::new(
                 "m".into(),
                 vec![],
                 vec![],
                 vec![],
                 Default::default(),
             );
+            session.saved_at = pinned_saved_at(i);
             crate::session::save(&dir, name, &session).unwrap();
         }
         let mut app = App::new("test/model".into(), None, 10, dir.clone());
         app.open_load_picker();
         (app, dir)
+    }
+
+    /// A save time that puts `names[i]` at position `i` in the picker.
+    ///
+    /// The picker orders by recency, so without this the fixtures depend on a
+    /// loop of `Session::new` calls all landing in the same second — and when one
+    /// straddles a boundary the order flips and the test flakes. Descending, so
+    /// the first name is the most recent and the listed order is the given one.
+    fn pinned_saved_at(i: usize) -> u64 {
+        2_000_000_000 - i as u64
     }
 
     /// A picker over sessions that each have a one-line preview.
@@ -3756,14 +4103,15 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        for name in names {
-            let session = crate::session::Session::new(
+        for (i, name) in names.iter().enumerate() {
+            let mut session = crate::session::Session::new(
                 "m".into(),
                 vec![],
                 vec![Entry::User(format!("what {name} was about"))],
                 vec![],
                 Default::default(),
             );
+            session.saved_at = pinned_saved_at(i);
             crate::session::save(&dir, name, &session).unwrap();
         }
         let mut app = App::new("test/model".into(), None, 10, dir.clone());

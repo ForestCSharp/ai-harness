@@ -264,6 +264,9 @@ Commands are handled locally and never sent to the model.
 | `/plan [task]` | Toggle plan mode; with a task, start planning it (see [Plan mode](#plan-mode)) |
 | `/clear` | Clear the conversation, keeping the system prompt |
 | `/compact` | Summarise the older part of the conversation to free context (see [Context compaction](#context-compaction)) |
+| `/undo` | Put back the files the last changing turn touched (see [Checkpoints and undo](#checkpoints-and-undo)) |
+| `/rewind` | Choose how far back to undo, from a list of the conversation |
+| `/checkpoints [n]` | List what can be undone; with a number, keep only the last `n` turns |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
 | `/rename <name>` | Rename the current session (the name it loads under) |
@@ -417,6 +420,82 @@ actions cannot spin forever; reads and edits count against it like anything else
 It is bounded by `--max-turn-bytes` as well, because round-trips are the wrong
 unit for the damage a few whole-file reads can do: a handful of them can crowd
 out the context window well inside the round-trip budget.
+
+## Checkpoints and undo
+
+The sandbox root is what commands are confined *to*, not protected from. An
+auto-approved `rm -rf .` is entirely inside the boundary, and the kernel is right
+to allow it. So before an approved action changes anything, the files it is about
+to change are copied aside.
+
+Two ways of filling a checkpoint, because two different things are knowable:
+
+- A **write or edit** names its file, so exactly that file is copied. Exact, and
+  nearly free.
+- A **shell command** could touch anything, so the workspace is walked and copied
+  within caps on file count, total size, and time. This is the case the feature
+  exists for.
+
+One checkpoint per turn, opened by the first action that changes something — a
+turn that only reads leaves nothing behind. Several edits in one turn share it,
+and the state it holds is the one the turn *started* from, so `/undo` is one step
+however many files the turn touched.
+
+`/undo` asks before it acts, because a restore deletes the files the turn
+created, and the panel lists those separately from the ones it will restore.
+Confirming also **rewinds the conversation** to before the prompt that started
+the turn — both the model's copy of it and the one on screen. That is the point:
+leaving the turn in the model's context would leave it certain about writes that
+are no longer on disk, and leaving it on screen would have you reading work that
+no longer exists anywhere. A notice is left in its place saying what was undone.
+
+`/rewind` is the same thing with a choice of how far. It opens a list of the
+conversation — one row per prompt, oldest at the top, **newest at the bottom and
+selected**, because that is where you already are. Moving up reaches further
+back, and a line above the list keeps saying what going that far would cost:
+
+```
+┌ rewind to ────────────────────────────────────────────────────
+│  undo 3 turn(s) · 4 file(s) restored · 1 deleted
+│
+│  add a checkpoint module                          3 file(s)
+│› why is retire_superseded_reads keyed on the range?
+│  wire it into the approval path                   2 file(s)
+│  now make the load modal full screen              1 file(s)
+└───────────────────────────────────────────────────────────────
+```
+
+Enter commits, and the chosen row and everything after it leave the screen along
+with the files and the model's context. There is no second confirmation, because
+the summary has been telling you what would happen the whole time the row was
+highlighted — that is what makes it an informed press. `/undo` confirms instead,
+having shown you nothing beforehand. Every row is a real target: choosing the
+bottom one is exactly `/undo`, and Esc is how you do nothing.
+
+Rows are read from the conversation as it stands, not from anything recorded
+when the turn ran. A turn that changed no files is still a row — rewinding past
+it puts the conversation back even though there is nothing on disk to restore.
+Turns that a compaction summarised away are gone from the list, since there is no
+longer a point in the conversation to return to; their files can still be
+restored, and it says so when that happens.
+
+Checkpoints live in the session's own folder, so `/rename` carries them and two
+sessions cannot interleave their numbering. Nothing is pruned by default;
+`/checkpoints` lists them and `/checkpoints <n>` keeps only the last `n` turns.
+That setting is saved with the session, and `--keep-checkpoints` sets it for a
+fresh one.
+
+Three limits, stated rather than hidden:
+
+- **`.git` is not checkpointed.** It is on the walk's skip list on cost, along
+  with `target/` and `node_modules/`. `/undo` restores your working tree; git
+  remains the backstop for git's own directory.
+- **A capped snapshot says so at the time**, in the transcript, rather than at
+  `/undo` time when it would be too late to decide differently about running the
+  command. The command still runs — refusing an approved action because the
+  safety net could not be hung would be a worse answer.
+- **`/undo` does not cross a `/fork`**, which starts a new session with its own
+  empty checkpoint folder.
 
 ## Plan mode
 
@@ -650,8 +729,9 @@ context window that triggers [compaction](#context-compaction) (`0` disables it)
 searches behind the approval modal along with everything else, and
 `--confirm-fetch` does the same for URL fetches.
 `--strict-replies` rejects a reply that narrates before its element rather than
-dropping the narration, and `--no-reasoning` starts with the reasoning window
-hidden.
+dropping the narration, `--no-reasoning` starts with the reasoning window
+hidden, and `--keep-checkpoints` caps how many turns of
+[undo history](#checkpoints-and-undo) a fresh session keeps.
 `--auto-approve` goes the other way and removes the modal entirely — read
 [Sandboxing](#sandboxing) before using it. Every flag also has an environment
 variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
@@ -770,6 +850,7 @@ reading while you choose which conversation to be in.
 | `src/markdown.rs` | Markdown subset for rendering model responses |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`) |
+| `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
 | `src/ui.rs` | Rendering and layout |
 | `src/app.rs` | Application state: transcript, history, request status |

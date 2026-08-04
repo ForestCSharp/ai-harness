@@ -280,6 +280,27 @@ decide:
   Seatbelt sandbox with a timeout and output caps. When it finishes →
   `Update::Command(output)`.
 
+`app.approve()` has one side effect before it hands the action back:
+`checkpoint_before` copies aside whatever the action is about to change. That is
+the one place that knows an action is really about to run, which is why it lives
+there rather than at dispatch. A write names its file, so exactly that file is
+copied; a shell command could touch anything, so the workspace is snapshotted
+within caps. The checkpoint is opened lazily on the first such action, so a turn
+that only reads leaves no folder behind. See
+[src/checkpoint.rs](../src/checkpoint.rs).
+
+A checkpoint records the **turn number** it belongs to and nothing about
+`history`. It briefly recorded the history length as well, and that was a bug:
+`compact::apply` rebuilds the conversation from scratch, so the index meant
+nothing afterwards and `Vec::truncate` past the end fails silently — the same
+hazard `retry_anchor` is documented against a few sections down. `/undo` and
+`/rewind` find the turn boundary by scanning the live history for
+`<ai-harness-query>` messages instead. That works because `encode_query` has
+exactly one caller and a compaction only ever collapses or drops a *prefix*, so
+the prompts still in history are always the last *n* the session sent — which
+also lets each one be matched back to its turn number, and thus to its
+checkpoint.
+
 A command does not stay silent while it runs. `run_streaming` reads both pipes
 incrementally and forwards each read as an `exec::Chunk`; the spawned task relays
 those onto the same `Tagged` channel everything else uses, so live output arrives
@@ -472,4 +493,5 @@ cannot be run.
 | `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
+| `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

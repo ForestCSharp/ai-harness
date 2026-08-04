@@ -13,6 +13,12 @@ pub enum Command {
     Auto,
     /// Toggle showing the model's reasoning while it streams.
     Reasoning,
+    /// Restore the workspace to before the last turn that changed it.
+    Undo,
+    /// Choose how far back to undo, from a list of the conversation.
+    Rewind,
+    /// List checkpoints; `Some` sets how many turns to keep.
+    Checkpoints(Option<String>),
     /// Toggle plan mode. `Some` carries the task to start planning immediately.
     Plan(Option<String>),
     Help,
@@ -71,6 +77,9 @@ pub fn parse(input: &str) -> Input {
         "debug" => Command::Debug,
         "auto" | "auto-approve" => Command::Auto,
         "reasoning" | "thinking" => Command::Reasoning,
+        "undo" => Command::Undo,
+        "rewind" => Command::Rewind,
+        "checkpoints" | "checkpoint" => Command::Checkpoints(arg),
         "plan" => Command::Plan(arg),
         "help" | "h" | "?" => Command::Help,
         "clear" | "reset" => Command::Clear,
@@ -122,6 +131,18 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "compact",
         description: "summarise the older part of the conversation to free context",
+    },
+    Spec {
+        name: "undo",
+        description: "restore the files the last changing turn touched, and rewind it",
+    },
+    Spec {
+        name: "rewind",
+        description: "choose how far back to undo, from a list of the conversation",
+    },
+    Spec {
+        name: "checkpoints",
+        description: "list what can be undone (/checkpoints <n> keeps only the last n)",
     },
     Spec {
         name: "save",
@@ -334,9 +355,9 @@ mod tests {
         let expected: Vec<_> = COMMANDS.iter().map(|s| s.name).collect();
         assert_eq!(names, expected);
 
-        // A prefix shared by two commands offers both.
+        // A prefix shared by several commands offers all of them, in table order.
         let names: Vec<_> = matching("c").iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["clear", "compact", "cost"]);
+        assert_eq!(names, vec!["clear", "compact", "checkpoints", "cost"]);
 
         let names: Vec<_> = matching("cl").iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["clear"]);
