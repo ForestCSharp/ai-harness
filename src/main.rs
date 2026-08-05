@@ -442,8 +442,6 @@ fn handle_sessions_event(event: Event, sessions: &mut Sessions, metrics: &ui::Me
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
-                KeyCode::Up => sessions.view_move(-1),
-                KeyCode::Down => sessions.view_move(1),
                 KeyCode::Enter => sessions.view_confirm(),
                 KeyCode::Char('n') if !ctrl => sessions.view_spawn(),
                 KeyCode::Char('x') if !ctrl => sessions.view_close_selected(),
@@ -452,7 +450,13 @@ fn handle_sessions_event(event: Event, sessions: &mut Sessions, metrics: &ui::Me
                 }
                 // Ctrl+C still quits from here, as it does everywhere.
                 KeyCode::Char('c') if ctrl => sessions.app_mut().should_quit = true,
-                _ => {}
+                // A page here is the list itself, which has no scrollback of its
+                // own; the sessions cap keeps it to a screenful anyway.
+                _ => {
+                    if let Some(delta) = list_motion(&key, sessions::MAX_SESSIONS) {
+                        sessions.view_move(delta);
+                    }
+                }
             }
         }
         Event::Mouse(mouse) => match mouse.kind {
@@ -874,6 +878,69 @@ fn execute_plan(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFligh
     }
 }
 
+/// How far a key means to move in a list, or `None` if it is not a motion.
+///
+/// One table for every list in the harness, so `j` cannot mean "down" in the
+/// sessions view and nothing in the `/rewind` list. Arrows and the page keys as
+/// always, plus vim's `j`/`k`, `g`/`G` and `Ctrl+D`/`Ctrl+U`.
+///
+/// The ends are a very large delta rather than their own case: every list clamps
+/// its own bounds already, and inventing a `Top`/`Bottom` variant would mean six
+/// lists each learning to handle it.
+///
+/// `g` alone rather than vim's `gg`, deliberately: a pending-key state is a lot
+/// of machinery for one keystroke in a modal you are in for two seconds.
+fn list_motion(key: &KeyEvent, page: usize) -> Option<isize> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let page = page as isize;
+    Some(match key.code {
+        KeyCode::Up => -1,
+        KeyCode::Down => 1,
+        KeyCode::Char('k') if !ctrl => -1,
+        KeyCode::Char('j') if !ctrl => 1,
+        KeyCode::PageUp => -page,
+        KeyCode::PageDown => page,
+        KeyCode::Char('u') if ctrl => -((page / 2).max(1)),
+        KeyCode::Char('d') if ctrl => (page / 2).max(1),
+        KeyCode::Char('g') => isize::MIN / 2,
+        KeyCode::Char('G') => isize::MAX / 2,
+        KeyCode::Home => isize::MIN / 2,
+        KeyCode::End => isize::MAX / 2,
+        _ => return None,
+    })
+}
+
+/// Apply an editing key to a query row, so a search field behaves like the
+/// prompt does — word motions and word deletion included.
+///
+/// Shared by the two pickers that have one. Motions and the keys that leave the
+/// field are handled by the caller; everything reaching here is an edit.
+fn picker_edit(
+    key: KeyEvent,
+    alt: bool,
+    ctrl: bool,
+    mut apply: impl FnMut(&mut dyn FnMut(&mut input::Input)),
+) {
+    match key.code {
+        KeyCode::Char(c) if !ctrl => apply(&mut |i| i.insert_char(c)),
+        KeyCode::Backspace if alt || ctrl => apply(&mut |i| i.delete_word_before()),
+        KeyCode::Backspace => apply(&mut |i| i.backspace()),
+        KeyCode::Delete if alt || ctrl => apply(&mut |i| i.delete_word_after()),
+        KeyCode::Delete => apply(&mut |i| i.delete()),
+        KeyCode::Left if alt || ctrl => apply(&mut |i| i.move_word_left()),
+        KeyCode::Right if alt || ctrl => apply(&mut |i| i.move_word_right()),
+        KeyCode::Left => apply(&mut |i| i.move_left()),
+        KeyCode::Right => apply(&mut |i| i.move_right()),
+        KeyCode::Home => apply(&mut |i| i.move_to_line_start()),
+        KeyCode::End => apply(&mut |i| i.move_to_line_end()),
+        KeyCode::Char('u') if ctrl => apply(&mut |i| i.delete_to_line_start()),
+        // See the prompt's handler: off the kitty protocol, Ctrl+Backspace
+        // reaches us as Ctrl+H.
+        KeyCode::Char('h') | KeyCode::Char('w') if ctrl => apply(&mut |i| i.delete_word_before()),
+        _ => {}
+    }
+}
+
 fn handle_key(
     key: KeyEvent,
     id: u64,
@@ -900,6 +967,8 @@ fn handle_key(
     if app.pending().is_some() {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
+            // `h`/`l` beside the arrows, as everywhere else.
+            KeyCode::Char('h') | KeyCode::Char('l') if !ctrl => app.toggle_choice(),
             KeyCode::Char('y') | KeyCode::Char('Y') => allow(id, app, ctx, inflight),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => deny(id, app, ctx, inflight),
             KeyCode::Enter => match app.pending().map(|p| p.selected) {
@@ -920,6 +989,8 @@ fn handle_key(
     if app.executing().is_some() {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
+            // `h`/`l` beside the arrows, as everywhere else.
+            KeyCode::Char('h') | KeyCode::Char('l') if !ctrl => app.toggle_choice(),
             KeyCode::Enter => match app.executing() {
                 Some(Choice::Allow) => execute_plan(id, app, ctx, inflight),
                 _ => app.keep_planning(),
@@ -938,6 +1009,8 @@ fn handle_key(
     if app.pending_undo().is_some() {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
+            // `h`/`l` beside the arrows, as everywhere else.
+            KeyCode::Char('h') | KeyCode::Char('l') if !ctrl => app.toggle_choice(),
             KeyCode::Enter => match app.undo_choice() {
                 Some(Choice::Allow) => app.confirm_undo(),
                 _ => app.cancel_undo(),
@@ -977,6 +1050,14 @@ fn handle_key(
                 let index = c.to_digit(10).expect("checked ascii digit") as usize - 1;
                 app.question_select(index);
             }
+            // `j`/`k` and the rest, but only off the free-text row — there they
+            // are letters, on the same rule the digits above follow. This modal
+            // has no search: its free-text row is an *answer*, not a filter, so
+            // there is nothing for `/` to start.
+            _ if !on_other && list_motion(&key, page as usize).is_some() => {
+                let delta = list_motion(&key, page as usize).unwrap_or(0);
+                app.question_move(delta);
+            }
             // Everything else edits the free-text answer, and only when that row
             // is focused — `question_input` enforces that, so a keystroke aimed
             // at a highlighted choice cannot vanish into an invisible buffer.
@@ -1009,100 +1090,74 @@ fn handle_key(
     // nothing to type into: it is a list of what already happened.
     if app.rewind().is_some() {
         match key.code {
-            KeyCode::Up => app.rewind_move(-1),
-            KeyCode::Down => app.rewind_move(1),
-            KeyCode::PageUp => app.rewind_move(-(page as isize)),
-            KeyCode::PageDown => app.rewind_move(page as isize),
-            KeyCode::Home => app.rewind_move(isize::MIN / 2),
-            KeyCode::End => app.rewind_move(isize::MAX / 2),
             KeyCode::Enter => app.rewind_confirm(),
             KeyCode::Esc => app.rewind_cancel(),
-            _ => {}
+            _ => {
+                if let Some(delta) = list_motion(&key, page as usize) {
+                    app.rewind_move(delta);
+                }
+            }
         }
         return;
     }
 
-    // The session picker owns the keyboard while it is open. Like the model
-    // picker below, it is a list plus a text field: navigation keys move the
-    // highlight and everything else narrows the list.
+    // The session picker owns the keyboard while it is open. It is a list you
+    // navigate, with `/` to narrow it — see `list_motion` and `Picker::searching`.
     if app.picker().is_some() {
+        if app.picker_searching() {
+            // Typing a filter. Arrows still move the highlight, since they are
+            // unambiguous; the letters belong to the query.
+            match key.code {
+                KeyCode::Up => app.picker_move(-1),
+                KeyCode::Down => app.picker_move(1),
+                KeyCode::PageUp => app.picker_move(-(page as isize)),
+                KeyCode::PageDown => app.picker_move(page as isize),
+                KeyCode::Enter => app.picker_confirm(),
+                // Back to navigating, filter intact — you narrowed the list in
+                // order to walk it. A second Esc closes the picker.
+                KeyCode::Esc => app.picker_search(false),
+                _ => picker_edit(key, alt, ctrl, |edit| app.picker_query_input(edit)),
+            }
+            return;
+        }
         match key.code {
-            KeyCode::Up => app.picker_move(-1),
-            KeyCode::Down => app.picker_move(1),
-            KeyCode::PageUp => app.picker_move(-(page as isize)),
-            KeyCode::PageDown => app.picker_move(page as isize),
             KeyCode::Enter => app.picker_confirm(),
             KeyCode::Esc => app.picker_cancel(),
-            KeyCode::Char(c) if !ctrl => app.picker_query_input(|input| input.insert_char(c)),
-            KeyCode::Backspace if alt || ctrl => {
-                app.picker_query_input(|input| input.delete_word_before())
+            KeyCode::Char('/') => app.picker_search(true),
+            _ => {
+                if let Some(delta) = list_motion(&key, page as usize) {
+                    app.picker_move(delta);
+                }
             }
-            KeyCode::Backspace => app.picker_query_input(|input| input.backspace()),
-            KeyCode::Delete if alt || ctrl => {
-                app.picker_query_input(|input| input.delete_word_after())
-            }
-            KeyCode::Delete => app.picker_query_input(|input| input.delete()),
-            KeyCode::Left if alt || ctrl => app.picker_query_input(|input| input.move_word_left()),
-            KeyCode::Right if alt || ctrl => {
-                app.picker_query_input(|input| input.move_word_right())
-            }
-            KeyCode::Left => app.picker_query_input(|input| input.move_left()),
-            KeyCode::Right => app.picker_query_input(|input| input.move_right()),
-            KeyCode::Home => app.picker_query_input(|input| input.move_to_line_start()),
-            KeyCode::End => app.picker_query_input(|input| input.move_to_line_end()),
-            KeyCode::Char('u') if ctrl => {
-                app.picker_query_input(|input| input.delete_to_line_start())
-            }
-            // See the prompt's handler: off the kitty protocol, Ctrl+Backspace
-            // reaches us as Ctrl+H.
-            KeyCode::Char('h') if ctrl => {
-                app.picker_query_input(|input| input.delete_word_before())
-            }
-            KeyCode::Char('w') if ctrl => {
-                app.picker_query_input(|input| input.delete_word_before())
-            }
-            _ => {}
         }
         return;
     }
 
-    // The model picker owns the keyboard too, and like the model's question it
-    // is a list plus a text field: navigation keys move the highlight and
-    // everything else narrows the list. There is no digit shortcut — digits are
-    // part of model ids and have to be typeable.
+    // The model picker works exactly as the session picker above does: a list
+    // you navigate, with `/` to narrow it. There is no digit shortcut — digits
+    // are part of model ids and have to be typeable.
     if app.model_picker().is_some() {
+        if app.model_searching() {
+            match key.code {
+                KeyCode::Up => app.model_move(-1),
+                KeyCode::Down => app.model_move(1),
+                KeyCode::PageUp => app.model_move(-(page as isize)),
+                KeyCode::PageDown => app.model_move(page as isize),
+                KeyCode::Enter => app.model_confirm(),
+                KeyCode::Esc => app.model_search(false),
+                _ => picker_edit(key, alt, ctrl, |edit| app.model_query_input(edit)),
+            }
+            return;
+        }
         match key.code {
-            KeyCode::Up => app.model_move(-1),
-            KeyCode::Down => app.model_move(1),
-            KeyCode::PageUp => app.model_move(-(page as isize)),
-            KeyCode::PageDown => app.model_move(page as isize),
             KeyCode::Enter => app.model_confirm(),
             KeyCode::Esc => app.model_cancel(),
-            // Word-wise editing matches the prompt's, so the query behaves like
-            // the box it stands in for.
-            KeyCode::Char(c) if !ctrl => app.model_query_input(|input| input.insert_char(c)),
-            KeyCode::Backspace if alt || ctrl => {
-                app.model_query_input(|input| input.delete_word_before())
+            KeyCode::Char('/') => app.model_search(true),
+            _ => {
+                if let Some(delta) = list_motion(&key, page as usize) {
+                    app.model_move(delta);
+                }
             }
-            KeyCode::Backspace => app.model_query_input(|input| input.backspace()),
-            KeyCode::Delete if alt || ctrl => {
-                app.model_query_input(|input| input.delete_word_after())
-            }
-            KeyCode::Delete => app.model_query_input(|input| input.delete()),
-            KeyCode::Left if alt || ctrl => app.model_query_input(|input| input.move_word_left()),
-            KeyCode::Right if alt || ctrl => app.model_query_input(|input| input.move_word_right()),
-            KeyCode::Left => app.model_query_input(|input| input.move_left()),
-            KeyCode::Right => app.model_query_input(|input| input.move_right()),
-            KeyCode::Home => app.model_query_input(|input| input.move_to_line_start()),
-            KeyCode::End => app.model_query_input(|input| input.move_to_line_end()),
-            KeyCode::Char('u') if ctrl => {
-                app.model_query_input(|input| input.delete_to_line_start())
-            }
-            // See the prompt's handler: off the kitty protocol, Ctrl+Backspace
-            // reaches us as Ctrl+H.
-            KeyCode::Char('h') if ctrl => app.model_query_input(|input| input.delete_word_before()),
-            KeyCode::Char('w') if ctrl => app.model_query_input(|input| input.delete_word_before()),
-            _ => {}
         }
         return;
     }
@@ -1434,6 +1489,71 @@ async fn stream_reply(
                 Some(Err(e)) => return Some(Err(format!("{e:#}"))),
                 None => return Some(Ok(Completion { content, usage })),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// One table for every list, so a motion cannot work in one modal and go
+    /// missing in another — which is what six hand-written copies had produced.
+    #[test]
+    fn vim_motions_sit_beside_the_arrows() {
+        let page = 10;
+        for (down, up) in [
+            (KeyCode::Down, KeyCode::Up),
+            (KeyCode::Char('j'), KeyCode::Char('k')),
+        ] {
+            assert_eq!(list_motion(&key(down), page), Some(1));
+            assert_eq!(list_motion(&key(up), page), Some(-1));
+        }
+
+        // The ends, by either name.
+        for top in [KeyCode::Char('g'), KeyCode::Home] {
+            assert!(list_motion(&key(top), page).unwrap() < -1000);
+        }
+        for bottom in [KeyCode::Char('G'), KeyCode::End] {
+            assert!(list_motion(&key(bottom), page).unwrap() > 1000);
+        }
+
+        // A page, and vim's half page.
+        assert_eq!(list_motion(&key(KeyCode::PageDown), page), Some(10));
+        assert_eq!(list_motion(&key(KeyCode::PageUp), page), Some(-10));
+        assert_eq!(list_motion(&ctrl_key('d'), page), Some(5));
+        assert_eq!(list_motion(&ctrl_key('u'), page), Some(-5));
+        // A one-row list still moves by one rather than standing still.
+        assert_eq!(list_motion(&ctrl_key('d'), 1), Some(1));
+        assert_eq!(list_motion(&ctrl_key('u'), 1), Some(-1));
+    }
+
+    /// `j` is a motion; `Ctrl+J` is not, and neither is a letter with no
+    /// meaning here — those have to fall through to whatever the modal does
+    /// with an unrecognised key.
+    #[test]
+    fn only_the_motion_keys_are_motions() {
+        for not_a_motion in [
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('/')),
+            key(KeyCode::Enter),
+            key(KeyCode::Esc),
+            ctrl_key('j'),
+            ctrl_key('k'),
+        ] {
+            assert_eq!(
+                list_motion(&not_a_motion, 10),
+                None,
+                "{not_a_motion:?} should not move a list"
+            );
         }
     }
 }

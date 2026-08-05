@@ -830,11 +830,44 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | `Ctrl+A` / `Ctrl+E` | Start / end of line |
 | `Ctrl+Home` / `Ctrl+End` | Start / end of the prompt |
 
+### In any list
+
+Every list in the harness — the `/load` and `/model` pickers, `/rewind`, the
+sessions view, the model's question — takes the same motions, so a key that
+moves in one moves in all of them:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Down / up, beside `↓` / `↑` |
+| `g` / `G` | First / last, beside `Home` / `End` |
+| `Ctrl+D` / `Ctrl+U` | Half a page down / up |
+| `PageDown` / `PageUp` | A page |
+| `h` / `l` | Move between the two buttons on an approval, `/plan` or `/undo` panel |
+| `Enter` | Take the highlighted one |
+| `Esc` | Close |
+
+`g` alone rather than vim's `gg`: a pending-key state is a lot of machinery for
+one keystroke in a modal you are in for two seconds.
+
+**Lists you can search — `/load` and `/model` — open ready to be walked, and `/`
+starts a search**, as it does in a pager. That is the price of `j` and `k`: a
+list cannot both take letters as motions and take them as text, so typing has to
+be asked for. The query row says which mode it is in.
+
+`Esc` while searching goes back to the list and **keeps the filter** — you
+narrowed the list in order to walk it, and clearing it on the way out would undo
+the point. A second `Esc` closes the picker. `Enter` takes the highlighted entry
+from either mode. Arrow keys still move the highlight while you type, being
+unambiguous.
+
+The completion menu is the exception: it appears while you are typing a slash
+command in the prompt, so `j` there is the letter. `↑`/`↓` and `Tab` move it.
+
 While the model's question modal is up, the keyboard belongs to it:
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Move between the choices and the free-text row (wraps) |
+| `↑` / `↓` / `j` / `k` | Move between the choices and the free-text row (wraps) |
 | `1`–`9` | Pick that choice outright |
 | `Enter` | Answer with the highlighted choice, or with what you typed |
 | `Esc` | Dismiss the question (reported to the model, which then continues) |
@@ -844,12 +877,14 @@ word deletion included.
 
 Typing goes to the free-text row **only while it is focused**, so a keystroke
 aimed at a highlighted choice cannot vanish into a buffer you cannot see. Choices
-are clickable too.
+are clickable too. That is also why `j` and the digits move the highlight only
+off that row: on it they are what you are typing. This modal has no `/` search —
+its free-text row is an *answer*, not a filter, so there is nothing to start.
 
-The `/model` and `/load` pickers work the same way — each owns the keyboard, its
-query row takes the prompt's editing keys, and rows are clickable — except that
-typing always goes to the query, since narrowing the list is the only thing to do
-there.
+The `/model` and `/load` pickers work the same way — each owns the keyboard and
+its rows are clickable — except that they open navigable, and `/` starts the
+search whose row then takes the prompt's editing keys. See
+[In any list](#in-any-list).
 
 Mouse wheel scrolls the transcript. Scrolling up detaches the view; it re-attaches
 to the bottom once you scroll back down (or press `End`).
@@ -1023,16 +1058,16 @@ never overwrite each other.
   under a new name. Both start identical and diverge from the fork point; the
   original is preserved to `/load` back.
 - `/save [name]` — save now and, with a name, adopt it going forward.
-- `/load <name>` — restore a session. `/load` with no name opens a picker: type to
-  filter, choose with `↑`/`↓` or the mouse, `Enter` or click to load, `Esc` to
-  cancel. Each entry shows its name, the model it was held with (right of the
+- `/load <name>` — restore a session. `/load` with no name opens a picker: move
+  with `j`/`k` or `↑`/`↓` or the mouse, `/` to filter, `Enter` or click to load,
+  `Esc` to cancel. Each entry shows its name, the model it was held with (right of the
   name — loading switches to it), and the session's last few lines, so the list
   can be read rather than navigated — names are timestamps until you `/rename`
   them, and a timestamp says nothing about what a session was. Sessions saved
   before previews existed show a bare name until their next save.
 
   The list is ordered by when each session was last worked in, most recent
-  first, since that is nearly always the one you want. Typing narrows it on the
+  first, since that is nearly always the one you want. A search narrows it on the
   name and the model, matching the `/model` picker: every whitespace-separated
   term must appear, so terms narrow rather than widen. Filtering does not
   reorder — a list that rearranged itself under a query would move the row you

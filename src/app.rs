@@ -326,6 +326,15 @@ pub struct Picker {
     /// What has been typed to narrow the list. Reuses the prompt's editor, the
     /// same way the model picker does for its free-text row.
     pub query: Input,
+    /// Whether keystrokes are going to the query rather than moving the
+    /// highlight.
+    ///
+    /// A list you can both navigate and type into cannot have both on one set of
+    /// keys: `j` is either "down" or the letter. So the list is navigable by
+    /// default and `/` starts a search, the way it does in a pager or in vim.
+    /// The query survives leaving search — you narrow the list *in order to*
+    /// walk it, and clearing the filter on the way out would undo the point.
+    pub searching: bool,
 }
 
 impl Picker {
@@ -383,6 +392,8 @@ pub struct ModelPicker {
     /// Highlighted row, as an index into the *matches*. Clamped on read, since
     /// the list shrinks as the query narrows.
     pub selected: usize,
+    /// Whether keystrokes are going to the query. See [`Picker::searching`].
+    pub searching: bool,
 }
 
 /// The checkpoint `/undo` is offering to restore, and what doing so would do.
@@ -1312,6 +1323,7 @@ impl App {
                 previews,
                 models,
                 query: Input::default(),
+                searching: false,
             });
         }
     }
@@ -1375,6 +1387,18 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Start typing a filter, the way `/` starts one in a pager.
+    pub fn picker_search(&mut self, on: bool) {
+        if let Some(picker) = &mut self.picker {
+            picker.searching = on;
+        }
+    }
+
+    /// Whether the `/load` picker's keystrokes are going to its query.
+    pub fn picker_searching(&self) -> bool {
+        self.picker.as_ref().is_some_and(|picker| picker.searching)
     }
 
     /// Edit the query. Any edit resets the highlight to the top, for the reason
@@ -1545,6 +1569,7 @@ impl App {
         self.models = Some(ModelPicker {
             query: Input::default(),
             selected,
+            searching: false,
         });
     }
 
@@ -1608,6 +1633,18 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Start typing a filter. See [`App::picker_search`].
+    pub fn model_search(&mut self, on: bool) {
+        if let Some(picker) = &mut self.models {
+            picker.searching = on;
+        }
+    }
+
+    /// Whether the `/model` picker's keystrokes are going to its query.
+    pub fn model_searching(&self) -> bool {
+        self.models.as_ref().is_some_and(|picker| picker.searching)
     }
 
     /// Edit the query. Any edit resets the highlight to the top: the list under
@@ -5083,6 +5120,27 @@ mod tests {
         app.open_load_picker();
         app.picker_query_input(|input| input.insert_str("keep"));
         assert_eq!(shown(&app), vec!["keep-b", "keep-a"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A list you can both walk and type into cannot have both on one set of
+    /// keys, so it opens navigable and `/` starts the search.
+    #[test]
+    fn a_picker_opens_navigable_and_slash_starts_the_search() {
+        let dir = session_temp_dir("picker-search-mode");
+        let mut app = app_with_saved(&dir, &["alpha", "beta"]);
+        assert!(!app.picker_searching(), "opens ready to be walked");
+
+        app.picker_search(true);
+        assert!(app.picker_searching());
+        app.picker_query_input(|input| input.insert_str("beta"));
+        assert_eq!(shown(&app), vec!["beta"]);
+
+        // Leaving the search keeps the filter — you narrowed the list in order
+        // to walk it, and clearing it on the way out would undo the point.
+        app.picker_search(false);
+        assert!(!app.picker_searching());
+        assert_eq!(shown(&app), vec!["beta"], "the filter is still in force");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

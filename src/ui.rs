@@ -265,7 +265,7 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             hint: Some(if question.on_other() {
                 "type your answer · Enter send · ↑/↓ choose · Esc dismiss"
             } else {
-                "↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
+                "j/k or ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
             }),
             height,
             header,
@@ -423,7 +423,7 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             title: " rewind to ",
             colour: Color::Yellow,
             body,
-            hint: Some("↑/↓ choose · Enter rewind · Esc cancel"),
+            hint: Some("j/k or ↑/↓ · Enter rewind · Esc cancel"),
             height,
             // The summary row and the blank under it.
             header: 2,
@@ -448,7 +448,10 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         let (rows, owners) =
             picker_rows(picker, &matches, app.picker_index(), visible, inner_width);
 
-        let mut body = vec![query_row(&picker.query, inner_width), Line::default()];
+        let mut body = vec![
+            query_row(&picker.query, picker.searching, inner_width),
+            Line::default(),
+        ];
         if matches.is_empty() {
             body.push(Line::from(Span::styled(
                 "  no session matches",
@@ -463,7 +466,11 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             title: " load session ",
             colour: Color::Blue,
             body,
-            hint: Some("type to filter · ↑/↓ choose · Enter load · Esc cancel"),
+            hint: Some(if picker.searching {
+                "typing filters · Enter load · Esc back to the list"
+            } else {
+                "/ search · j/k or ↑/↓ · Enter load · Esc cancel"
+            }),
             height,
             // The query row and the blank under it.
             header: 2,
@@ -509,7 +516,10 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             .saturating_sub(visible.saturating_sub(1))
             .min(matches.len().saturating_sub(visible));
 
-        let mut body = vec![query_row(&picker.query, inner_width), Line::default()];
+        let mut body = vec![
+            query_row(&picker.query, picker.searching, inner_width),
+            Line::default(),
+        ];
         match placeholder {
             Some(lines) => body.extend(lines),
             None => body.extend(model_rows(&matches, selected, offset, visible, inner_width)),
@@ -520,7 +530,11 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             title: " choose a model ",
             colour: Color::Blue,
             body,
-            hint: Some("type to filter · ↑/↓ choose · Enter select · Esc cancel"),
+            hint: Some(if picker.searching {
+                "typing filters · Enter select · Esc back to the list"
+            } else {
+                "/ search · j/k or ↑/↓ · Enter select · Esc cancel"
+            }),
             height,
             // The query row and the blank under it.
             header: 2,
@@ -603,7 +617,9 @@ fn draw_prepared_panel(
             metrics.picker_rows = owners;
             // The cursor sits in the query row above the list, the same as the
             // model picker's — see the `Models` arm below.
-            if let Some(picker) = app.picker() {
+            // Only while searching: a cursor in a row nobody is typing into
+            // points at the wrong thing.
+            if let Some(picker) = app.picker().filter(|p| p.searching) {
                 let col = picker
                     .query
                     .layout(content.width.saturating_sub(2))
@@ -618,7 +634,7 @@ fn draw_prepared_panel(
             // The cursor lives in the query row, which sits in the header above
             // the list — the same trick the question panel uses for its
             // free-text row, so typing here reads as typing at the prompt.
-            if let Some(picker) = app.model_picker() {
+            if let Some(picker) = app.model_picker().filter(|p| p.searching) {
                 let col = picker
                     .query
                     .layout(content.width.saturating_sub(2))
@@ -815,19 +831,34 @@ fn question_rows(
 /// The terminal cursor sits in this row (see [`draw_prepared_panel`]), so it
 /// reads as the prompt with a list under it rather than a box with a search
 /// field bolted on.
-fn query_row(query: &crate::input::Input, width: usize) -> Line<'static> {
+fn query_row(query: &crate::input::Input, searching: bool, width: usize) -> Line<'static> {
     let text = query.text();
-    if text.is_empty() {
-        Line::from(Span::styled(
-            "  type to filter…",
-            Style::default().fg(Color::DarkGray),
-        ))
-    } else {
-        Line::from(Span::styled(
-            format!("  {}", truncate(text, width.saturating_sub(2))),
-            Style::default().add_modifier(Modifier::BOLD),
-        ))
+    let dim = Style::default().fg(Color::DarkGray);
+    // The `/` is shown while searching, the way a pager shows it, so the row
+    // says which mode the keyboard is in rather than leaving it to be discovered
+    // by pressing a letter and watching what happens.
+    if searching {
+        return Line::from(vec![
+            Span::styled("  /", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate(text, width.saturating_sub(3)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]);
     }
+    if text.is_empty() {
+        return Line::from(Span::styled("  / to search", dim));
+    }
+    // A filter still in force while navigating: shown, so a list that is short
+    // for a reason does not look like a list that is short.
+    Line::from(vec![
+        Span::styled("  /", dim),
+        Span::styled(
+            truncate(text, width.saturating_sub(3)),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled("  · / to edit", dim),
+    ])
 }
 
 /// One row per visible rewind point: the prompt, and what that turn changed.
@@ -2284,7 +2315,7 @@ pub fn draw_sessions(
     frame.render_widget(Paragraph::new(Text::from(lines)), list);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "n new · Enter switch · x shut down · Esc close",
+            "j/k move · Enter switch · n new · x shut down · Esc close",
             Style::default().fg(Color::DarkGray),
         ))),
         footer,
@@ -2453,13 +2484,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize
     } else if app.executing().is_some() {
         "  ←/→ choose · Enter confirm · Esc keep planning"
     } else if app.question().is_some() {
-        "  ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
+        "  j/k or ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
     } else if app.picker().is_some() {
         // The picker coexists with `Idle`, so without this the bar offers to
         // send a prompt while the panel below it is asking you to choose.
-        "  type to filter · ↑/↓ choose · Enter load · Esc cancel"
+        if app.picker_searching() {
+            "  typing filters · Enter load · Esc back to the list"
+        } else {
+            "  / search · j/k or ↑/↓ · Enter load · Esc cancel"
+        }
     } else if app.model_picker().is_some() {
-        "  type to filter · ↑/↓ choose · Enter select · Esc cancel"
+        if app.model_searching() {
+            "  typing filters · Enter select · Esc back to the list"
+        } else {
+            "  / search · j/k or ↑/↓ · Enter select · Esc cancel"
+        }
     } else if matches!(
         app.status,
         Status::Waiting | Status::Streaming | Status::Running | Status::Compacting
@@ -4819,9 +4858,13 @@ mod tests {
     fn picker_shows_the_query_and_narrows_to_it() {
         let (mut app, dir) = app_with_picker(&["alpha", "beta", "gamma"]);
         let (rows, _) = render(&mut app, 60, 20);
+        // Below the panel's top edge, so this is the query row rather than the
+        // status bar — which says something similar and would otherwise let
+        // this pass without the row being drawn at all.
+        let top = panel_top(&rows, "load session");
         assert!(
-            rows.join("\n").contains("type to filter"),
-            "an empty query must invite typing:\n{}",
+            rows[top..].join("\n").contains("/ to search"),
+            "an empty query must say how to start one:\n{}",
             rows.join("\n")
         );
 
@@ -4833,6 +4876,46 @@ mod tests {
         assert!(!screen.contains("alpha"), "filtered out:\n{screen}");
         assert!(!screen.contains("gamma"), "filtered out:\n{screen}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The row has to say which mode the keyboard is in, or you find out by
+    /// pressing a letter and watching what happens.
+    #[test]
+    fn the_query_row_says_whether_it_is_taking_keystrokes() {
+        let (mut app, dir) = app_with_picker(&["alpha", "beta"]);
+        let (rows, _) = render(&mut app, 60, 20);
+        let top = panel_top(&rows, "load session");
+        assert!(rows[top..].join("\n").contains("/ to search"));
+        assert!(
+            rows.join("\n").contains("/ search"),
+            "and so does the footer:\n{}",
+            rows.join("\n")
+        );
+
+        app.picker_search(true);
+        app.picker_query_input(|input| input.insert_str("bet"));
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = rows[panel_top(&rows, "load session")..].join("\n");
+        assert!(
+            screen.contains("/bet"),
+            "the search shows its own `/`:\n{screen}"
+        );
+        assert!(
+            rows.join("\n").contains("typing filters"),
+            "and the footer changes with it:\n{}",
+            rows.join("\n")
+        );
+
+        // Back to navigating: the filter stays, and the row says it is still on.
+        app.picker_search(false);
+        let (rows, _) = render(&mut app, 60, 20);
+        let screen = rows[panel_top(&rows, "load session")..].join("\n");
+        assert!(
+            screen.contains("/bet"),
+            "a filter in force is shown:\n{screen}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(screen.contains("beta") && !screen.contains("alpha"));
     }
 
     #[test]
