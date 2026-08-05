@@ -16,6 +16,7 @@ mod protocol;
 mod sandbox;
 mod search;
 mod session;
+mod sessions;
 mod tui;
 mod ui;
 mod wrap;
@@ -39,6 +40,7 @@ use fetch::{FetchOutcome, Fetcher};
 use openrouter::{Client, Completion, Message};
 use protocol::Action;
 use sandbox::Sandbox;
+use sessions::{InFlight, Sessions};
 
 /// Spinner animation rate. Only paced the spinner: an idle harness has nothing
 /// to animate, so a tick that finds nothing running redraws nothing.
@@ -77,20 +79,13 @@ enum Update {
 /// An [`Update`] tagged with the generation of the task that produced it, so a
 /// cancelled task's still-queued updates can be recognised as stale and dropped.
 struct Tagged {
+    /// Which session asked for this. Sessions run at the same time and share one
+    /// channel, so an update has to say where it belongs before the generation
+    /// check below can mean anything — a generation is only unique within a
+    /// session.
+    session: u64,
     generation: u64,
     update: Update,
-}
-
-/// A handle to the current in-flight task. Dropping or sending on `cancel`
-/// resolves the task's cancel future, stopping its work cleanly.
-struct InFlight {
-    cancel: oneshot::Sender<()>,
-}
-
-impl InFlight {
-    fn new(cancel: oneshot::Sender<()>) -> Self {
-        Self { cancel }
-    }
 }
 
 /// Shared context the event handlers need to start new background work.
@@ -175,13 +170,11 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         tx,
     };
     spawn_catalog_fetch(&ctx);
-    // The current in-flight task, if any, so `Esc` can cancel it.
-    let mut inflight: Option<InFlight> = None;
+    // Every conversation, its background work, and its rendering. Starts as one,
+    // which is how the harness has always started; `Ctrl+T` opens more.
+    let mut sessions = Sessions::new(app);
     let mut ticker = tokio::time::interval(TICK);
     let mut metrics = ui::Metrics::default();
-    // Lives across frames on purpose: it is what keeps a long conversation from
-    // being re-rendered from the beginning every time anything happens.
-    let mut cache = ui::TranscriptCache::default();
 
     // Nothing has been drawn yet, so the first pass through always draws.
     let mut dirty = true;
@@ -192,17 +185,33 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         // running changes nothing on screen, and a burst of stream deltas is
         // one visible change, not thirty.
         if dirty {
-            terminal.draw(|frame| metrics = ui::draw(frame, &mut app, &mut cache))?;
+            // The sessions view is a screen of its own rather than a panel in
+            // the prompt's slot: it is about the harness, not about any one
+            // conversation, and nothing in it belongs beside a transcript.
+            if sessions.view_open() {
+                let rows = sessions.rows();
+                let view = sessions.view().cloned().unwrap_or_default();
+                let tick = sessions.app().tick;
+                terminal.draw(|frame| metrics = ui::draw_sessions(frame, &view, &rows, tick))?;
+            } else {
+                let counts = (sessions.len(), sessions.blocked());
+                let slot = sessions.current_mut();
+                terminal.draw(|frame| {
+                    metrics = ui::draw(frame, &mut slot.app, &mut slot.cache, counts)
+                })?;
+            }
             dirty = false;
         }
 
         tokio::select! {
-            // Terminal input.
+            // Terminal input. Always goes to the focused session, or to the view
+            // when it is open — one screen has the keyboard at a time.
             Some(event) = events.next() => {
                 match event {
-                    Ok(event) => handle_event(event, &mut app, &ctx, &mut inflight, &metrics),
+                    Ok(event) => handle_event(event, &mut sessions, &ctx, &metrics),
                     // A read error means the terminal is gone; exit rather than spin.
                     Err(err) => {
+                        let app = sessions.app_mut();
                         app.push_error(format!("terminal input error: {err}"));
                         app.should_quit = true;
                     }
@@ -210,29 +219,32 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                 // A key can park a compaction — `/compact`, or a prompt whose
                 // turn ends over the threshold. Both converge here rather than
                 // in each handler, so there is one place that starts one.
-                pump_compaction(&mut app, &ctx, &mut inflight);
+                let slot = sessions.current_mut();
+                pump_compaction(slot.id, &mut slot.app, &ctx, &mut slot.inflight);
+                // `/sessions` parks a request rather than opening the view, for
+                // the reason given where it is parked.
+                if sessions.app_mut().take_sessions_request() {
+                    sessions.open_view();
+                }
                 dirty = true;
             }
 
-            // Background work finished.
+            // Background work finished — in any session, not just this one.
             Some(tagged) = rx.recv() => {
-                handle_update(tagged, &mut app, &ctx, &mut inflight);
-                pump_compaction(&mut app, &ctx, &mut inflight);
+                route_update(tagged, &mut sessions, &ctx);
                 dirty = true;
             }
 
             // Animate the spinner while we wait. An idle harness has nothing to
             // animate, so this is the one wake-up that can leave the screen
-            // alone — which is what keeps an idle session off the CPU.
+            // alone — which is what keeps an idle session off the CPU. Any
+            // session being busy is enough: a spinner in the view has to keep
+            // moving for work you are not watching.
             _ = ticker.tick() => {
-                if matches!(
-                    app.status,
-                    app::Status::Waiting
-                        | app::Status::Streaming
-                        | app::Status::Running
-                        | app::Status::Compacting
-                ) {
-                    app.tick = app.tick.wrapping_add(1);
+                if sessions.any_busy() {
+                    for slot in sessions.iter_mut() {
+                        slot.app.tick = slot.app.tick.wrapping_add(1);
+                    }
                     dirty = true;
                 }
             }
@@ -242,30 +254,67 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         // and command output arrive far faster than a person can read them, and
         // rendering each one in turn is what made a fast reply feel slow.
         while let Ok(tagged) = rx.try_recv() {
-            handle_update(tagged, &mut app, &ctx, &mut inflight);
+            route_update(tagged, &mut sessions, &ctx);
         }
 
-        // Persist a completed turn. A cheap no-op unless the conversation just
-        // changed and settled back to idle, so it runs after replies, cancels,
-        // errors, and loads alike.
-        app.maybe_autosave();
+        // Persist a completed turn, in every session. A cheap no-op unless a
+        // conversation just changed and settled back to idle — and a background
+        // session settling is exactly a case the focused one cannot cover.
+        for slot in sessions.iter_mut() {
+            slot.app.maybe_autosave();
+        }
 
-        if app.should_quit {
+        if sessions.app().should_quit {
+            // Leaving takes every session with it, so nothing in flight is left
+            // running and nothing unsaved is left behind.
+            for slot in sessions.iter_mut() {
+                if let Some(inflight) = slot.inflight.take() {
+                    let _ = inflight.cancel.send(());
+                }
+                slot.app.cancel();
+                slot.app.maybe_autosave();
+            }
             return Ok(());
         }
     }
 }
 
-fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
-    // Drop anything from a task the user has since cancelled or superseded. The
-    // catalog is exempt: it is fetched once at startup and belongs to no turn,
-    // so whatever the user did while it was in flight, it is still the catalog.
-    if !matches!(tagged.update, Update::Models(_)) && tagged.generation != app.generation() {
+/// Deliver an update to the session that asked for it.
+///
+/// Two stale checks, in order, because there are now two ways to be stale. An id
+/// that matches no session means it was shut down while its work was in flight,
+/// and there is nothing left to apply the result to. Within a live session, the
+/// generation check is the one that has always been here: a task the user
+/// cancelled or superseded. The generation alone would not do — it is unique
+/// within a session, not across them.
+fn route_update(tagged: Tagged, sessions: &mut Sessions, ctx: &Ctx) {
+    // The catalog belongs to no session. It is fetched once at startup, so
+    // whatever anyone did while it was in flight, it is still the catalog — and
+    // it goes to every session, including ones opened after it landed.
+    if let Update::Models(result) = tagged.update {
+        return sessions.set_catalog(result);
+    }
+    let Some(slot) = sessions.route(tagged.session) else {
+        return;
+    };
+    if tagged.generation != slot.app.generation() {
         return;
     }
+    let id = slot.id;
+    handle_update(tagged, id, &mut slot.app, ctx, &mut slot.inflight);
+    pump_compaction(id, &mut slot.app, ctx, &mut slot.inflight);
+}
 
+fn handle_update(
+    tagged: Tagged,
+    id: u64,
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+) {
     match tagged.update {
-        Update::Models(result) => app.set_catalog(result),
+        // Routed away above; the arm exists to keep the match exhaustive.
+        Update::Models(_) => {}
         // Live tokens accumulate in the display-only streaming buffer.
         Update::Delta(delta) => app.push_delta(&delta),
         Update::Reasoning(delta) => app.push_reasoning(&delta),
@@ -277,14 +326,14 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
             app.mark_request_done();
             app.finish_stream();
             match app.push_response(completion.content, completion.usage) {
-                Some(messages) => spawn_request(app, ctx, inflight, messages),
+                Some(messages) => spawn_request(id, app, ctx, inflight, messages),
                 // An auto-approved fetch is parked rather than returned, since
                 // it is background work the app layer cannot start itself.
                 None => {
                     if let Some(url) = app.take_pending_fetch() {
-                        spawn_fetch(app, ctx, inflight, url);
+                        spawn_fetch(id, app, ctx, inflight, url);
                     } else if let Some(request) = app.take_pending_search() {
-                        spawn_search(app, ctx, inflight, request);
+                        spawn_search(id, app, ctx, inflight, request);
                     // Under `--auto-approve` the modal is skipped: the app still
                     // parked a `Pending` exactly as it always does, and the
                     // decision to act on it is made here. `else if` rather than a
@@ -295,7 +344,7 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
                     // This runs before the loop returns to `terminal.draw`, so
                     // there is no frame in which the modal is visible.
                     } else if app.auto_approve && app.pending().is_some() {
-                        allow(app, ctx, inflight);
+                        allow(id, app, ctx, inflight);
                     }
                 }
             }
@@ -315,7 +364,7 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
         Update::Command(Ok(output)) => {
             *inflight = None;
             let messages = app.push_command_result(output);
-            spawn_request(app, ctx, inflight, messages);
+            spawn_request(id, app, ctx, inflight, messages);
         }
         Update::Command(Err(message)) => {
             *inflight = None;
@@ -325,7 +374,7 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
         Update::Write(Ok(outcome)) => {
             *inflight = None;
             let messages = app.push_write_result(outcome);
-            spawn_request(app, ctx, inflight, messages);
+            spawn_request(id, app, ctx, inflight, messages);
         }
         Update::Write(Err(message)) => {
             *inflight = None;
@@ -336,14 +385,14 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
         Update::Fetch(outcome) => {
             *inflight = None;
             let messages = app.push_fetch_result(*outcome);
-            spawn_request(app, ctx, inflight, messages);
+            spawn_request(id, app, ctx, inflight, messages);
         }
         // A search does the same: a bad pattern or an unreachable directory is
         // an outcome the model can act on, not a failed turn.
         Update::Search(outcome) => {
             *inflight = None;
             let messages = app.push_search_result(*outcome);
-            spawn_request(app, ctx, inflight, messages);
+            spawn_request(id, app, ctx, inflight, messages);
         }
         // A summary either shortens the conversation or fails trying; both end
         // with a shorter history, and the overflow path resends on the spot.
@@ -352,14 +401,91 @@ fn handle_update(tagged: Tagged, app: &mut App, ctx: &Ctx, inflight: &mut Option
             app.mark_request_done();
             let (job, result) = *payload;
             if let Some(messages) = app.apply_summary(job, result) {
-                spawn_request(app, ctx, inflight, messages);
+                spawn_request(id, app, ctx, inflight, messages);
             }
         }
     }
 }
 
-fn handle_event(
+/// Route input to whichever screen has the keyboard.
+///
+/// The sessions view takes it whole while it is open — it is a screen, not a
+/// panel, and nothing behind it should be typed into by accident. Otherwise the
+/// focused session gets it, exactly as it did when there was only one.
+fn handle_event(event: Event, sessions: &mut Sessions, ctx: &Ctx, metrics: &ui::Metrics) {
+    if sessions.view_open() {
+        return handle_sessions_event(event, sessions, metrics);
+    }
+    // Opening the view is the one key that belongs to the harness rather than to
+    // a conversation, so it is checked before the session sees anything.
+    if let Event::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('t')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return sessions.open_view();
+    }
+    let slot = sessions.current_mut();
+    handle_session_event(
+        event,
+        slot.id,
+        &mut slot.app,
+        ctx,
+        &mut slot.inflight,
+        metrics,
+    );
+}
+
+/// Keys and clicks while the sessions view is up.
+fn handle_sessions_event(event: Event, sessions: &mut Sessions, metrics: &ui::Metrics) {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Up => sessions.view_move(-1),
+                KeyCode::Down => sessions.view_move(1),
+                KeyCode::Enter => sessions.view_confirm(),
+                KeyCode::Char('n') if !ctrl => sessions.view_spawn(),
+                KeyCode::Char('x') if !ctrl => sessions.view_close_selected(),
+                KeyCode::Esc | KeyCode::Char('t') if ctrl || key.code == KeyCode::Esc => {
+                    sessions.close_view()
+                }
+                // Ctrl+C still quits from here, as it does everywhere.
+                KeyCode::Char('c') if ctrl => sessions.app_mut().should_quit = true,
+                _ => {}
+            }
+        }
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(i) = owned_row_at(
+                    metrics.sessions_list,
+                    &metrics.sessions_rows,
+                    mouse.column,
+                    mouse.row,
+                ) && sessions.view_select(i)
+                {
+                    sessions.view_confirm();
+                }
+            }
+            MouseEventKind::Moved => {
+                if let Some(i) = owned_row_at(
+                    metrics.sessions_list,
+                    &metrics.sessions_rows,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    sessions.view_select(i);
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn handle_session_event(
     event: Event,
+    id: u64,
     app: &mut App,
     ctx: &Ctx,
     inflight: &mut Option<InFlight>,
@@ -367,22 +493,22 @@ fn handle_event(
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            handle_key(key, app, ctx, inflight, metrics)
+            handle_key(key, id, app, ctx, inflight, metrics)
         }
         Event::Mouse(mouse) => match mouse.kind {
             // Clicking a modal button is equivalent to confirming it.
             MouseEventKind::Down(MouseButton::Left) if app.pending().is_some() => {
                 if ui::hit(metrics.allow_button, mouse.column, mouse.row) {
-                    allow(app, ctx, inflight);
+                    allow(id, app, ctx, inflight);
                 } else if ui::hit(metrics.deny_button, mouse.column, mouse.row) {
-                    deny(app, ctx, inflight);
+                    deny(id, app, ctx, inflight);
                 }
             }
             // The execute panel shares the approval panel's footer, so it shares
             // the button rects too; only what they do differs.
             MouseEventKind::Down(MouseButton::Left) if app.executing().is_some() => {
                 if ui::hit(metrics.allow_button, mouse.column, mouse.row) {
-                    execute_plan(app, ctx, inflight);
+                    execute_plan(id, app, ctx, inflight);
                 } else if ui::hit(metrics.deny_button, mouse.column, mouse.row) {
                     app.keep_planning();
                 }
@@ -417,7 +543,7 @@ fn handle_event(
                 ) && app.question_select(i)
                     && let Some(messages) = app.answer_question()
                 {
-                    spawn_request(app, ctx, inflight, messages);
+                    spawn_request(id, app, ctx, inflight, messages);
                 }
             }
             MouseEventKind::Moved if app.question().is_some() => {
@@ -521,11 +647,22 @@ fn handle_event(
 /// its preview lines, and a gap — so the row a click lands on has to be looked
 /// up rather than derived by adding a scroll offset.
 fn picker_row_at(metrics: &ui::Metrics, column: u16, row: u16) -> Option<usize> {
-    let list = metrics.picker_list?;
+    owned_row_at(metrics.picker_list, &metrics.picker_rows, column, row)
+}
+
+/// The same, for any list whose entries span several rows and so report which
+/// entry each row belongs to: the `/load` picker and the sessions view.
+fn owned_row_at(
+    list: Option<ratatui::layout::Rect>,
+    owners: &[usize],
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let list = list?;
     if !ui::hit(Some(list), column, row) {
         return None;
     }
-    metrics.picker_rows.get((row - list.y) as usize).copied()
+    owners.get((row - list.y) as usize).copied()
 }
 
 /// Which list row a mouse position falls on, using the geometry from the last
@@ -547,7 +684,7 @@ fn row_at(
 }
 
 /// Approve the pending action and start running it — a shell command or a write.
-fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+fn allow(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     let Some(action) = app.approve() else { return };
 
     // A read needs no subprocess, so it is done inline and the loop continues
@@ -560,13 +697,13 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
             limit,
         } => {
             let messages = app.perform_read(&path, offset, limit);
-            spawn_request(app, ctx, inflight, messages);
+            spawn_request(id, app, ctx, inflight, messages);
             return;
         }
         // Only reachable under `--confirm-fetch`; otherwise the dispatch parks
         // the fetch rather than making it pending.
         Action::Fetch { url } => {
-            spawn_fetch(app, ctx, inflight, url);
+            spawn_fetch(id, app, ctx, inflight, url);
             return;
         }
         // Only reachable under `--confirm-reads`, like a read — but unlike one,
@@ -574,6 +711,7 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
         // work and would stall the event loop.
         Action::Grep { pattern, dir, glob } => {
             spawn_search(
+                id,
                 app,
                 ctx,
                 inflight,
@@ -588,6 +726,7 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
         }
         Action::Glob { pattern, dir } => {
             spawn_search(
+                id,
                 app,
                 ctx,
                 inflight,
@@ -606,7 +745,7 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     // A shell command is watched while it runs; a write is not, being a single
     // atomic act with nothing to show in progress.
     if let Action::Shell(command) = action {
-        spawn_shell(app, ctx, inflight, command);
+        spawn_shell(id, app, ctx, inflight, command);
         return;
     }
 
@@ -641,7 +780,13 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
             | Action::Options { .. }
             | Action::Response(_) => return,
         };
-        let _ = tx.send(Tagged { generation, update }).await;
+        let _ = tx
+            .send(Tagged {
+                session: id,
+                generation,
+                update,
+            })
+            .await;
     });
     *inflight = Some(InFlight::new(cancel_tx));
 }
@@ -652,7 +797,13 @@ fn allow(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
 /// window. The forwarder relays them onto the single `Tagged` channel the event
 /// loop drains, so live output is generation-tagged and dropped on cancel exactly
 /// like every other update.
-fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, command: String) {
+fn spawn_shell(
+    id: u64,
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    command: String,
+) {
     let generation = app.next_generation();
     app.start_running(command.clone());
 
@@ -672,6 +823,7 @@ fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, comman
                 while let Some(chunk) = chunk_rx.recv().await {
                     let _ = tx
                         .send(Tagged {
+                            session: id,
                             generation,
                             update: Update::CommandChunk(chunk),
                         })
@@ -686,6 +838,7 @@ fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, comman
         );
         let _ = tx
             .send(Tagged {
+                session: id,
                 generation,
                 update: Update::Command(result.map_err(|e| format!("{e:#}"))),
             })
@@ -695,9 +848,9 @@ fn spawn_shell(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, comman
 }
 
 /// Refuse the pending command and let the model know.
-fn deny(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+fn deny(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     if let Some(messages) = app.deny() {
-        spawn_request(app, ctx, inflight, messages);
+        spawn_request(id, app, ctx, inflight, messages);
     }
 }
 
@@ -715,14 +868,15 @@ fn action_sandbox(app: &App, ctx: &Ctx) -> Sandbox {
 }
 
 /// Accept a finished plan: leave plan mode and start the work.
-fn execute_plan(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+fn execute_plan(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     if let Some(messages) = app.execute_plan() {
-        spawn_request(app, ctx, inflight, messages);
+        spawn_request(id, app, ctx, inflight, messages);
     }
 }
 
 fn handle_key(
     key: KeyEvent,
+    id: u64,
     app: &mut App,
     ctx: &Ctx,
     inflight: &mut Option<InFlight>,
@@ -746,11 +900,11 @@ fn handle_key(
     if app.pending().is_some() {
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
-            KeyCode::Char('y') | KeyCode::Char('Y') => allow(app, ctx, inflight),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => deny(app, ctx, inflight),
+            KeyCode::Char('y') | KeyCode::Char('Y') => allow(id, app, ctx, inflight),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => deny(id, app, ctx, inflight),
             KeyCode::Enter => match app.pending().map(|p| p.selected) {
-                Some(Choice::Allow) => allow(app, ctx, inflight),
-                Some(Choice::Deny) => deny(app, ctx, inflight),
+                Some(Choice::Allow) => allow(id, app, ctx, inflight),
+                Some(Choice::Deny) => deny(id, app, ctx, inflight),
                 None => {}
             },
             KeyCode::PageUp => app.scroll_up(page),
@@ -767,7 +921,7 @@ fn handle_key(
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_choice(),
             KeyCode::Enter => match app.executing() {
-                Some(Choice::Allow) => execute_plan(app, ctx, inflight),
+                Some(Choice::Allow) => execute_plan(id, app, ctx, inflight),
                 _ => app.keep_planning(),
             },
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.keep_planning(),
@@ -808,12 +962,12 @@ fn handle_key(
             KeyCode::BackTab => app.question_move(-1),
             KeyCode::Esc => {
                 if let Some(messages) = app.decline_question() {
-                    spawn_request(app, ctx, inflight, messages);
+                    spawn_request(id, app, ctx, inflight, messages);
                 }
             }
             KeyCode::Enter => {
                 if let Some(messages) = app.answer_question() {
-                    spawn_request(app, ctx, inflight, messages);
+                    spawn_request(id, app, ctx, inflight, messages);
                 }
             }
             // A digit picks a choice outright — one keypress is the point of
@@ -993,7 +1147,7 @@ fn handle_key(
             // does not need completing first.
             app.accept_completion();
             if let Some(messages) = app.submit() {
-                spawn_request(app, ctx, inflight, messages);
+                spawn_request(id, app, ctx, inflight, messages);
             }
         }
 
@@ -1043,7 +1197,7 @@ fn handle_key(
 /// Shared by the automatic path and the `--confirm-fetch` approval path. Unlike
 /// a read this cannot run inline: it is network I/O, so it needs the same
 /// generation tagging and cancel signal a command gets.
-fn spawn_fetch(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: String) {
+fn spawn_fetch(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: String) {
     let generation = app.next_generation();
     let fetcher = ctx.fetcher.clone();
     let tx = ctx.tx.clone();
@@ -1055,6 +1209,7 @@ fn spawn_fetch(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: S
         let outcome = fetcher.fetch(&url, cancel).await;
         let _ = tx
             .send(Tagged {
+                session: id,
                 generation,
                 update: Update::Fetch(Box::new(outcome)),
             })
@@ -1076,6 +1231,7 @@ fn spawn_fetch(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, url: S
 /// entry. Even if it finished first, the generation tag would see the result
 /// dropped as stale.
 fn spawn_search(
+    id: u64,
     app: &mut App,
     ctx: &Ctx,
     inflight: &mut Option<InFlight>,
@@ -1105,6 +1261,7 @@ fn spawn_search(
         };
         let _ = tx
             .send(Tagged {
+                session: id,
                 generation,
                 update: Update::Search(Box::new(outcome)),
             })
@@ -1123,7 +1280,13 @@ fn spawn_search(
 /// selects over the whole request. The job travels with the update because
 /// nothing has been applied yet: dropping it on cancel is what makes a
 /// cancelled compaction a no-op.
-fn spawn_summary(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, job: compact::Job) {
+fn spawn_summary(
+    id: u64,
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    job: compact::Job,
+) {
     let generation = app.next_generation();
     app.mark_request_sent();
     let client = ctx.client.with_model(&app.model);
@@ -1137,6 +1300,7 @@ fn spawn_summary(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, job:
         };
         let _ = tx
             .send(Tagged {
+                session: id,
                 generation,
                 update: Update::Summary(Box::new((job, result))),
             })
@@ -1151,9 +1315,9 @@ fn spawn_summary(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>, job:
 /// compaction can be parked by several different paths — the end-of-turn
 /// trigger, an overflow, `/compact` — and every one of them should reach the
 /// single place allowed to start a request.
-fn pump_compaction(app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+fn pump_compaction(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     if let Some(job) = app.take_pending_compaction() {
-        spawn_summary(app, ctx, inflight, job);
+        spawn_summary(id, app, ctx, inflight, job);
     }
 }
 
@@ -1170,6 +1334,9 @@ fn spawn_catalog_fetch(ctx: &Ctx) {
         let result = client.list_models().await.map_err(|e| format!("{e:#}"));
         let _ = tx
             .send(Tagged {
+                // Belongs to no session, and is routed away before either
+                // staleness check; the ids are placeholders.
+                session: 0,
                 generation: 0,
                 update: Update::Models(result),
             })
@@ -1178,6 +1345,7 @@ fn spawn_catalog_fetch(ctx: &Ctx) {
 }
 
 fn spawn_request(
+    id: u64,
     app: &mut App,
     ctx: &Ctx,
     inflight: &mut Option<InFlight>,
@@ -1196,7 +1364,7 @@ fn spawn_request(
         };
         // A send failure just means the UI shut down; stop forwarding if so.
         let end = match client.open_stream(&messages).await {
-            Ok(stream) => stream_reply(stream, &tx, generation, cancel).await,
+            Ok(stream) => stream_reply(stream, &tx, id, generation, cancel).await,
             Err(e) => Some(Err(format!("{e:#}"))),
         };
         // On cancel `end` is None, so we send nothing — the app has already
@@ -1204,6 +1372,7 @@ fn spawn_request(
         if let Some(end) = end {
             let _ = tx
                 .send(Tagged {
+                    session: id,
                     generation,
                     update: Update::ReplyEnd(end),
                 })
@@ -1220,6 +1389,7 @@ fn spawn_request(
 async fn stream_reply(
     stream: impl futures_util::Stream<Item = anyhow::Result<openrouter::StreamEvent>>,
     tx: &mpsc::Sender<Tagged>,
+    session: u64,
     generation: u64,
     cancel: impl std::future::Future<Output = ()>,
 ) -> Option<Result<Completion, String>> {
@@ -1240,7 +1410,7 @@ async fn stream_reply(
                     // `send().await` back-pressures the HTTP read, so tokens are
                     // never dropped when the UI falls behind.
                     if tx
-                        .send(Tagged { generation, update: Update::Delta(delta) })
+                        .send(Tagged { session, generation, update: Update::Delta(delta) })
                         .await
                         .is_err()
                     {
@@ -1252,7 +1422,7 @@ async fn stream_reply(
                 // the protocol parses and the conversation keeps.
                 Some(Ok(StreamEvent::Reasoning(delta))) => {
                     if tx
-                        .send(Tagged { generation, update: Update::Reasoning(delta) })
+                        .send(Tagged { session, generation, update: Update::Reasoning(delta) })
                         .await
                         .is_err()
                     {

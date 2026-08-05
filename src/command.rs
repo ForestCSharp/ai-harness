@@ -17,6 +17,8 @@ pub enum Command {
     Undo,
     /// Choose how far back to undo, from a list of the conversation.
     Rewind,
+    /// Open the sessions view, the same as `Ctrl+T`.
+    Sessions,
     /// List checkpoints; `Some` sets how many turns to keep.
     Checkpoints(Option<String>),
     /// Toggle plan mode. `Some` carries the task to start planning immediately.
@@ -79,6 +81,7 @@ pub fn parse(input: &str) -> Input {
         "reasoning" | "thinking" => Command::Reasoning,
         "undo" => Command::Undo,
         "rewind" => Command::Rewind,
+        "sessions" => Command::Sessions,
         "checkpoints" | "checkpoint" => Command::Checkpoints(arg),
         "plan" => Command::Plan(arg),
         "help" | "h" | "?" => Command::Help,
@@ -143,6 +146,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "checkpoints",
         description: "list what can be undone (/checkpoints <n> keeps only the last n)",
+    },
+    Spec {
+        name: "sessions",
+        description: "switch between running sessions, or start one (also Ctrl+T)",
     },
     Spec {
         name: "save",

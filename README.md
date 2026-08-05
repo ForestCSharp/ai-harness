@@ -266,6 +266,7 @@ Commands are handled locally and never sent to the model.
 | `/compact` | Summarise the older part of the conversation to free context (see [Context compaction](#context-compaction)) |
 | `/undo` | Put back the files the last changing turn touched (see [Checkpoints and undo](#checkpoints-and-undo)) |
 | `/rewind` | Choose how far back to undo, from a list of the conversation |
+| `/sessions` | Switch between running sessions, or start one (also `Ctrl+T`) |
 | `/checkpoints [n]` | List what can be undone; with a number, keep only the last `n` turns |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -421,6 +422,70 @@ It is bounded by `--max-turn-bytes` as well, because round-trips are the wrong
 unit for the damage a few whole-file reads can do: a handful of them can crowd
 out the context window well inside the round-trip budget.
 
+## Sessions
+
+`Ctrl+T` — or `/sessions` — opens a list of every conversation the harness is
+running:
+
+```
+┌ sessions ──────────────────────────────────────────────────────────
+│  ⠋ session-1785873241        streaming  deepseek/deepseek-v4-pro  12 turns
+│      you: add a checkpoint module
+│      write src/checkpoint.rs
+│      cargo test 2>&1 | tail -20
+│
+│    session-1785873999 ‹current›   ready  z-ai/glm-5.2              3 turns
+│      you: why is retire_superseded_reads keyed on the range?
+│      Because keying on the path alone would retire a read of a diff…
+│
+│› ! session-1785874100        needs you  deepseek/deepseek-v4-pro   7 turns
+│      you: clean up the tmp directory
+│      rm -rf tmp/*
+│
+│n new · Enter switch · x shut down · Esc close
+└────────────────────────────────────────────────────────────────────
+```
+
+Each session shows the last few things that happened in it, because which one is
+busy is a column of names but *what with* is the thing you came back for. It
+names actions as well as words: a session three commands into a build has said
+nothing, and showing it blank would be the least useful thing on the screen.
+Whatever is streaming or running this instant goes last, being the newest. It is
+also what makes `!` actionable rather than alarming — the command waiting for
+your approval is right there under the name.
+
+They run **at the same time**. A session you are not looking at keeps streaming
+and keeps running commands, which is the point: you can leave one working through
+something long and go do something else. The spinner in the list is that session
+still going while you are away.
+
+What a background session cannot do is ask you something. An approval belongs to
+a screen, and it is not on screen — so one that proposes a command parks and is
+marked `!`, and the status bar says how many are waiting on you. Under
+auto-approve it carries on instead; that is the difference the setting makes, and
+it is why the setting is per session.
+
+**Settings travel with the conversation.** Auto-approve, `/debug`, `/reasoning`,
+the model and the checkpoint retention all belong to a session, and a new one
+inherits them from the session you spawned it from. So a session spawned from one
+running unattended is also unattended, and one spawned from a careful session
+also asks. Plan mode is the exception and is never inherited: it is a mode you
+are in for a particular piece of work, and a new session is new work.
+
+`x` shuts a session down. It is not destructive and so is not confirmed — the
+conversation is saved on the way out and `/load` brings it back; what is lost is
+a reply that was in flight, which cancelling would have lost anyway. The last
+session cannot be shut down, since a harness with nowhere to type is not a state
+worth having; `/quit` is how you leave.
+
+The list shows sessions that are *running*. Opening a saved one is still `/load`,
+which replaces the conversation you are in rather than opening it beside the
+others.
+
+Two things they share, deliberately: the working directory and the sandbox.
+Nothing isolates one session from another, and the boundary is still the project
+root. **That has a sharp edge with checkpoints** — see the next section.
+
 ## Checkpoints and undo
 
 The sandbox root is what commands are confined *to*, not protected from. An
@@ -485,8 +550,14 @@ sessions cannot interleave their numbering. Nothing is pruned by default;
 That setting is saved with the session, and `--keep-checkpoints` sets it for a
 fresh one.
 
-Three limits, stated rather than hidden:
+Four limits, stated rather than hidden:
 
+- **Checkpoints do not know about other sessions.** [Sessions](#sessions) share
+  one working directory, and a workspace snapshot taken by one captures whatever
+  another has just written — so `/undo` in the first can silently revert the
+  second's work. Two sessions editing the same files at once is asking for
+  trouble, and this is the shape the trouble takes. Two sessions on separate
+  parts of a project are fine.
 - **`.git` is not checkpointed.** It is on the walk's skip list on cost, along
   with `target/` and `node_modules/`. `/undo` restores your working tree; git
   remains the backstop for git's own directory.
@@ -744,6 +815,7 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | `Alt+Enter` | Insert a newline (also `Shift+Enter` on terminals supporting the kitty keyboard protocol) |
 | `Esc` | Interrupt the in-flight reply or running command (while busy) |
 | `↑` / `↓` | Recall previous / next prompt (on an empty prompt) |
+| `Ctrl+T` | Open the sessions view (see [Sessions](#sessions)) |
 | `Ctrl+C` | Quit |
 | `Ctrl+D` | Quit when the prompt is empty |
 | `Ctrl+L` | Clear the conversation (keeps the system prompt) |
@@ -850,6 +922,7 @@ reading while you choose which conversation to be in.
 | `src/markdown.rs` | Markdown subset for rendering model responses |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`) |
+| `src/sessions.rs` | Several sessions at once, and the `Ctrl+T` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
 | `src/ui.rs` | Rendering and layout |

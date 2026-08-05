@@ -266,6 +266,42 @@ impl Question {
     }
 }
 
+/// The first line with anything on it, trimmed. A long answer must not make a
+/// row tall, and its opening line is what says which answer it was.
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+}
+
+/// A short phrase for what an action does, for anywhere one has to be named
+/// rather than shown: what a denial refused, what a session is busy with.
+pub fn action_label(action: &Action) -> String {
+    match action {
+        Action::Shell(command) => command.clone(),
+        Action::Read {
+            path,
+            offset,
+            limit,
+        } => format!("read {}", protocol::read_label(path, *offset, *limit)),
+        Action::Grep { pattern, dir, glob } => format!(
+            "grep {}",
+            protocol::search_label(pattern, dir.as_deref(), glob.as_deref())
+        ),
+        Action::Glob { pattern, dir } => format!(
+            "glob {}",
+            protocol::search_label(pattern, dir.as_deref(), None)
+        ),
+        Action::Fetch { url } => format!("fetch {url}"),
+        Action::Write { path, .. } => format!("write {path}"),
+        Action::Edit { path, .. } => format!("edit {path}"),
+        // A response is the answer rather than a step towards it, and a question
+        // is shown in full where it is asked; neither is ever *refused*.
+        Action::Options { .. } | Action::Response(_) => String::new(),
+    }
+}
+
 /// The `/load` session picker overlay. A UI overlay, not a conversation status:
 /// it coexists with `Status::Idle`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +509,9 @@ pub struct App {
     turn_prompt: String,
     /// The `/rewind` list, when open.
     rewind: Option<Rewind>,
+    /// Whether `/sessions` has asked for the sessions view. Parked for the event
+    /// loop to take, like `pending_fetch` — a session cannot open it itself.
+    sessions_requested: bool,
     /// The checkpoint for this turn, opened by the first mutating action.
     ///
     /// Lazily, because most turns mutate nothing and a folder per question would
@@ -589,7 +628,10 @@ pub struct App {
     /// The `/load` session picker, when open.
     picker: Option<Picker>,
     /// Every model OpenRouter offers, once the startup fetch has landed.
-    pub catalog: Catalog,
+    ///
+    /// Shared between sessions: fetched once at startup, identical for all of
+    /// them, and large enough that a copy per session would be waste.
+    pub catalog: std::sync::Arc<Catalog>,
     /// The `/model` picker, when open.
     models: Option<ModelPicker>,
     /// Directory where `/save` and `/load` read and write session files.
@@ -642,6 +684,7 @@ impl App {
             turn_start_bytes: 0,
             turn_number: 0,
             rewind: None,
+            sessions_requested: false,
             turn_prompt: String::new(),
             checkpoint: None,
             keep_checkpoints: None,
@@ -677,7 +720,7 @@ impl App {
             prompt_history: Vec::new(),
             history_index: None,
             picker: None,
-            catalog: Catalog::Loading,
+            catalog: std::sync::Arc::new(Catalog::Loading),
             models: None,
         }
     }
@@ -919,6 +962,11 @@ impl App {
             }
             Command::Undo => self.begin_undo(),
             Command::Rewind => self.open_rewind(),
+            // Parked rather than acted on: the sessions view is about the
+            // harness, and a session cannot open a list it is only one entry
+            // of. The event loop takes this the same way it takes a parked
+            // fetch or search.
+            Command::Sessions => self.sessions_requested = true,
             Command::Checkpoints(arg) => self.checkpoints_command(arg),
             Command::Reasoning => {
                 self.show_reasoning = !self.show_reasoning;
@@ -1361,12 +1409,126 @@ impl App {
         self.picker = None;
     }
 
+    /// The session this conversation is saved under.
+    pub fn session_name(&self) -> &str {
+        &self.current_session
+    }
+
+    /// The last few things that happened here, oldest first, for the sessions
+    /// view. Empty for a session nothing has happened in yet.
+    ///
+    /// Not [`crate::session::preview`], which reads a *saved* session's prose
+    /// off disk to answer "what was this about". This answers "what is it doing"
+    /// about a running one, so it names actions as well as words — a session
+    /// three commands deep into a build has said nothing, and showing it as
+    /// blank would be the least useful thing on the screen.
+    ///
+    /// Live state goes last, because it is the newest thing: whatever is
+    /// streaming or running right now is what you came to look at.
+    pub fn activity(&self, want: usize) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        // Room for the live line below, so a busy session does not lose all its
+        // history to it.
+        let from_transcript = want.saturating_sub(usize::from(self.is_busy())).max(1);
+
+        for entry in self.transcript.iter().rev() {
+            let text = match entry {
+                Entry::User(text) => format!("you: {}", first_line(text)),
+                Entry::Action { action, .. } => match action {
+                    Action::Response(text) => first_line(text).to_string(),
+                    Action::Options { question, .. } => format!("asks: {}", first_line(question)),
+                    other => action_label(other),
+                },
+                Entry::Denied(what) => format!("denied: {what}"),
+                Entry::Error(text) => format!("error: {}", first_line(text)),
+                // Results, notices and frames are the machinery around what
+                // happened rather than what happened.
+                _ => continue,
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            lines.push(text);
+            if lines.len() == from_transcript {
+                break;
+            }
+        }
+        lines.reverse();
+
+        // What it is doing this instant, if anything.
+        if let Some(running) = &self.running {
+            lines.push(format!("running: {}", running.command));
+        } else if let Some(text) = &self.streaming {
+            let tail = text.lines().rev().find(|l| !l.trim().is_empty());
+            if let Some(tail) = tail {
+                lines.push(tail.trim().to_string());
+            }
+        }
+        lines
+    }
+
+    /// Where this session's folder lives, for anything that needs to know which
+    /// names are already taken.
+    pub fn sessions_dir(&self) -> &std::path::Path {
+        &self.sessions_dir
+    }
+
+    /// A fresh session beside this one: same settings, same workspace, new
+    /// conversation under `name`.
+    ///
+    /// The list of what carries over lives here rather than in `sessions.rs`,
+    /// beside the fields it names — a setting added to `App` and forgotten here
+    /// would silently reset itself every time a session was spawned. What does
+    /// *not* carry over is everything about the conversation: history,
+    /// transcript, ledger, turn count, and the checkpoints keyed to them.
+    pub fn spawn_sibling(&self, name: String) -> Self {
+        let mut fresh = Self::new(
+            self.model.clone(),
+            self.extra_system.clone(),
+            self.max_iterations,
+            self.sessions_dir.clone(),
+        );
+        fresh.current_session = name;
+        fresh.sandbox = self.sandbox.clone();
+        fresh.catalog = self.catalog.clone();
+        fresh.debug = self.debug;
+        fresh.auto_approve = self.auto_approve;
+        fresh.confirm_reads = self.confirm_reads;
+        fresh.confirm_fetches = self.confirm_fetches;
+        fresh.strip_preamble = self.strip_preamble;
+        fresh.show_reasoning = self.show_reasoning;
+        fresh.keep_checkpoints = self.keep_checkpoints;
+        fresh.max_turn_bytes = self.max_turn_bytes;
+        fresh.max_retries = self.max_retries;
+        fresh.compact_at = self.compact_at;
+        fresh.price_in = self.price_in;
+        fresh.price_out = self.price_out;
+        // Plan mode is deliberately not inherited: it is a mode you are in for a
+        // particular piece of work, and a new session is a new piece of work.
+        fresh.refresh_contract();
+        fresh
+    }
+
     /// Record the outcome of the startup catalog fetch.
     pub fn set_catalog(&mut self, result: Result<Vec<ModelInfo>, String>) {
-        self.catalog = match result {
+        self.catalog = std::sync::Arc::new(match result {
             Ok(models) => Catalog::Ready(models),
             Err(e) => Catalog::Failed(e),
-        };
+        });
+    }
+
+    /// Adopt a catalog another session already has.
+    ///
+    /// Shared rather than copied: it is fetched once at startup and is the same
+    /// list for every session, so cloning several hundred `ModelInfo`s per slot
+    /// to say so would be waste.
+    pub fn share_catalog(&mut self, catalog: std::sync::Arc<Catalog>) {
+        self.catalog = catalog;
+    }
+
+    /// This session's handle on the catalog, to hand to a new one.
+    pub fn catalog(&self) -> std::sync::Arc<Catalog> {
+        self.catalog.clone()
     }
 
     /// Open the model picker, with the model in use highlighted.
@@ -2578,30 +2740,7 @@ impl App {
             return None;
         };
         // Show what was refused: the command, or the write's path.
-        let refused = match &pending.action {
-            Action::Shell(command) => command.clone(),
-            Action::Read {
-                path,
-                offset,
-                limit,
-            } => format!("read {}", protocol::read_label(path, *offset, *limit)),
-            Action::Grep { pattern, dir, glob } => format!(
-                "grep {}",
-                protocol::search_label(pattern, dir.as_deref(), glob.as_deref())
-            ),
-            Action::Glob { pattern, dir } => {
-                format!(
-                    "glob {}",
-                    protocol::search_label(pattern, dir.as_deref(), None)
-                )
-            }
-            Action::Fetch { url } => format!("fetch {url}"),
-            Action::Write { path, .. } => format!("write {path}"),
-            Action::Edit { path, .. } => format!("edit {path}"),
-            // Neither is ever approvable: a response ends the turn, and a
-            // question goes to `AwaitingChoice` rather than becoming pending.
-            Action::Options { .. } | Action::Response(_) => String::new(),
-        };
+        let refused = action_label(&pending.action);
         self.transcript.push(Entry::Denied(refused));
         let encoded = protocol::encode_denied();
         self.frame(Direction::Sent, encoded.clone());
@@ -2635,6 +2774,12 @@ impl App {
         self.status = Status::Waiting;
         self.follow = true;
         self.history.clone()
+    }
+
+    /// Take the `/sessions` request, if one was parked. Taking it clears it, so
+    /// the view opens once.
+    pub fn take_sessions_request(&mut self) -> bool {
+        std::mem::take(&mut self.sessions_requested)
     }
 
     /// Take the fetch the dispatch parked, if there is one.
@@ -3672,6 +3817,83 @@ mod tests {
     /// The commonest protocol slip there is: the model narrates, then writes a
     /// perfectly good element. Rejecting that costs a round-trip and a rollback
     /// to arrive back where it started.
+    /// A session three commands into a build has *said* nothing, so prose alone
+    /// would show it as blank — the least useful thing to put on the screen.
+    #[test]
+    fn activity_names_what_a_session_is_doing_not_only_what_it_said() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        assert!(app.activity(3).is_empty(), "nothing has happened yet");
+
+        app.input.insert_str("build the thing");
+        app.submit().unwrap();
+        app.push_response(
+            "<ai-harness-shell>cargo test</ai-harness-shell>".into(),
+            None,
+        );
+
+        let lines = app.activity(3);
+        assert_eq!(lines[0], "you: build the thing");
+        assert!(
+            lines.iter().any(|l| l == "cargo test"),
+            "the action is the activity: {lines:?}"
+        );
+    }
+
+    /// Newest last, and what is happening *now* is newest of all.
+    #[test]
+    fn activity_ends_with_what_is_happening_this_instant() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("go");
+        app.submit().unwrap();
+
+        app.push_delta("I'll start by\nreading the file");
+        assert_eq!(
+            app.activity(3).last().unwrap(),
+            "reading the file",
+            "the live tail is the newest thing there is"
+        );
+
+        app.finish_stream();
+        app.start_running("cargo build --release".into());
+        assert_eq!(
+            app.activity(3).last().unwrap(),
+            "running: cargo build --release"
+        );
+    }
+
+    #[test]
+    fn activity_is_capped_and_keeps_the_newest() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        for i in 0..6 {
+            app.status = Status::Idle;
+            app.input.insert_str(&format!("prompt {i}"));
+            app.submit().unwrap();
+            app.push_response(
+                format!("<ai-harness-response>answer {i}</ai-harness-response>"),
+                None,
+            );
+        }
+        let lines = app.activity(3);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.last().unwrap(), "answer 5", "newest last");
+        assert!(!lines.iter().any(|l| l.contains('0')), "oldest dropped");
+    }
+
+    /// The view is about the harness, which a session is one entry of — so the
+    /// command parks a request for the event loop rather than acting.
+    #[test]
+    fn the_sessions_command_parks_a_request_taken_once() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        assert!(!app.take_sessions_request(), "nothing asked for yet");
+
+        app.run_command(Command::Sessions);
+        assert!(app.take_sessions_request(), "the request is there");
+        assert!(
+            !app.take_sessions_request(),
+            "and taking it clears it, so the view opens once"
+        );
+    }
+
     #[test]
     fn a_narrated_element_runs_instead_of_earning_a_retry() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
@@ -5099,7 +5321,7 @@ mod tests {
     #[test]
     fn the_picker_opens_before_the_catalog_lands() {
         let mut app = App::new("alpha/one".into(), None, 10, std::env::temp_dir());
-        assert_eq!(app.catalog, Catalog::Loading);
+        assert_eq!(*app.catalog, Catalog::Loading);
 
         app.run_command(Command::Model(None));
         assert!(
@@ -5112,7 +5334,7 @@ mod tests {
         assert_eq!(app.model, "alpha/one");
 
         app.set_catalog(Err("network down".into()));
-        assert!(matches!(app.catalog, Catalog::Failed(e) if e == "network down"));
+        assert!(matches!(&*app.catalog, Catalog::Failed(e) if e == "network down"));
     }
 
     #[test]

@@ -1,23 +1,22 @@
 
 # DO IN ORDER
 
-[ ] Load `AGENTS.md` from the project root at startup, appended to the contract in
+-   Allow user to still run commands in the input window even when session is actively working
+
+-   Load `AGENTS.md` from the project root at startup, appended to the contract in
     the same slot `--system` uses (never replacing it). `--system` is per-launch
     only; nothing picks up per-project conventions today.
 
-[ ] Prompt cache breakpoints. The client sends no cache directives of its own, so
+-   Prompt cache breakpoints. The client sends no cache directives of its own, so
     for models where caching is opt-in via `cache_control` the 0% in `/cost` is the
     expected result rather than a provider quirk. Put a breakpoint after the system
     prompt and one at the last stable turn boundary.
 
-[ ] Batched non-mutating actions: one top-level batch element whose children are
+-   Batched non-mutating actions: one top-level batch element whose children are
     read/fetch/grep only. Five reads is currently five round-trips, each re-sending
     the entire conversation. Keeps the invariant that matters — one mutating action,
     one approval — and the relaxation must not reach any other element, since strict
     whole-reply parsing is the point of the protocol.
-
-[ ] Multi-session support: a shortcut key goes to a sessions view, where you can spawn new, load previous, shutdown 
-    and move between active sessions. 
 
 ---
 

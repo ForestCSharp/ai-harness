@@ -18,6 +18,16 @@ It is a single-threaded state machine; nothing mutates `App` except in response
 to one of those. Long work (HTTP requests, command execution) is pushed to
 detached `tokio` tasks that report back over the channel, so the UI never blocks.
 
+There is more than one `App`. `Sessions` ([src/sessions.rs](../src/sessions.rs))
+holds a `Slot` per running conversation — its `App`, its in-flight handle, its
+render cache — and they run at the same time, sharing the one channel. So a
+background message names its session as well as its generation, and
+`route_update` finds the slot before anything else happens. **Both checks are
+needed**: a generation is only unique within a session, and an id that matches
+nothing means the session was shut down while its work was in flight. Terminal
+events go to the focused slot, or to the sessions view when it is open. Everything
+below describes one session; the others are doing the same thing beside it.
+
 ## 1. You press Enter
 
 The keypress reaches `handle_key` ([src/main.rs:210](../src/main.rs)). With no
@@ -493,5 +503,6 @@ cannot be run.
 | `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
+| `src/sessions.rs` | Several sessions at once, and the `Ctrl+T` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

@@ -24,6 +24,38 @@ const MIN_TRANSCRIPT_ROWS: u16 = 6;
 const MIN_PANEL_ROWS: u16 = 4;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
+/// The highlight on a selected row, wherever there is a list to select in.
+///
+/// One style rather than one per list. It is the same idea every time — "this is
+/// the one" — and it was written out six times, in two different colours, which
+/// made the same answer look like different answers. What the panels are *for*
+/// is already carried by their border colour; the bar only has to be legible.
+///
+/// Black on white rather than black on a hue: it has to stay readable across
+/// terminal themes, and a saturated background leaves too little contrast
+/// against black text on several of the common ones.
+fn selected_row() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::White)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The dim half of a row — the model beside a name, the price beside an id.
+///
+/// It has to carry the highlight's background when the row is selected, or the
+/// bar stops partway across and reads as ragged rather than as a selected row.
+/// Only the foreground dims, which is what "dimmer than the name" meant all
+/// along. `model_rows` avoids the question entirely by building one span; where
+/// the aside has to be its own span, this is how.
+fn selected_aside(focused: bool) -> Style {
+    if focused {
+        selected_row().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
 /// How the last frame was laid out. The event loop needs this to clamp
 /// scrolling to the content that was actually rendered.
 #[derive(Debug, Default, Clone)]
@@ -51,6 +83,11 @@ pub struct Metrics {
     /// The same again, for the `/rewind` list.
     pub rewind_list: Option<Rect>,
     pub rewind_offset: usize,
+    /// And for the sessions view, which is a screen rather than a panel. A row
+    /// map rather than an offset, since a session's entry spans several rows —
+    /// the same reason `picker_rows` is a table.
+    pub sessions_list: Option<Rect>,
+    pub sessions_rows: Vec<usize>,
 }
 
 /// Did `(column, row)` land inside `area`?
@@ -68,7 +105,17 @@ impl Metrics {
     }
 }
 
-pub fn draw(frame: &mut Frame, app: &mut App, cache: &mut TranscriptCache) -> Metrics {
+/// Draw the focused session.
+///
+/// `sessions` is `(how many, how many waiting on a person)`, for the status bar:
+/// the other conversations are invisible from here, and a reply waiting in one
+/// of them should not be discovered by chance.
+pub fn draw(
+    frame: &mut Frame,
+    app: &mut App,
+    cache: &mut TranscriptCache,
+    sessions: (usize, usize),
+) -> Metrics {
     let area = frame.area();
 
     // Lay the prompt out first so we know how tall it needs to be.
@@ -112,7 +159,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, cache: &mut TranscriptCache) -> Me
     if menu_rows > 0 {
         draw_completions(frame, &completions, app.completion_index(), menu_area);
     }
-    draw_status(frame, app, status_area);
+    draw_status(frame, app, status_area, sessions);
 
     match panel {
         Some(panel) => draw_prepared_panel(frame, app, panel, panel_area, &mut metrics),
@@ -432,7 +479,7 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         let chrome = 5u16;
         // The catalog stands in for the list until it arrives, so the panel is
         // the same shape whether or not the fetch has landed.
-        let placeholder = match &app.catalog {
+        let placeholder = match &*app.catalog {
             crate::app::Catalog::Loading => Some(vec![Line::from(Span::styled(
                 "  loading models…",
                 Style::default().fg(Color::DarkGray),
@@ -624,10 +671,7 @@ fn picker_entry(
     width: usize,
 ) -> Vec<Line<'static>> {
     let title = if focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Blue)
-            .add_modifier(Modifier::BOLD)
+        selected_row()
     } else {
         Style::default()
             .fg(Color::Gray)
@@ -636,11 +680,7 @@ fn picker_entry(
     // Dimmer than the name, on the same reasoning as the preview lines below:
     // the name is what you are choosing, the model is what you are choosing
     // between. Only slightly, though — loading adopts it, so it is not trivia.
-    let aside = Style::default().fg(if focused {
-        Color::Gray
-    } else {
-        Color::DarkGray
-    });
+    let aside = selected_aside(focused);
     let marker = if focused { "› " } else { "  " };
 
     // The name gives way to the model rather than the other way round: a name
@@ -752,10 +792,7 @@ fn question_rows(
     for i in offset..question.rows().min(offset + visible) {
         let focused = i == question.selected;
         let style = if focused {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            selected_row()
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -809,18 +846,11 @@ fn rewind_rows(
         let row = &rewind.rows[i];
         let focused = i == rewind.selected;
         let style = if focused {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            selected_row()
         } else {
             Style::default().fg(Color::Gray)
         };
-        let aside = Style::default().fg(if focused {
-            Color::Black
-        } else {
-            Color::DarkGray
-        });
+        let aside = selected_aside(focused);
         let note = match row.changed {
             0 => String::new(),
             n => format!("{n} file(s)  "),
@@ -855,10 +885,7 @@ fn model_rows(
     for (i, model) in matches.iter().enumerate().skip(offset).take(visible) {
         let focused = i == selected;
         let style = if focused {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD)
+            selected_row()
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -936,10 +963,7 @@ fn draw_completions(
             let focused = i == selected;
             let name = format!(" /{:<name_width$} ", spec.name, name_width = name_width);
             let name_style = if focused {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD)
+                selected_row()
             } else {
                 Style::default().fg(Color::Blue)
             };
@@ -2200,7 +2224,153 @@ fn tinted(colour: Color) -> Color {
     }
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+/// Draw the sessions view: every conversation running, and what each is doing.
+///
+/// A whole screen rather than a panel in the prompt's slot. Every other overlay
+/// in this harness is about the conversation it sits under, and is drawn beside
+/// it for exactly that reason; this one is about the harness, and there is no
+/// one conversation it belongs beside.
+pub fn draw_sessions(
+    frame: &mut Frame,
+    view: &crate::sessions::View,
+    rows: &[crate::sessions::Row],
+    tick: usize,
+) -> Metrics {
+    let area = frame.area();
+    let block = Block::bordered()
+        .title(Line::from(" sessions ").bold())
+        .border_style(Style::default().fg(Color::Blue));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [list, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let width = list.width as usize;
+    let visible = list.height as usize;
+
+    // An entry is a header and its activity, so it is several rows tall and a
+    // click maps back through a table rather than by adding an offset — the same
+    // problem the `/load` picker's entries have, solved the same way.
+    let entries: Vec<Vec<Line<'static>>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| session_entry(row, i == view.selected, tick, width))
+        .collect();
+
+    // Walk back from the selection while the entries still fit, so the
+    // highlighted session is on screen by construction rather than by arithmetic
+    // that assumed every entry was the same height.
+    let mut first = view.selected.min(entries.len().saturating_sub(1));
+    let mut used = entries.get(first).map_or(0, Vec::len);
+    while first > 0 {
+        let next = used + entries[first - 1].len();
+        if next > visible {
+            break;
+        }
+        used = next;
+        first -= 1;
+    }
+
+    let mut lines = Vec::new();
+    let mut owners = Vec::new();
+    'outer: for (i, entry) in entries.iter().enumerate().skip(first) {
+        for line in entry {
+            if lines.len() == visible {
+                break 'outer;
+            }
+            lines.push(line.clone());
+            owners.push(i);
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), list);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "n new · Enter switch · x shut down · Esc close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        footer,
+    );
+
+    Metrics {
+        sessions_list: Some(list),
+        sessions_rows: owners,
+        ..Metrics::default()
+    }
+}
+
+/// One session in the view: a header naming it, then what it is doing.
+///
+/// The activity is the reason to open this list at all. A column of names and
+/// the word "streaming" tells you which session is busy; it does not tell you
+/// which one is busy with the thing you came back for.
+fn session_entry(
+    row: &crate::sessions::Row,
+    highlighted: bool,
+    tick: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let style = if highlighted {
+        selected_row()
+    } else if row.focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    // Three states worth telling apart at a glance: working, waiting on you, and
+    // neither. A spinner says "come back later"; a `!` says "come now".
+    let mark = if row.blocked {
+        "! ".to_string()
+    } else if row.busy {
+        format!("{} ", SPINNER[(tick / 2) % SPINNER.len()])
+    } else {
+        "  ".to_string()
+    };
+    let marker = if highlighted { "› " } else { "  " };
+    // `‹current›` on the session the prompt belongs to, so switching away and
+    // back is never disorienting — the highlight is where you are *looking*.
+    let here = if row.focused { " ‹current›" } else { "" };
+    let aside = format!("{}  {}  {} turns", row.status, row.model, row.turns);
+    let name = format!("{marker}{mark}{}{here}", row.name);
+    let room = width.saturating_sub(aside.chars().count() + 2);
+    let name = truncate(&name, room.max(1));
+    // Exactly the remaining width, so the three spans together fill the row. A
+    // highlight that stopped short of the edge would read as a ragged bar rather
+    // than as a selected row.
+    let pad = width
+        .saturating_sub(name.chars().count() + aside.chars().count())
+        .max(1);
+    // The aside carries the highlight's background too, for the same reason: it
+    // is the right-hand end of the same row, not a separate thing beside it. A
+    // blocked session keeps its yellow while it is not the highlighted one; on
+    // the bar the `!` beside the name already says it.
+    let aside_style = if !highlighted && row.blocked {
+        Style::default().fg(Color::Yellow)
+    } else {
+        selected_aside(highlighted)
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(name, style),
+        Span::styled(" ".repeat(pad), style),
+        Span::styled(aside, aside_style),
+    ])];
+
+    // Dim and indented under the name: the header is what you are choosing
+    // between, the activity is what tells you which to choose.
+    let dim = Style::default().fg(Color::DarkGray);
+    for line in &row.activity {
+        lines.push(Line::from(Span::styled(
+            format!("      {}", truncate(line, width.saturating_sub(7).max(1))),
+            dim,
+        )));
+    }
+    // A blank between entries, so several sessions read as several things.
+    lines.push(Line::default());
+    lines
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize)) {
     let (label, colour) = match app.status {
         Status::Idle => (" ready ", Color::Green),
         Status::Waiting => (" waiting ", Color::Yellow),
@@ -2218,6 +2388,25 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(app.model.clone(), Style::default().fg(Color::Gray)),
     ];
+    // The other sessions, when there are any. Hidden at one, which is the shape
+    // the harness has always had — and a session waiting on a person is called
+    // out, since that is the one thing that will not resolve itself while you
+    // are looking elsewhere.
+    let (count, blocked) = sessions;
+    if count > 1 {
+        spans.push(Span::styled(
+            format!("  {count} sessions"),
+            Style::default().fg(Color::Gray),
+        ));
+        if blocked > 0 {
+            spans.push(Span::styled(
+                format!(" · {blocked} need you"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
     // Cumulative spend, once there is any. Hidden on a fresh session so the bar
     // does not open with a row of zeroes.
     if !app.ledger.is_empty() {
@@ -2338,10 +2527,323 @@ mod tests {
 
     use super::*;
 
+    /// Render the sessions view and return the screen as one string per row.
+    fn render_sessions(
+        rows: &[crate::sessions::Row],
+        selected: usize,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Metrics) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut metrics = Metrics::default();
+        let view = crate::sessions::View { selected };
+        terminal
+            .draw(|frame| metrics = draw_sessions(frame, &view, rows, 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        (rows, metrics)
+    }
+
+    /// A session row, with everything but what the test is about defaulted.
+    fn session_row(name: &str, status: &'static str, focused: bool) -> crate::sessions::Row {
+        crate::sessions::Row {
+            id: 1,
+            name: name.into(),
+            model: "test/model".into(),
+            status,
+            blocked: status == "needs you",
+            busy: matches!(status, "streaming" | "thinking" | "running"),
+            turns: 3,
+            focused,
+            activity: Vec::new(),
+        }
+    }
+
+    /// The same, with a few lines of activity under it.
+    fn active_row(name: &str, status: &'static str, activity: &[&str]) -> crate::sessions::Row {
+        crate::sessions::Row {
+            activity: activity.iter().map(|s| (*s).to_string()).collect(),
+            ..session_row(name, status, false)
+        }
+    }
+
+    /// Every row of `buffer` that carries the selection background, as
+    /// `(y, how many cells)`.
+    fn highlighted_rows(buffer: &ratatui::buffer::Buffer) -> Vec<(u16, usize)> {
+        let bar = selected_row().bg;
+        (0..buffer.area.height)
+            .filter_map(|y| {
+                let n = (0..buffer.area.width)
+                    .filter(|x| buffer[(*x, y)].style().bg == bar)
+                    .count();
+                (n > 0).then_some((y, n))
+            })
+            .collect()
+    }
+
+    /// The bar has to reach both edges of its row in *every* list, not just the
+    /// one that was reported. Each of these builds its row from several spans,
+    /// and a span that forgets the background leaves the highlight ragged —
+    /// which is exactly how this was first noticed in the sessions view.
+    #[test]
+    fn a_selected_row_is_highlighted_edge_to_edge_in_every_list() {
+        let width = 60u16;
+        // What `prepare_panel` builds its lines to: borders take two columns and
+        // the content is padded by one either side. The bar is as wide as the
+        // content, so this is the full width of a panel row.
+        let inner = (width - 4) as usize;
+
+        // The `/load` picker, whose entry is a name and the model beside it.
+        let (mut app, dir) = app_with_picker(&["alpha", "beta"]);
+        app.picker_move(1);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        let mut cache = TranscriptCache::default();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app, &mut cache, (1, 0));
+            })
+            .unwrap();
+        for (y, n) in highlighted_rows(terminal.backend().buffer()) {
+            assert_eq!(n, inner, "the /load picker's bar is ragged on row {y}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The `/rewind` list, whose row is a prompt and a file count beside it.
+        let mut app = with_rewind(&[("first", 2), ("second", 0)]);
+        app.rewind_move(-1);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        let mut cache = TranscriptCache::default();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app, &mut cache, (1, 0));
+            })
+            .unwrap();
+        for (y, n) in highlighted_rows(terminal.backend().buffer()) {
+            assert_eq!(n, inner, "the /rewind list's bar is ragged on row {y}");
+        }
+    }
+
+    /// The same for the sessions view, which is a screen rather than a panel.
+    #[test]
+    fn the_selected_session_is_highlighted_the_whole_width() {
+        let rows = vec![
+            active_row("first", "ready", &["you: one"]),
+            active_row("second", "streaming", &["you: two"]),
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        let view = crate::sessions::View { selected: 1 };
+        terminal
+            .draw(|frame| {
+                draw_sessions(frame, &view, &rows, 0);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // The header row of the highlighted session, found by its name.
+        let y = (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("second")
+            })
+            .expect("the highlighted session is on screen");
+
+        // Inside the border, every cell of that row carries the highlight —
+        // whatever `selected_row` currently is, so a restyle cannot quietly
+        // break the geometry this test is actually about.
+        let bar = selected_row().bg;
+        let highlighted: Vec<bool> = (1..buffer.area.width - 1)
+            .map(|x| buffer[(x, y)].style().bg == bar)
+            .collect();
+        assert!(
+            highlighted.iter().all(|on| *on),
+            "the bar stops short at column {:?} of {}",
+            highlighted.iter().position(|on| !on),
+            highlighted.len()
+        );
+
+        // And the row above it, belonging to another session, carries none.
+        let plain = (1..buffer.area.width - 1).all(|x| buffer[(x, y - 1)].style().bg != bar);
+        assert!(plain, "only the selected row is a bar");
+    }
+
+    /// The reason to open the list at all: which session is busy is a column of
+    /// names, but *what with* is the thing you came back for.
+    #[test]
+    fn each_session_shows_what_it_is_doing() {
+        let rows = vec![
+            active_row(
+                "builder",
+                "streaming",
+                &["you: add a checkpoint module", "cargo test 2>&1 | tail -20"],
+            ),
+            active_row(
+                "cleaner",
+                "needs you",
+                &["you: clean up tmp", "rm -rf tmp/*"],
+            ),
+        ];
+        let (screen, _) = render_sessions(&rows, 0, 78, 20);
+        let text = screen.join("\n");
+
+        for line in [
+            "you: add a checkpoint module",
+            "cargo test 2>&1 | tail -20",
+            "rm -rf tmp/*",
+        ] {
+            assert!(text.contains(line), "missing {line:?}:\n{text}");
+        }
+        // The activity is why `needs you` is actionable rather than alarming:
+        // the command waiting for approval is right there under the name.
+        let blocked_at = text.find("cleaner").unwrap();
+        let command_at = text.find("rm -rf tmp/*").unwrap();
+        assert!(blocked_at < command_at, "under its own session:\n{text}");
+    }
+
+    /// An entry is several rows tall, so a click anywhere in one has to pick
+    /// that session — including on its activity, which is most of its height.
+    #[test]
+    fn a_click_on_any_line_of_a_session_picks_that_session() {
+        let rows = vec![
+            active_row("first", "ready", &["you: one", "did one"]),
+            active_row("second", "ready", &["you: two", "did two"]),
+        ];
+        let (screen, metrics) = render_sessions(&rows, 0, 78, 20);
+        let list = metrics.sessions_list.expect("list rect");
+
+        // The row holding "did two" belongs to the second session.
+        let row = screen.iter().position(|r| r.contains("did two")).unwrap() as u16;
+        let owner = metrics
+            .sessions_rows
+            .get((row - list.y) as usize)
+            .copied()
+            .expect("every rendered row has an owner");
+        assert_eq!(owner, 1, "an activity line belongs to its session");
+    }
+
+    #[test]
+    fn the_sessions_view_lists_every_session_and_what_it_is_doing() {
+        let rows = vec![
+            session_row("session-alpha", "streaming", false),
+            session_row("session-beta", "ready", true),
+            session_row("session-gamma", "needs you", false),
+        ];
+        let (screen, metrics) = render_sessions(&rows, 1, 78, 10);
+        let text = screen.join("\n");
+
+        assert!(text.contains("sessions"), "missing title:\n{text}");
+        for name in ["session-alpha", "session-beta", "session-gamma"] {
+            assert!(text.contains(name), "missing {name}:\n{text}");
+        }
+        assert!(text.contains("n new"), "missing footer:\n{text}");
+        assert!(metrics.sessions_list.is_some(), "list rect for clicks");
+    }
+
+    /// Three states worth telling apart without reading: working, wanting you,
+    /// and neither. The second is the one that will not resolve on its own.
+    #[test]
+    fn a_working_session_spins_and_a_blocked_one_is_marked() {
+        let rows = vec![
+            session_row("busy-one", "streaming", false),
+            session_row("blocked-one", "needs you", false),
+            session_row("idle-one", "ready", false),
+        ];
+        let (screen, _) = render_sessions(&rows, 0, 78, 10);
+
+        let busy = screen.iter().find(|r| r.contains("busy-one")).unwrap();
+        let blocked = screen.iter().find(|r| r.contains("blocked-one")).unwrap();
+        let idle = screen.iter().find(|r| r.contains("idle-one")).unwrap();
+        assert!(
+            SPINNER.iter().any(|frame| busy.contains(frame)),
+            "a working session should spin: {busy:?}"
+        );
+        assert!(
+            blocked.contains('!'),
+            "a blocked one should shout: {blocked:?}"
+        );
+        assert!(
+            !idle.contains('!') && !SPINNER.iter().any(|f| idle.contains(f)),
+            "and an idle one should do neither: {idle:?}"
+        );
+    }
+
+    /// Switching away and back should never leave you wondering which one you
+    /// are in, so the session the prompt belongs to says so.
+    #[test]
+    fn the_view_marks_the_session_you_are_in_apart_from_the_highlight() {
+        let rows = vec![
+            session_row("where-you-are", "ready", true),
+            session_row("merely-highlighted", "ready", false),
+        ];
+        let (screen, _) = render_sessions(&rows, 1, 78, 10);
+        let current = screen.iter().find(|r| r.contains("where-you-are")).unwrap();
+        let highlighted = screen
+            .iter()
+            .find(|r| r.contains("merely-highlighted"))
+            .unwrap();
+        assert!(current.contains("‹current›"), "{current:?}");
+        assert!(!current.contains('›') || current.contains("‹current›"));
+        assert!(
+            highlighted.contains('›') && !highlighted.contains("‹current›"),
+            "the highlight is where you are looking, not where you are: {highlighted:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_counts_the_other_sessions_and_who_needs_you() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let (screen, _) = render_with_sessions(&mut app, 70, 12, (1, 0));
+        assert!(
+            !screen.join("\n").contains("sessions"),
+            "one session is the shape the harness has always had"
+        );
+
+        let (screen, _) = render_with_sessions(&mut app, 70, 12, (3, 1));
+        let text = screen.join("\n");
+        assert!(text.contains("3 sessions"), "{text}");
+        assert!(text.contains("1 need you"), "{text}");
+    }
+
     /// Render into a fake terminal and return the screen as one string per row.
     /// Starts from a cold cache, which is what most tests want to pin down.
     fn render(app: &mut App, width: u16, height: u16) -> (Vec<String>, Metrics) {
         render_cached(app, &mut TranscriptCache::default(), width, height)
+    }
+
+    /// The same, with a session count for the status bar.
+    fn render_with_sessions(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        sessions: (usize, usize),
+    ) -> (Vec<String>, Metrics) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut metrics = Metrics::default();
+        let mut cache = TranscriptCache::default();
+        terminal
+            .draw(|frame| metrics = draw(frame, app, &mut cache, sessions))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        (rows, metrics)
     }
 
     /// The same, against a cache that survives between calls — the way the real
@@ -2355,7 +2857,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut metrics = Metrics::default();
         terminal
-            .draw(|frame| metrics = draw(frame, app, cache))
+            .draw(|frame| metrics = draw(frame, app, cache, (1, 0)))
             .unwrap();
 
         let buffer = terminal.backend().buffer().clone();
