@@ -17,7 +17,7 @@ pub enum Command {
     Undo,
     /// Choose how far back to undo, from a list of the conversation.
     Rewind,
-    /// Open the sessions view, the same as `Ctrl+T`.
+    /// Open the sessions view, the same as `Ctrl+Space`.
     Sessions,
     /// List checkpoints; `Some` sets how many turns to keep.
     Checkpoints(Option<String>),
@@ -45,6 +45,86 @@ pub enum Command {
     /// user rather than forwarded — silently sending a typo'd command to the
     /// model is the worst available outcome.
     Unknown(String),
+}
+
+impl Command {
+    /// Whether this can run with a turn already in flight.
+    ///
+    /// The prompt stays usable while the harness works, so this is what decides
+    /// what that usefully means. Two things disqualify a command: rewriting the
+    /// `history` the in-flight request was built from — the reply would land on
+    /// a conversation that no longer matches what was sent — and moving the
+    /// session folder, which is where the turn's open checkpoint is writing.
+    ///
+    /// Exhaustive on purpose: a command added later has to answer this question
+    /// rather than inherit an answer.
+    pub fn runs_while_busy(&self) -> bool {
+        match self {
+            // Display toggles, read where they are used rather than latched.
+            // `/auto` is the one worth having mid-turn: it is read at the
+            // approval decision, so flipping it is how you stop being asked
+            // about the rest of a turn you have decided to trust.
+            Command::Debug | Command::Reasoning | Command::Auto => true,
+            // Read-only. `/checkpoints <n>` prunes, but oldest-first, so the
+            // checkpoint the current turn is filling is never the one dropped.
+            Command::Cost | Command::Help | Command::Checkpoints(_) => true,
+            // Parks a flag the event loop takes; the view is about the harness
+            // rather than about this conversation.
+            Command::Sessions => true,
+            // The in-flight request already carries its model, so this lands on
+            // the next turn — which is usually why it is being typed.
+            Command::Model(_) => true,
+            // A snapshot of what has happened. The in-flight reply is not in
+            // `history` yet, so the file is consistent either way.
+            Command::Save(None) => true,
+            // Quitting cancels and saves every session on its way out.
+            Command::Quit => true,
+            // Only pushes "unknown command". Answering a typo with "wait for the
+            // turn to finish" would be a worse reply than the right one.
+            Command::Unknown(_) => true,
+
+            // `/save <name>` *renames* the current session, exactly as `/rename`
+            // does — see `App::save_session`. That moves the folder the turn's
+            // checkpoint is being written into, so the argument, not the name,
+            // is what makes it unsafe.
+            Command::Save(Some(_)) | Command::Rename(_) => false,
+            // Each of these rewrites or replaces `history` under the request.
+            Command::Clear | Command::Compact | Command::Load(_) | Command::Fork(_) => false,
+            // Changes the contract and the sandbox mid-turn, and `/plan <task>`
+            // would start a second turn on top of the first.
+            Command::Plan(_) => false,
+            // Restore files and truncate the conversation. Both would be undoing
+            // a turn that is still adding to it.
+            Command::Undo | Command::Rewind => false,
+        }
+    }
+
+    /// The canonical name, without the slash — for the notice that refuses it.
+    ///
+    /// Matches the [`COMMANDS`] table, which the tests check.
+    pub fn name(&self) -> &str {
+        match self {
+            Command::Debug => "debug",
+            Command::Auto => "auto",
+            Command::Reasoning => "reasoning",
+            Command::Undo => "undo",
+            Command::Rewind => "rewind",
+            Command::Sessions => "sessions",
+            Command::Checkpoints(_) => "checkpoints",
+            Command::Plan(_) => "plan",
+            Command::Help => "help",
+            Command::Clear => "clear",
+            Command::Compact => "compact",
+            Command::Quit => "quit",
+            Command::Save(_) => "save",
+            Command::Load(_) => "load",
+            Command::Rename(_) => "rename",
+            Command::Fork(_) => "fork",
+            Command::Cost => "cost",
+            Command::Model(_) => "model",
+            Command::Unknown(name) => name,
+        }
+    }
 }
 
 /// What the prompt should do with a line of input.
@@ -149,7 +229,7 @@ pub const COMMANDS: &[Spec] = &[
     },
     Spec {
         name: "sessions",
-        description: "switch between running sessions, or start one (also Ctrl+T)",
+        description: "switch between running sessions, or start one (also Ctrl+Space)",
     },
     Spec {
         name: "save",
@@ -333,6 +413,74 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    /// `name()` is what the refusal notice tells you to retype, so it has to be
+    /// the name that parses — and the table is where those names are decided.
+    #[test]
+    fn every_listed_command_names_itself_the_way_it_is_typed() {
+        for spec in COMMANDS {
+            assert_eq!(
+                command(&format!("/{}", spec.name)).name(),
+                spec.name,
+                "/{} does not name itself",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn commands_that_only_read_or_toggle_run_mid_turn() {
+        for input in [
+            "/debug",
+            "/auto",
+            "/reasoning",
+            "/cost",
+            "/help",
+            "/checkpoints",
+            "/checkpoints 3",
+            "/sessions",
+            "/model",
+            "/model x/y",
+            "/quit",
+            "/nonsense",
+        ] {
+            assert!(
+                command(input).runs_while_busy(),
+                "{input} should run while a turn is in flight"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_that_rewrite_the_conversation_wait_their_turn() {
+        for input in [
+            "/clear",
+            "/compact",
+            "/load",
+            "/load old",
+            "/fork",
+            "/plan",
+            "/plan do a thing",
+            "/undo",
+            "/rewind",
+            "/rename other",
+        ] {
+            assert!(
+                !command(input).runs_while_busy(),
+                "{input} should wait for the turn to finish"
+            );
+        }
+    }
+
+    /// The trap: `/save <name>` renames the session, and the folder it moves is
+    /// where the running turn's checkpoint is being written. So the argument
+    /// decides, not the name — which is why this is classified on the parsed
+    /// command rather than on the `COMMANDS` table.
+    #[test]
+    fn save_is_safe_mid_turn_only_without_a_name() {
+        assert!(command("/save").runs_while_busy());
+        assert!(!command("/save elsewhere").runs_while_busy());
     }
 
     #[test]

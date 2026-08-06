@@ -171,7 +171,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     };
     spawn_catalog_fetch(&ctx);
     // Every conversation, its background work, and its rendering. Starts as one,
-    // which is how the harness has always started; `Ctrl+T` opens more.
+    // which is how the harness has always started; `Ctrl+Space` opens more.
     let mut sessions = Sessions::new(app);
     let mut ticker = tokio::time::interval(TICK);
     let mut metrics = ui::Metrics::default();
@@ -192,7 +192,9 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                 let rows = sessions.view_rows();
                 let view = sessions.view().cloned().unwrap_or_default();
                 let tick = sessions.app().tick;
-                terminal.draw(|frame| metrics = ui::draw_sessions(frame, &view, &rows, tick))?;
+                let armed = sessions.app().quit_armed();
+                terminal
+                    .draw(|frame| metrics = ui::draw_sessions(frame, &view, &rows, tick, armed))?;
             } else {
                 let counts = (sessions.len(), sessions.blocked());
                 let slot = sessions.current_mut();
@@ -245,6 +247,11 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                     for slot in sessions.iter_mut() {
                         slot.app.tick = slot.app.tick.wrapping_add(1);
                     }
+                    dirty = true;
+                }
+                // An armed Ctrl+C is offered on screen until its window shuts,
+                // and nothing else is happening at the moment it does.
+                if sessions.app_mut().expire_quit_arm() {
                     dirty = true;
                 }
             }
@@ -420,8 +427,7 @@ fn handle_event(event: Event, sessions: &mut Sessions, ctx: &Ctx, metrics: &ui::
     // a conversation, so it is checked before the session sees anything.
     if let Event::Key(key) = &event
         && key.kind == KeyEventKind::Press
-        && key.code == KeyCode::Char('t')
-        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && sessions_chord(key)
     {
         return sessions.open_view();
     }
@@ -434,6 +440,24 @@ fn handle_event(event: Event, sessions: &mut Sessions, ctx: &Ctx, metrics: &ui::
         &mut slot.inflight,
         metrics,
     );
+}
+
+/// The chord that opens and closes the sessions view.
+///
+/// `Ctrl+Space` is the one to reach for. Off the kitty keyboard protocol a
+/// terminal sends NUL for it, which crossterm reports as `Char(' ')` with
+/// CONTROL — the same event kitty sends outright, so nothing special is needed
+/// either way.
+///
+/// `Ctrl+T` still works and is deliberately not advertised, on the same footing
+/// as the command aliases in [`crate::command`]. macOS binds `Ctrl+Space` to
+/// "select the previous input source" for anyone with more than one keyboard
+/// layout, and the system takes it before the terminal ever sees it. A second
+/// chord that costs nothing is cheaper than a shortcut that silently does not
+/// work.
+fn sessions_chord(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('t'))
 }
 
 /// Keys and clicks while the sessions view is up.
@@ -455,8 +479,8 @@ fn handle_sessions_event(event: Event, sessions: &mut Sessions, metrics: &ui::Me
                     // The two chords that mean the same thing everywhere: the
                     // toggle that opened this view still closes it, and Ctrl+C
                     // still quits.
-                    KeyCode::Char('t') if ctrl => sessions.close_view(),
-                    KeyCode::Char('c') if ctrl => sessions.app_mut().should_quit = true,
+                    _ if sessions_chord(&key) => sessions.close_view(),
+                    KeyCode::Char('c') if ctrl => sessions.app_mut().request_quit(),
                     _ => picker_edit(key, alt, ctrl, |edit| sessions.view_query_input(edit)),
                 }
                 return;
@@ -466,11 +490,12 @@ fn handle_sessions_event(event: Event, sessions: &mut Sessions, metrics: &ui::Me
                 KeyCode::Char('/') if !ctrl => sessions.view_search(true),
                 KeyCode::Char('n') if !ctrl => sessions.view_spawn(),
                 KeyCode::Char('x') if !ctrl => sessions.view_close_selected(),
-                KeyCode::Esc | KeyCode::Char('t') if ctrl || key.code == KeyCode::Esc => {
-                    sessions.close_view()
-                }
-                // Ctrl+C still quits from here, as it does everywhere.
-                KeyCode::Char('c') if ctrl => sessions.app_mut().should_quit = true,
+                // Esc, or the chord that opened it.
+                KeyCode::Esc => sessions.close_view(),
+                _ if sessions_chord(&key) => sessions.close_view(),
+                // Ctrl+C still quits from here, as it does everywhere — and
+                // takes two presses here too.
+                KeyCode::Char('c') if ctrl => sessions.app_mut().request_quit(),
                 // A page here is the list itself, which has no scrollback of its
                 // own; the sessions cap keeps it to a screenful anyway.
                 _ => {
@@ -657,7 +682,9 @@ fn handle_session_event(
             let text = text.replace(['\r', '\n'], " ");
             app.picker_query_input(|input| input.insert_str(&text));
         }
-        Event::Paste(text) if !app.is_busy() && app.picker().is_none() => {
+        // Pasting into the prompt works while a turn is in flight, for the same
+        // reason typing does.
+        Event::Paste(text) if app.picker().is_none() => {
             // Normalise line endings so pasted CRLF does not leave stray \r.
             app.input
                 .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
@@ -976,9 +1003,10 @@ fn handle_key(
     let max_scroll = metrics.max_scroll();
     let page = metrics.transcript_height.saturating_sub(1).max(1);
 
-    // Ctrl+C always quits, even with the modal up.
+    // Ctrl+C is heard everywhere, even with a modal up — but it takes two
+    // presses in a second. See `App::request_quit`.
     if ctrl && key.code == KeyCode::Char('c') {
-        app.should_quit = true;
+        app.request_quit();
         return;
     }
 
@@ -1227,9 +1255,12 @@ fn handle_key(
             }
         }
 
-        _ if app.is_busy() => {} // editing is frozen while work is in flight
-
         // --- Editing ---
+        // Not frozen while work is in flight: the prompt stays usable so a
+        // command can be typed at a session that is busy. What such a command is
+        // allowed to *do* is decided in `App::submit`, and `Ctrl+L` — the one
+        // way to clear a conversation that does not pass through it — is guarded
+        // inside `reset_conversation`.
         KeyCode::Char('l') if ctrl => app.reset_conversation(),
         KeyCode::Char('u') if ctrl => app.input.delete_to_line_start(),
         KeyCode::Char('w') if ctrl => app.input.delete_word_before(),
@@ -1574,6 +1605,30 @@ mod tests {
                 list_motion(&not_a_motion, 10),
                 None,
                 "{not_a_motion:?} should not move a list"
+            );
+        }
+    }
+
+    /// Off the kitty protocol a terminal sends NUL for `Ctrl+Space`, which
+    /// crossterm reports as `Char(' ')` with CONTROL — this is what pins the
+    /// binding to the event that actually arrives.
+    #[test]
+    fn the_sessions_chord_is_ctrl_space_with_ctrl_t_beside_it() {
+        assert!(sessions_chord(&ctrl_key(' ')));
+        assert!(sessions_chord(&ctrl_key('t')));
+    }
+
+    #[test]
+    fn a_bare_space_is_a_space() {
+        for not_the_chord in [
+            key(KeyCode::Char(' ')),
+            key(KeyCode::Char('t')),
+            ctrl_key('c'),
+            ctrl_key('n'),
+        ] {
+            assert!(
+                !sessions_chord(&not_the_chord),
+                "{not_the_chord:?} should not open the sessions view"
             );
         }
     }

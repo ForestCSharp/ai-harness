@@ -167,6 +167,14 @@ pub const DEFAULT_COMPACT_AT: f64 = 0.8;
 /// measuring what it means to.
 const COMPACT_FALLBACK_BYTES: usize = 384 * 1024;
 
+/// How long a first `Ctrl+C` stays armed, waiting for its second.
+///
+/// Long enough to be a double-press rather than a race, short enough that it is
+/// gone before you have moved on to something else — a window still open a
+/// minute later would make a stray `Ctrl+C` quit, which is the thing being
+/// prevented.
+pub const QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl RunningCommand {
     fn new(command: String) -> Self {
         Self {
@@ -493,6 +501,9 @@ pub struct App {
     /// When true, the view sticks to the bottom as new content arrives.
     pub follow: bool,
     pub should_quit: bool,
+    /// When `Ctrl+C` was first pressed, while it is still waiting for its
+    /// second press. See [`App::request_quit`].
+    quit_armed: Option<std::time::Instant>,
     /// Frame counter used to animate the waiting indicator.
     pub tick: usize,
     /// Model round-trips since the user last typed. Bounded so a model that
@@ -687,6 +698,7 @@ impl App {
             scroll: 0,
             follow: true,
             should_quit: false,
+            quit_armed: None,
             tick: 0,
             iterations: 0,
             max_iterations,
@@ -832,6 +844,46 @@ impl App {
             .status_line(self.price_in, self.price_out, self.context_limit())
     }
 
+    /// `Ctrl+C`: arm the quit, or take it if it is already armed.
+    ///
+    /// Two presses within [`QUIT_WINDOW`] rather than one. `Ctrl+C` is muscle
+    /// memory for "stop this" from every other program, and here it ends a whole
+    /// session — several of them, now — where `Esc` is what stops the work. One
+    /// press is too small a gesture for that.
+    ///
+    /// Deliberately not a modal: a confirmation you have to read is the wrong
+    /// weight for a key you are allowed to mean. Pressing it twice is faster
+    /// than reading the question.
+    pub fn request_quit(&mut self) {
+        if self.quit_armed.is_some_and(|at| at.elapsed() < QUIT_WINDOW) {
+            self.should_quit = true;
+            return;
+        }
+        self.quit_armed = Some(std::time::Instant::now());
+    }
+
+    /// Whether a second `Ctrl+C` would quit right now, which is what the status
+    /// bar and the sessions view's footer say while it is true.
+    pub fn quit_armed(&self) -> bool {
+        self.quit_armed.is_some_and(|at| at.elapsed() < QUIT_WINDOW)
+    }
+
+    /// Drop an arm whose window has closed, reporting whether anything changed.
+    ///
+    /// The screen offers the second press while the window is open, so something
+    /// has to redraw when it shuts — nothing else is happening at that moment,
+    /// and without this the offer would sit there until the next keypress.
+    pub fn expire_quit_arm(&mut self) -> bool {
+        if self
+            .quit_armed
+            .is_some_and(|at| at.elapsed() >= QUIT_WINDOW)
+        {
+            self.quit_armed = None;
+            return true;
+        }
+        false
+    }
+
     /// Interrupt the in-flight turn: invalidate its updates, drop the live
     /// stream view, and return control to the user. The caller is responsible
     /// for signalling the task to stop its actual work.
@@ -899,10 +951,11 @@ impl App {
     ///
     /// Derived from the input buffer rather than cached, so it can never drift
     /// out of step with what has been typed.
+    ///
+    /// Offered while a turn is in flight too, since the prompt is usable then —
+    /// a command you cannot complete is a command you cannot type. Whether the
+    /// completed one *runs* is decided later, by [`App::submit`].
     pub fn completions(&self) -> Vec<&'static command::Spec> {
-        if self.is_busy() {
-            return Vec::new();
-        }
         match command::completion_prefix(self.input.text()) {
             Some(prefix) => command::matching(prefix),
             None => Vec::new(),
@@ -1735,7 +1788,10 @@ impl App {
         self.status == Status::Waiting
     }
 
-    /// True while the harness is busy and the prompt should be inert.
+    /// True while a turn is in flight.
+    ///
+    /// The prompt stays usable — see [`App::submit`] — so this gates what a
+    /// keystroke may *do*, not whether it is accepted.
     pub fn is_busy(&self) -> bool {
         !matches!(self.status, Status::Idle)
     }
@@ -1791,11 +1847,38 @@ impl App {
     /// A slash command is executed locally and reaches the model only when it
     /// carries a prompt of its own (`/plan <task>`). Otherwise this returns the
     /// messages to send for the typed prompt.
+    ///
+    /// With a turn in flight the prompt still works, but not everything it can
+    /// say does: [`Command::runs_while_busy`] decides, and a prompt always
+    /// waits. What is refused is **left in the buffer**, which is the reason the
+    /// input is parsed before it is taken — a mistimed `Enter` on a paragraph
+    /// you have just typed must not throw it away.
     pub fn submit(&mut self) -> Option<Vec<Message>> {
-        if self.is_busy() || self.input.is_blank() {
+        if self.input.is_blank() {
             return None;
         }
-        match crate::command::parse(&self.input.take()) {
+        let parsed = crate::command::parse(self.input.text());
+        if self.is_busy() {
+            match &parsed {
+                crate::command::Input::Command(command) if !command.runs_while_busy() => {
+                    let name = command.name().to_string();
+                    self.push_notice(format!(
+                        "/{name} needs the turn to finish. Press Esc to cancel it, or wait."
+                    ));
+                    return None;
+                }
+                crate::command::Input::Prompt(_) => {
+                    self.push_notice(
+                        "Wait for the turn to finish before sending a prompt, or press Esc to \
+                         cancel it.",
+                    );
+                    return None;
+                }
+                crate::command::Input::Command(_) => {}
+            }
+        }
+        self.input.clear();
+        match parsed {
             crate::command::Input::Command(command) => self.run_command(command),
             crate::command::Input::Prompt(text) => self.send_prompt(text),
         }
@@ -2293,10 +2376,10 @@ impl App {
     ///
     /// Asks rather than acts: a restore deletes the files the turn created, and
     /// that is not something to discover afterwards.
+    ///
+    /// No busy guard of its own: `/undo` is the only way here, and
+    /// [`App::submit`] refuses it while a turn is in flight — one place decides.
     fn begin_undo(&mut self) {
-        if self.is_busy() {
-            return self.push_notice("Wait for the current turn to finish before /undo.");
-        }
         let Some(folder) = self.checkpoint_folder() else {
             return self.push_notice("Nothing to undo.");
         };
@@ -2479,10 +2562,9 @@ impl App {
     }
 
     /// Open the `/rewind` list, or say why there is nothing to open it on.
+    ///
+    /// Refused mid-turn by [`App::submit`], as `/undo` is.
     fn open_rewind(&mut self) {
-        if self.is_busy() {
-            return self.push_notice("Wait for the current turn to finish before /rewind.");
-        }
         let rows = self.rewind_rows();
         if rows.is_empty() {
             return self.push_notice("Nothing to rewind — this conversation has no prompts yet.");
@@ -3179,7 +3261,16 @@ impl App {
     }
 
     /// Clear the conversation, keeping any system prompt in place.
+    ///
+    /// Guards itself, unlike `begin_undo` and `open_rewind`, because `Ctrl+L`
+    /// reaches it without passing through [`App::submit`]. On the `/clear` path
+    /// it is therefore refused twice, which is the cost of having no way in that
+    /// is unguarded.
     pub fn reset_conversation(&mut self) {
+        if self.is_busy() {
+            return self
+                .push_notice("/clear needs the turn to finish. Press Esc to cancel it, or wait.");
+        }
         self.history
             .retain(|m| m.role == crate::openrouter::Role::System);
         self.transcript.clear();
@@ -4909,6 +5000,13 @@ mod tests {
         app.submit();
         app.input.insert_str("/fork beta"); // now two saved sessions
         app.submit();
+        // The picker orders by `saved_at`, which is whole seconds — two saves in
+        // the same test tie or not depending on where the second boundary fell.
+        // Pin them, since what this test is about is that both are *listed*;
+        // `the_picker_lists_the_most_recently_worked_in_session_first` is what
+        // owns the ordering.
+        pin_saved_at(&dir, "alpha", 2_000_000_001);
+        pin_saved_at(&dir, "beta", 2_000_000_000);
 
         app.input.insert_str("/load");
         app.submit();
@@ -5710,14 +5808,14 @@ mod tests {
     }
 
     #[test]
-    fn streaming_counts_as_busy_so_the_prompt_is_inert() {
+    fn streaming_counts_as_busy_so_a_prompt_waits() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
         app.push_delta("partial");
         assert!(app.is_busy());
         app.input.insert_str("more");
-        assert!(app.submit().is_none(), "cannot submit mid-stream");
+        assert!(app.submit().is_none(), "cannot send a prompt mid-stream");
     }
 
     #[test]
@@ -5762,6 +5860,128 @@ mod tests {
         assert!(app.completions().is_empty(), "no command starts with costx");
     }
 
+    /// An app with a turn in flight, which is the state everything below is
+    /// about.
+    fn busy_app() -> App {
+        busy_app_in(App::new("m".into(), None, 10, std::env::temp_dir()))
+    }
+
+    fn busy_app_in(mut app: App) -> App {
+        app.input.insert_str("do something slow");
+        app.submit().expect("the first prompt starts a turn");
+        assert!(app.is_busy());
+        app
+    }
+
+    fn last_notice(app: &App) -> String {
+        app.transcript
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::Notice(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_toggle_runs_with_a_turn_in_flight() {
+        let mut app = busy_app();
+        let before = app.history.len();
+        app.input.insert_str("/debug");
+        assert!(app.submit().is_none(), "a toggle sends nothing");
+
+        assert!(app.debug, "the toggle took effect");
+        assert!(app.input.is_blank(), "and the command was consumed");
+        assert!(app.is_busy(), "the turn it was typed at is untouched");
+        assert_eq!(app.history.len(), before);
+    }
+
+    /// The whole point of leaving the buffer alone on a refusal: a mistimed
+    /// Enter on a paragraph must not throw the paragraph away.
+    #[test]
+    fn a_prompt_typed_mid_turn_is_refused_and_kept() {
+        let mut app = busy_app();
+        let before = app.history.len();
+        app.input.insert_str("and then run the tests");
+        assert!(app.submit().is_none());
+
+        assert_eq!(app.input.text(), "and then run the tests");
+        assert_eq!(app.history.len(), before, "nothing was sent");
+        assert!(last_notice(&app).contains("Wait for the turn to finish"));
+    }
+
+    #[test]
+    fn a_command_that_rewrites_the_conversation_is_refused_and_kept() {
+        let mut app = busy_app();
+        let before = app.history.len();
+        app.input.insert_str("/clear");
+        assert!(app.submit().is_none());
+
+        assert_eq!(app.input.text(), "/clear");
+        assert_eq!(app.history.len(), before, "the conversation survived");
+        assert!(app.is_busy(), "and so did the turn");
+        assert!(
+            last_notice(&app).contains("/clear needs the turn to finish"),
+            "the notice should name the command: {}",
+            last_notice(&app)
+        );
+    }
+
+    /// `Ctrl+L` reaches `reset_conversation` without passing through `submit`,
+    /// so the guard has to be there too.
+    #[test]
+    fn ctrl_l_cannot_clear_a_conversation_mid_turn() {
+        let mut app = busy_app();
+        let before = app.history.len();
+        app.reset_conversation();
+
+        assert_eq!(app.history.len(), before);
+        assert!(app.is_busy(), "clearing must not swallow the turn");
+        assert!(last_notice(&app).contains("/clear needs the turn to finish"));
+    }
+
+    /// The trap `runs_while_busy` exists for: `/save <name>` renames the
+    /// session, moving the folder the running turn's checkpoint is inside.
+    #[test]
+    fn save_under_a_new_name_waits_but_a_plain_save_does_not() {
+        let dir = session_temp_dir("save-mid-turn");
+        let mut app = busy_app_in(app_in(&dir));
+        let name = app.session_name().to_string();
+
+        app.input.insert_str("/save elsewhere");
+        assert!(app.submit().is_none());
+        assert_eq!(
+            app.session_name(),
+            name,
+            "the folder must not move mid-turn"
+        );
+        assert_eq!(app.input.text(), "/save elsewhere");
+        assert!(!crate::session::exists(&dir, "elsewhere"));
+
+        app.input.clear();
+        app.input.insert_str("/save");
+        assert!(app.submit().is_none());
+        assert!(app.input.is_blank(), "a plain /save runs");
+        assert!(
+            crate::session::exists(&dir, &name),
+            "and writes the session it is already in"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The in-flight request already carries its model, so this lands on the
+    /// next turn rather than disturbing this one.
+    #[test]
+    fn the_model_can_be_changed_mid_turn() {
+        let mut app = busy_app();
+        app.input.insert_str("/model other/model");
+        assert!(app.submit().is_none());
+
+        assert_eq!(app.model, "other/model");
+        assert!(app.is_busy());
+    }
+
     #[test]
     fn ordinary_prompts_offer_no_completions() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
@@ -5779,16 +5999,18 @@ mod tests {
         );
     }
 
+    /// A command you cannot complete is a command you cannot type, and the
+    /// prompt is usable mid-turn now.
     #[test]
-    fn no_completions_while_busy() {
+    fn completions_are_offered_while_busy() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("hi");
         app.submit().unwrap();
         assert!(app.is_busy());
         app.input.insert_str("/de");
-        assert!(
-            app.completions().is_empty(),
-            "the prompt is inert while busy, so the menu must be too"
+        assert_eq!(
+            app.completions().iter().map(|s| s.name).collect::<Vec<_>>(),
+            vec!["debug"]
         );
     }
 
@@ -5914,12 +6136,60 @@ mod tests {
         assert_eq!(app.history[0].role, Role::System);
     }
 
+    /// Reaching past the quit window without sleeping for it.
+    const PAST_THE_WINDOW: std::time::Duration =
+        QUIT_WINDOW.saturating_add(std::time::Duration::from_millis(1));
+
+    /// `/quit` is typed deliberately, so it is not the thing being guarded
+    /// against and takes no second anything.
     #[test]
-    fn quit_command_asks_to_exit() {
+    fn the_quit_command_needs_no_confirmation() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("/quit");
         app.submit();
         assert!(app.should_quit);
+        assert!(!app.quit_armed(), "and arms nothing on its way out");
+    }
+
+    #[test]
+    fn one_ctrl_c_arms_and_the_second_quits() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.request_quit();
+        assert!(!app.should_quit, "one press is not enough");
+        assert!(app.quit_armed(), "and the screen should say so");
+
+        app.request_quit();
+        assert!(app.should_quit);
+    }
+
+    /// The window is what makes this a double-press rather than a mode: a
+    /// `Ctrl+C` you pressed and thought better of must not be waiting to be
+    /// completed by an unrelated one later.
+    #[test]
+    fn a_second_ctrl_c_after_the_window_arms_again_instead_of_quitting() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.request_quit();
+        // Reach past the deadline without sleeping for it.
+        app.quit_armed = Some(std::time::Instant::now() - PAST_THE_WINDOW);
+        assert!(!app.quit_armed(), "the offer has lapsed");
+
+        app.request_quit();
+        assert!(!app.should_quit, "so this press is a first press again");
+        assert!(app.quit_armed());
+    }
+
+    /// The screen offers the second press, so something has to redraw when the
+    /// offer expires — nothing else is happening at that moment.
+    #[test]
+    fn the_expired_arm_is_cleared_once_and_then_stays_quiet() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        assert!(!app.expire_quit_arm(), "nothing armed, nothing to redraw");
+
+        app.request_quit();
+        assert!(!app.expire_quit_arm(), "still inside the window");
+        app.quit_armed = Some(std::time::Instant::now() - PAST_THE_WINDOW);
+        assert!(app.expire_quit_arm(), "the deadline passed: redraw");
+        assert!(!app.expire_quit_arm(), "and only the once");
     }
 
     #[test]

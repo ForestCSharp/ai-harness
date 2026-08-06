@@ -163,7 +163,7 @@ pub fn draw(
 
     match panel {
         Some(panel) => draw_prepared_panel(frame, app, panel, panel_area, &mut metrics),
-        None => draw_input(frame, app, panel_area, &input_layout, input_rows),
+        None => draw_input(frame, panel_area, &input_layout, input_rows),
     }
     metrics
 }
@@ -1320,7 +1320,7 @@ fn tail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
     if app.transcript.is_empty() {
         lines.extend(body_lines(
-            "Type a prompt and press Enter. Alt+Enter inserts a newline; Ctrl+C quits.",
+            "Type a prompt and press Enter. Alt+Enter inserts a newline; Ctrl+C twice quits.",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -2268,6 +2268,7 @@ pub fn draw_sessions(
     view: &crate::sessions::View,
     rows: &[crate::sessions::Row],
     tick: usize,
+    quit_armed: bool,
 ) -> Metrics {
     let area = frame.area();
     let block = Block::bordered()
@@ -2349,13 +2350,20 @@ pub fn draw_sessions(
     } else {
         "/ search · j/k or ↑/↓ · Enter switch · n new · x shut down · Esc close"
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        footer,
-    );
+    // The armed quit takes the footer, as it takes the status bar on the other
+    // screen. Quitting from here takes every session with it, so this is the
+    // screen where it most needs saying.
+    let footer_line = if quit_armed {
+        Line::from(Span::styled(
+            "Press Ctrl+C again to quit — every session closes",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+    };
+    frame.render_widget(Paragraph::new(footer_line), footer);
 
     Metrics {
         sessions_list: Some(list),
@@ -2539,30 +2547,35 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize
         app.status,
         Status::Waiting | Status::Streaming | Status::Running | Status::Compacting
     ) {
-        // Busy without a modal: the one useful key is Esc.
-        "  Esc cancel · Ctrl+C quit"
+        // Busy without a modal. The prompt still takes typing, so the hint says
+        // what it is good for — otherwise the only discoverable key is Esc and
+        // the box looks like it is there for nothing.
+        "  Esc cancel · slash commands still run · Ctrl+C quit"
     } else {
         "  Enter send · Alt+Enter newline · Ctrl+L clear · Ctrl+C quit"
     };
-    spans.push(Span::styled(hints, Style::default().fg(Color::DarkGray)));
+    // An armed Ctrl+C replaces every other hint and is the one thing on this bar
+    // that is not dim: it is a question with a deadline, and a hint nobody
+    // notices would make the second press feel like the first one did nothing.
+    if app.quit_armed() {
+        spans.push(Span::styled(
+            "  Press Ctrl+C again to quit",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled(hints, Style::default().fg(Color::DarkGray)));
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_input(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    layout: &crate::input::Layout,
-    visible_rows: u16,
-) {
-    let (border, gutter) = if app.is_busy() {
-        (Color::DarkGray, Color::DarkGray)
-    } else {
-        (Color::Blue, Color::Blue)
-    };
-
-    let block = Block::bordered().border_style(Style::default().fg(border));
+fn draw_input(frame: &mut Frame, area: Rect, layout: &crate::input::Layout, visible_rows: u16) {
+    // Live whether or not a turn is running: the box takes typing either way, and
+    // a dim border said the opposite. Which state the *session* is in is the
+    // status bar's job, and the spinner above says it too.
+    let block = Block::bordered().border_style(Style::default().fg(Color::Blue));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2579,7 +2592,7 @@ fn draw_input(
         .map(|(i, row)| {
             let marker = if i == 0 && offset == 0 { "> " } else { "  " };
             Line::from(vec![
-                Span::styled(marker, Style::default().fg(gutter)),
+                Span::styled(marker, Style::default().fg(Color::Blue)),
                 Span::raw(row.clone()),
             ])
         })
@@ -2587,12 +2600,10 @@ fn draw_input(
 
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 
-    if !app.is_busy() {
-        frame.set_cursor_position(Position::new(
-            inner.x + 2 + cursor_col,
-            inner.y + cursor_row.saturating_sub(offset),
-        ));
-    }
+    frame.set_cursor_position(Position::new(
+        inner.x + 2 + cursor_col,
+        inner.y + cursor_row.saturating_sub(offset),
+    ));
 }
 
 #[cfg(test)]
@@ -2630,7 +2641,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut metrics = Metrics::default();
         terminal
-            .draw(|frame| metrics = draw_sessions(frame, view, rows, 0))
+            .draw(|frame| metrics = draw_sessions(frame, view, rows, 0, false))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows = (0..buffer.area.height)
@@ -2738,7 +2749,7 @@ mod tests {
         };
         terminal
             .draw(|frame| {
-                draw_sessions(frame, &view, &rows, 0);
+                draw_sessions(frame, &view, &rows, 0, false);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -2959,6 +2970,107 @@ mod tests {
     /// Starts from a cold cache, which is what most tests want to pin down.
     fn render(app: &mut App, width: u16, height: u16) -> (Vec<String>, Metrics) {
         render_cached(app, &mut TranscriptCache::default(), width, height)
+    }
+
+    /// A first Ctrl+C that changed nothing on screen would read as a key that
+    /// did nothing, and the second press would come as a surprise.
+    #[test]
+    fn an_armed_quit_takes_over_the_status_bar() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let (before, _) = render(&mut app, 78, 12);
+        assert!(
+            before.iter().any(|r| r.contains("Enter send")),
+            "the ordinary hints: {before:?}"
+        );
+
+        app.request_quit();
+        let (armed, _) = render(&mut app, 78, 12);
+        assert!(
+            armed
+                .iter()
+                .any(|r| r.contains("Press Ctrl+C again to quit")),
+            "the armed quit should say so: {armed:?}"
+        );
+        assert!(
+            !armed.iter().any(|r| r.contains("Enter send")),
+            "and should replace the hints rather than crowd in beside them"
+        );
+    }
+
+    /// Quitting from the sessions view closes every conversation, so this is the
+    /// screen where the second press most needs offering.
+    #[test]
+    fn an_armed_quit_takes_over_the_sessions_footer() {
+        let rows = vec![session_row("one", "ready", true)];
+        let view = crate::sessions::View::default();
+        let mut terminal = Terminal::new(TestBackend::new(78, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_sessions(frame, &view, &rows, 0, true);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            screen.iter().any(|r| r.contains("Press Ctrl+C again")),
+            "{screen:#?}"
+        );
+        assert!(
+            !screen.iter().any(|r| r.contains("n new")),
+            "the footer is the offer now, not the key list"
+        );
+    }
+
+    /// The prompt is usable with a turn in flight, so it has to look usable:
+    /// a live border, a real cursor, and a hint that says what it is for.
+    #[test]
+    fn the_prompt_stays_live_while_a_turn_is_running() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("something slow");
+        app.submit().unwrap();
+        assert!(app.is_busy());
+        app.input.insert_str("/co");
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        let mut cache = TranscriptCache::default();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app, &mut cache, (1, 0));
+            })
+            .unwrap();
+
+        assert!(
+            terminal.get_cursor_position().is_ok_and(|p| p.x > 0),
+            "the cursor should sit in the prompt, not be parked at the origin"
+        );
+
+        let buffer = terminal.backend().buffer().clone();
+        let screen: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("slash commands still run")),
+            "the busy hint should say the prompt is good for something:\n{screen:#?}"
+        );
+        // The border below the status bar is the input box's.
+        let bottom = buffer.area.height - 1;
+        assert_eq!(
+            buffer[(0, bottom)].style().fg,
+            Some(Color::Blue),
+            "a dim border would say the box is inert, which it is not"
+        );
     }
 
     /// The same, with a session count for the status bar.

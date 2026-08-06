@@ -34,11 +34,6 @@ impl Input {
         self.text.trim().is_empty()
     }
 
-    pub fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
-    }
-
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -394,10 +389,10 @@ mod tests {
     }
 
     #[test]
-    fn take_resets_the_buffer() {
+    fn clear_resets_the_buffer() {
         let mut input = Input::default();
         input.insert_str("prompt");
-        assert_eq!(input.take(), "prompt");
+        input.clear();
         assert!(input.is_blank());
         assert_eq!(input.layout(10).cursor, (0, 0));
     }

@@ -465,6 +465,31 @@ UI back into `Streaming`, or a late reply would commit to an abandoned turn.
 Inside the approval modal, `Esc` keeps its existing meaning — **Deny** — which
 refuses the command and continues the loop rather than abandoning the turn.
 
+### The prompt is not frozen while a turn runs
+
+Typing, pasting and completion all work with a request in flight; `handle_key`
+has no busy branch for editing. What such a keystroke is allowed to *do* is
+decided in one place, `App::submit`, from
+`Command::runs_while_busy` ([src/command.rs](../src/command.rs)) — an exhaustive
+match, so a command added later has to answer the question rather than inherit an
+answer.
+
+Two things disqualify a command. **Rewriting `history`** (`/clear`, `/compact`,
+`/load`, `/fork`, `/plan`, `/undo`, `/rewind`) would leave the in-flight reply
+landing on a conversation that no longer matches what was sent. **Moving the
+session folder** (`/rename <name>`, and `/save <name>`, which renames too) would
+move the directory the turn's open checkpoint is writing into. Everything else
+either only reads, or deliberately applies to the next turn — `/model` mid-turn
+lands on the next request, because the one in flight already carries its model.
+
+Refused input is left in the buffer rather than consumed, which is why `submit`
+parses `input.text()` and only clears once it has decided to act.
+
+The guard lives at every entry point that is *not* `submit`. `/undo` and
+`/rewind` have none, so they carry no busy check of their own. `Ctrl+L` does have
+one — it calls `reset_conversation` directly — so that function guards itself,
+and the `/clear` path is therefore refused twice.
+
 ### The one update that is not part of a turn
 
 The model catalog behind `/model` is fetched once at startup by
@@ -503,6 +528,6 @@ cannot be run.
 | `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
-| `src/sessions.rs` | Several sessions at once, and the `Ctrl+T` view |
+| `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

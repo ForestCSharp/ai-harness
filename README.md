@@ -266,7 +266,7 @@ Commands are handled locally and never sent to the model.
 | `/compact` | Summarise the older part of the conversation to free context (see [Context compaction](#context-compaction)) |
 | `/undo` | Put back the files the last changing turn touched (see [Checkpoints and undo](#checkpoints-and-undo)) |
 | `/rewind` | Choose how far back to undo, from a list of the conversation |
-| `/sessions` | Switch between running sessions, or start one (also `Ctrl+T`) |
+| `/sessions` | Switch between running sessions, or start one (also `Ctrl+Space`) |
 | `/checkpoints [n]` | List what can be undone; with a number, keep only the last `n` turns |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -424,8 +424,10 @@ out the context window well inside the round-trip budget.
 
 ## Sessions
 
-`Ctrl+T` — or `/sessions` — opens a list of every conversation the harness is
-running:
+`Ctrl+Space` — or `/sessions` — opens a list of every conversation the harness is
+running. **`Ctrl+T` opens it too**, and is worth knowing about: macOS binds
+`Ctrl+Space` to "select the previous input source" for anyone with more than one
+keyboard layout, and the system takes the key before the terminal sees it.
 
 ```
 ┌ sessions ──────────────────────────────────────────────────────────
@@ -822,10 +824,10 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | `Alt+Enter` | Insert a newline (also `Shift+Enter` on terminals supporting the kitty keyboard protocol) |
 | `Esc` | Interrupt the in-flight reply or running command (while busy) |
 | `↑` / `↓` | Recall previous / next prompt (on an empty prompt) |
-| `Ctrl+T` | Open the sessions view (see [Sessions](#sessions)) |
-| `Ctrl+C` | Quit |
+| `Ctrl+Space` | Open the sessions view (see [Sessions](#sessions)); `Ctrl+T` does the same |
+| `Ctrl+C` | Quit — **twice within a second**; one press arms it and the status bar says so |
 | `Ctrl+D` | Quit when the prompt is empty |
-| `Ctrl+L` | Clear the conversation (keeps the system prompt) |
+| `Ctrl+L` | Clear the conversation (keeps the system prompt); refused while a turn is running |
 | `PageUp` / `PageDown` | Scroll the transcript |
 | `Ctrl+↑` / `Ctrl+↓` | Scroll one line |
 | `End` | Jump back to the newest message when scrolled up |
@@ -964,7 +966,7 @@ reading while you choose which conversation to be in.
 | `src/markdown.rs` | Markdown subset for rendering model responses |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`) |
-| `src/sessions.rs` | Several sessions at once, and the `Ctrl+T` view |
+| `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
 | `src/ui.rs` | Rendering and layout |
@@ -997,11 +999,36 @@ cargo test -- --ignored live_ --nocapture
 ## Notes
 
 Replies stream in token by token (Server-Sent Events): the text appears live
-below the transcript with a `▌` cursor while it arrives, and input stays frozen
-until it completes. Because the protocol parser is strict and whole-reply, this
-is display-only — the approval modal and command execution still fire only once
-the full reply has arrived and parsed. A brief `⠋ thinking…` spinner covers the
-gap before the first token.
+below the transcript with a `▌` cursor while it arrives. Because the protocol
+parser is strict and whole-reply, this is display-only — the approval modal and
+command execution still fire only once the full reply has arrived and parsed. A
+brief `⠋ thinking…` spinner covers the gap before the first token.
+
+## While a turn is running
+
+The prompt stays usable. You can type, paste, complete a command with `Tab` and
+run it while a reply streams or a command executes — `/auto` to stop being asked
+about the rest of a turn you have decided to trust, `/reasoning` to see what it
+is thinking, `/cost` to see what it is costing.
+
+What is refused is anything that would pull the conversation out from under the
+request already in flight: the reply would land on a history that no longer
+matches what was sent.
+
+| | |
+| --- | --- |
+| **Runs** | `/debug` `/auto` `/reasoning` `/cost` `/help` `/checkpoints` `/sessions` `/model` `/save` `/quit` |
+| **Waits** | `/clear` `/compact` `/load` `/fork` `/plan` `/undo` `/rewind` `/rename <name>` `/save <name>` |
+
+`/save <name>` is in the second list because it *renames* the session, and the
+folder it moves is where the running turn's checkpoint is being written; a plain
+`/save` is a snapshot and is fine. `Ctrl+L` is refused for the same reason
+`/clear` is.
+
+A refusal leaves what you typed **in the prompt**, so a mistimed `Enter` on a
+paragraph does not throw the paragraph away. Sending a plain prompt still waits
+for the turn to finish — press `Esc` to cancel it, or wait and press `Enter`
+again.
 
 ## Cancelling
 
@@ -1019,6 +1046,22 @@ Cancellation is cooperative: each in-flight `tokio` task carries a cancel signal
 it selects on, and every task is tagged with a generation so that updates already
 queued by a cancelled task are recognised as stale and dropped rather than
 corrupting the next turn.
+
+### Quitting
+
+`Ctrl+C` takes **two presses within a second**. `Esc` is what stops the work
+here, while `Ctrl+C` ends every running session at once — and `Ctrl+C` is muscle
+memory for "stop this" from every other program, so one press is too small a
+gesture for what it does.
+
+The first press arms it and the status bar says `Press Ctrl+C again to quit` in
+yellow, replacing the usual hints; in the sessions view the footer says it and
+adds that every session closes. The offer lapses after a second, so a `Ctrl+C`
+you thought better of is not left waiting to be completed by an unrelated one
+later.
+
+`/quit` and `Ctrl+D` on an empty prompt are unchanged and quit outright: both are
+already deliberate in a way a reflexive `Ctrl+C` is not.
 
 ## Saving and loading sessions
 

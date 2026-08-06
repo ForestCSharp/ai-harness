@@ -216,7 +216,7 @@ impl Sessions {
         if self.slots.len() >= MAX_SESSIONS {
             return self.app_mut().push_notice(format!(
                 "Already running {MAX_SESSIONS} sessions, the most at once. Shut one \
-                 down first — Ctrl+T, then x."
+                 down first — Ctrl+Space, then x."
             ));
         }
         let name = self.unique_name();
@@ -233,7 +233,7 @@ impl Sessions {
         self.current = self.slots.len() - 1;
         let name = self.app().session_name().to_string();
         self.app_mut().push_notice(format!(
-            "New session {name:?}. Ctrl+T switches between them."
+            "New session {name:?}. Ctrl+Space switches between them."
         ));
     }
 

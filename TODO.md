@@ -1,9 +1,7 @@
 
 # DO IN ORDER
 
--   Allow user to still run commands in the input window even when session is actively working
-
--   option (on by default) to save/restore active sessions for cwd on launch
+-   option (on by default) to save/restore active sessions for cwd (the last sessions you had open on quit) on launch
 
 -   shortcut to open load dialog directly from sessions list
 
