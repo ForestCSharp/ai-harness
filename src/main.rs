@@ -189,7 +189,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             // the prompt's slot: it is about the harness, not about any one
             // conversation, and nothing in it belongs beside a transcript.
             if sessions.view_open() {
-                let rows = sessions.rows();
+                let rows = sessions.view_rows();
                 let view = sessions.view().cloned().unwrap_or_default();
                 let tick = sessions.app().tick;
                 terminal.draw(|frame| metrics = ui::draw_sessions(frame, &view, &rows, tick))?;
@@ -441,8 +441,29 @@ fn handle_sessions_event(event: Event, sessions: &mut Sessions, metrics: &ui::Me
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            // Typing a filter, on the same terms as the two pickers: the letters
+            // belong to the query, and only the unambiguous keys still navigate.
+            if sessions.view_searching() {
+                match key.code {
+                    KeyCode::Up => sessions.view_move(-1),
+                    KeyCode::Down => sessions.view_move(1),
+                    KeyCode::Enter => sessions.view_confirm(),
+                    // Back to navigating, filter intact. A second Esc closes the
+                    // view.
+                    KeyCode::Esc => sessions.view_search(false),
+                    // The two chords that mean the same thing everywhere: the
+                    // toggle that opened this view still closes it, and Ctrl+C
+                    // still quits.
+                    KeyCode::Char('t') if ctrl => sessions.close_view(),
+                    KeyCode::Char('c') if ctrl => sessions.app_mut().should_quit = true,
+                    _ => picker_edit(key, alt, ctrl, |edit| sessions.view_query_input(edit)),
+                }
+                return;
+            }
             match key.code {
                 KeyCode::Enter => sessions.view_confirm(),
+                KeyCode::Char('/') if !ctrl => sessions.view_search(true),
                 KeyCode::Char('n') if !ctrl => sessions.view_spawn(),
                 KeyCode::Char('x') if !ctrl => sessions.view_close_selected(),
                 KeyCode::Esc | KeyCode::Char('t') if ctrl || key.code == KeyCode::Esc => {

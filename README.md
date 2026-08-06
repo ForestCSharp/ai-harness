@@ -429,6 +429,7 @@ running:
 
 ```
 ┌ sessions ──────────────────────────────────────────────────────────
+│  / to search
 │  ⠋ session-1785873241        streaming  deepseek/deepseek-v4-pro  12 turns
 │      you: add a checkpoint module
 │      write src/checkpoint.rs
@@ -442,7 +443,7 @@ running:
 │      you: clean up the tmp directory
 │      rm -rf tmp/*
 │
-│n new · Enter switch · x shut down · Esc close
+│/ search · j/k or ↑/↓ · Enter switch · n new · x shut down · Esc close
 └────────────────────────────────────────────────────────────────────
 ```
 
@@ -453,6 +454,12 @@ nothing, and showing it blank would be the least useful thing on the screen.
 Whatever is streaming or running this instant goes last, being the newest. It is
 also what makes `!` actionable rather than alarming — the command waiting for
 your approval is right there under the name.
+
+`/` narrows the list, on the terms in [In any list](#in-any-list). It searches
+the **activity** as well as the name and the model, unlike the `/load` picker:
+every session here is called `session-<timestamp>`, so the name is the least
+distinguishing thing about it, and `/ parser` finding the one that is working on
+the parser is the whole point.
 
 They run **at the same time**. A session you are not looking at keeps streaming
 and keeps running commands, which is the point: you can leave one working through
@@ -849,10 +856,10 @@ moves in one moves in all of them:
 `g` alone rather than vim's `gg`: a pending-key state is a lot of machinery for
 one keystroke in a modal you are in for two seconds.
 
-**Lists you can search — `/load` and `/model` — open ready to be walked, and `/`
-starts a search**, as it does in a pager. That is the price of `j` and `k`: a
-list cannot both take letters as motions and take them as text, so typing has to
-be asked for. The query row says which mode it is in.
+**Lists you can search — `/load`, `/model` and the sessions view — open ready to
+be walked, and `/` starts a search**, as it does in a pager. That is the price of
+`j` and `k`: a list cannot both take letters as motions and take them as text, so
+typing has to be asked for. The query row says which mode it is in.
 
 `Esc` while searching goes back to the list and **keeps the filter** — you
 narrowed the list in order to walk it, and clearing it on the way out would undo

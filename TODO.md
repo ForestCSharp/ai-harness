@@ -3,6 +3,14 @@
 
 -   Allow user to still run commands in the input window even when session is actively working
 
+-   option (on by default) to save/restore active sessions for cwd on launch
+
+-   shortcut to open load dialog directly from sessions list
+
+-   memory system under .ai_harness/
+
+-   code indexing support, also stored in .ai_harness/
+
 -   Load `AGENTS.md` from the project root at startup, appended to the contract in
     the same slot `--system` uses (never replacing it). `--system` is per-launch
     only; nothing picks up per-project conventions today.

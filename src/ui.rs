@@ -619,13 +619,15 @@ fn draw_prepared_panel(
             // model picker's — see the `Models` arm below.
             // Only while searching: a cursor in a row nobody is typing into
             // points at the wrong thing.
+            // Column 3, not 2: `query_row` spends two cells on the indent and one
+            // on the `/`, so that is where the next character lands.
             if let Some(picker) = app.picker().filter(|p| p.searching) {
                 let col = picker
                     .query
-                    .layout(content.width.saturating_sub(2))
+                    .layout(content.width.saturating_sub(3))
                     .cursor
                     .1;
-                frame.set_cursor_position(Position::new(content.x + 2 + col, content.y));
+                frame.set_cursor_position(Position::new(content.x + 3 + col, content.y));
             }
         }
         PanelKind::Models => {
@@ -637,10 +639,10 @@ fn draw_prepared_panel(
             if let Some(picker) = app.model_picker().filter(|p| p.searching) {
                 let col = picker
                     .query
-                    .layout(content.width.saturating_sub(2))
+                    .layout(content.width.saturating_sub(3))
                     .cursor
                     .1;
-                frame.set_cursor_position(Position::new(content.x + 2 + col, content.y));
+                frame.set_cursor_position(Position::new(content.x + 3 + col, content.y));
             }
         }
     }
@@ -2274,9 +2276,30 @@ pub fn draw_sessions(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [list, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [query, list, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
     let width = list.width as usize;
     let visible = list.height as usize;
+
+    frame.render_widget(
+        Paragraph::new(query_row(&view.query, view.searching, query.width as usize)),
+        query,
+    );
+    // Only while searching, for the reason the pickers place it that way: a
+    // cursor in a row nobody is typing into says the keyboard is somewhere it
+    // is not.
+    if view.searching {
+        let col = view.query.layout(query.width.saturating_sub(3)).cursor.1;
+        frame.set_cursor_position(Position::new(query.x + 3 + col, query.y));
+    }
+
+    // The highlight is a position in the filtered rows, and the filter can shrink
+    // under it when a background session's status changes.
+    let selected = view.selected.min(rows.len().saturating_sub(1));
 
     // An entry is a header and its activity, so it is several rows tall and a
     // click maps back through a table rather than by adding an offset — the same
@@ -2284,13 +2307,13 @@ pub fn draw_sessions(
     let entries: Vec<Vec<Line<'static>>> = rows
         .iter()
         .enumerate()
-        .map(|(i, row)| session_entry(row, i == view.selected, tick, width))
+        .map(|(i, row)| session_entry(row, i == selected, tick, width))
         .collect();
 
     // Walk back from the selection while the entries still fit, so the
     // highlighted session is on screen by construction rather than by arithmetic
     // that assumed every entry was the same height.
-    let mut first = view.selected.min(entries.len().saturating_sub(1));
+    let mut first = selected.min(entries.len().saturating_sub(1));
     let mut used = entries.get(first).map_or(0, Vec::len);
     while first > 0 {
         let next = used + entries[first - 1].len();
@@ -2312,10 +2335,23 @@ pub fn draw_sessions(
             owners.push(i);
         }
     }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no session matches",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     frame.render_widget(Paragraph::new(Text::from(lines)), list);
+    // The hints name the keys that are live *now*: while searching the letters
+    // are the query, so offering `n new` would be a lie.
+    let hint = if view.searching {
+        "typing filters · Enter switch · Esc back to the list"
+    } else {
+        "/ search · j/k or ↑/↓ · Enter switch · n new · x shut down · Esc close"
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "j/k move · Enter switch · n new · x shut down · Esc close",
+            hint,
             Style::default().fg(Color::DarkGray),
         ))),
         footer,
@@ -2573,11 +2609,28 @@ mod tests {
         width: u16,
         height: u16,
     ) -> (Vec<String>, Metrics) {
+        render_sessions_view(
+            rows,
+            &crate::sessions::View {
+                selected,
+                ..Default::default()
+            },
+            width,
+            height,
+        )
+    }
+
+    /// The same, with the view's search state under the caller's control.
+    fn render_sessions_view(
+        rows: &[crate::sessions::Row],
+        view: &crate::sessions::View,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Metrics) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut metrics = Metrics::default();
-        let view = crate::sessions::View { selected };
         terminal
-            .draw(|frame| metrics = draw_sessions(frame, &view, rows, 0))
+            .draw(|frame| metrics = draw_sessions(frame, view, rows, 0))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows = (0..buffer.area.height)
@@ -2679,7 +2732,10 @@ mod tests {
             active_row("second", "streaming", &["you: two"]),
         ];
         let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        let view = crate::sessions::View { selected: 1 };
+        let view = crate::sessions::View {
+            selected: 1,
+            ..Default::default()
+        };
         terminal
             .draw(|frame| {
                 draw_sessions(frame, &view, &rows, 0);
@@ -2835,6 +2891,52 @@ mod tests {
         assert!(
             highlighted.contains('›') && !highlighted.contains("‹current›"),
             "the highlight is where you are looking, not where you are: {highlighted:?}"
+        );
+    }
+
+    /// The query row says which mode the keyboard is in, and the hints below it
+    /// name only the keys that are live — while searching, `n` is a letter.
+    #[test]
+    fn the_sessions_view_says_whether_you_are_navigating_or_searching() {
+        let rows = vec![session_row("one", "ready", true)];
+        let navigating = crate::sessions::View::default();
+        let (screen, _) = render_sessions_view(&rows, &navigating, 78, 10);
+        assert!(screen[1].contains("/ to search"), "{:?}", screen[1]);
+        assert!(
+            screen.iter().any(|r| r.contains("n new")),
+            "navigating offers the list's keys: {screen:?}"
+        );
+
+        let mut searching = crate::sessions::View {
+            searching: true,
+            ..Default::default()
+        };
+        searching.query.insert_char('b');
+        let (screen, _) = render_sessions_view(&rows, &searching, 78, 10);
+        assert!(screen[1].contains("/b"), "{:?}", screen[1]);
+        assert!(
+            screen.iter().any(|r| r.contains("typing filters"))
+                && !screen.iter().any(|r| r.contains("n new")),
+            "searching does not offer keys the query has taken: {screen:?}"
+        );
+    }
+
+    /// A filter can leave nothing, and an empty screen would read as a broken
+    /// one rather than as a query that is too narrow.
+    #[test]
+    fn a_filtered_out_sessions_view_says_so() {
+        let view = crate::sessions::View {
+            searching: true,
+            ..Default::default()
+        };
+        let (screen, metrics) = render_sessions_view(&[], &view, 78, 10);
+        assert!(
+            screen.iter().any(|r| r.contains("no session matches")),
+            "{screen:?}"
+        );
+        assert!(
+            metrics.sessions_rows.is_empty(),
+            "and a click on the notice lands on nothing"
         );
     }
 

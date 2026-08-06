@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::app::{App, Catalog, Status};
+use crate::input::Input;
 use crate::ui::TranscriptCache;
 
 /// Most sessions kept at once.
@@ -87,7 +88,13 @@ pub const ACTIVITY_LINES: usize = 3;
 /// The sessions view, while it is open.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct View {
+    /// A position in the *matches*, not in the slots — the query can hide rows
+    /// between the highlight and the session it names.
     pub selected: usize,
+    /// What has been typed to narrow the list, on the same terms as the `/load`
+    /// and `/model` pickers: the list is navigable, and `/` starts a search.
+    pub query: Input,
+    pub searching: bool,
 }
 
 pub struct Sessions {
@@ -348,9 +355,13 @@ impl Sessions {
     }
 
     /// Open the view on the session you are in, so the list starts where you are.
+    ///
+    /// The query starts empty, so the highlight's position in the matches is its
+    /// position in the slots.
     pub fn open_view(&mut self) {
         self.view = Some(View {
             selected: self.current,
+            ..View::default()
         });
     }
 
@@ -358,15 +369,77 @@ impl Sessions {
         self.view = None;
     }
 
-    pub fn view_move(&mut self, delta: isize) {
-        let last = self.slots.len().saturating_sub(1) as isize;
-        if let Some(view) = &mut self.view {
-            view.selected = (view.selected as isize + delta).clamp(0, last) as usize;
+    /// Slot indices matching what has been typed, in view order.
+    ///
+    /// Derived per call for the reason [`Sessions::rows`] is: the sessions and
+    /// their states change underneath it constantly.
+    pub fn view_matches(&self) -> Vec<usize> {
+        let Some(view) = &self.view else {
+            return Vec::new();
+        };
+        let terms: Vec<String> = view
+            .query
+            .text()
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        (0..self.slots.len())
+            .filter(|&i| self.matches(i, &terms))
+            .collect()
+    }
+
+    /// Whether every one of `terms` appears somewhere in the row for session
+    /// `i`. `terms` are expected lowercase.
+    ///
+    /// Wider than the `/load` picker's rule, which matches on name and model
+    /// only, and deliberately so: every session here is named
+    /// `session-<timestamp>`, so the name is the least distinguishing thing
+    /// about it. What tells two apart is what they are *doing*, which is why the
+    /// activity lines are on the row — and so they are what you can search.
+    fn matches(&self, i: usize, terms: &[String]) -> bool {
+        let app = &self.slots[i].app;
+        let mut haystack = format!("{} {}", app.session_name(), app.model).to_lowercase();
+        for line in app.activity(ACTIVITY_LINES) {
+            haystack.push(' ');
+            haystack.push_str(&line.to_lowercase());
+        }
+        terms.iter().all(|term| haystack.contains(term.as_str()))
+    }
+
+    /// The rows the view actually shows: [`Sessions::rows`] narrowed to the
+    /// matches.
+    pub fn view_rows(&self) -> Vec<Row> {
+        let rows = self.rows();
+        self.view_matches()
+            .into_iter()
+            .filter_map(|i| rows.get(i).cloned())
+            .collect()
+    }
+
+    /// The highlight, clamped to what is actually offered. The matches can shrink
+    /// under a stationary highlight when a background session's status changes.
+    pub fn view_index(&self) -> usize {
+        let count = self.view_matches().len();
+        let selected = self.view.as_ref().map_or(0, |view| view.selected);
+        if count == 0 {
+            0
+        } else {
+            selected.min(count - 1)
         }
     }
 
+    pub fn view_move(&mut self, delta: isize) {
+        let last = self.view_matches().len().saturating_sub(1) as isize;
+        let current = self.view_index() as isize;
+        if let Some(view) = &mut self.view {
+            view.selected = (current + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// Focus a row directly, for mouse hover and clicks. `i` is a position in the
+    /// filtered list, which is what the row map holds.
     pub fn view_select(&mut self, i: usize) -> bool {
-        if i >= self.slots.len() {
+        if i >= self.view_matches().len() {
             return false;
         }
         if let Some(view) = &mut self.view {
@@ -376,21 +449,46 @@ impl Sessions {
         false
     }
 
+    /// Start typing a filter, the way `/` starts one in a pager.
+    pub fn view_search(&mut self, on: bool) {
+        if let Some(view) = &mut self.view {
+            view.searching = on;
+        }
+    }
+
+    pub fn view_searching(&self) -> bool {
+        self.view.as_ref().is_some_and(|view| view.searching)
+    }
+
+    /// Edit the query. Any edit resets the highlight to the top: the list under
+    /// it has just changed, so holding the old position would land it somewhere
+    /// unrelated.
+    pub fn view_query_input(&mut self, edit: impl FnOnce(&mut Input)) {
+        if let Some(view) = &mut self.view {
+            edit(&mut view.query);
+            view.selected = 0;
+        }
+    }
+
     /// Switch to the highlighted session and close the view.
     pub fn view_confirm(&mut self) {
-        if let Some(view) = self.view.take() {
-            self.switch(view.selected);
-        }
+        let Some(&slot) = self.view_matches().get(self.view_index()) else {
+            return;
+        };
+        self.view = None;
+        self.switch(slot);
     }
 
     /// Shut the highlighted session down, leaving the view open.
     pub fn view_close_selected(&mut self) {
-        let Some(view) = self.view.as_ref() else {
+        let selected = self.view_index();
+        let Some(&slot) = self.view_matches().get(selected) else {
             return;
         };
-        let selected = view.selected;
-        self.close(selected);
-        let last = self.slots.len().saturating_sub(1);
+        self.close(slot);
+        // Clamp against the matches after the close, not before: the filter may
+        // hide the session that took the closed one's place.
+        let last = self.view_matches().len().saturating_sub(1);
         if let Some(view) = &mut self.view {
             view.selected = selected.min(last);
         }
@@ -621,6 +719,104 @@ mod tests {
         sessions.view_confirm();
         assert_eq!(sessions.current, 0, "Enter switches to the highlight");
         assert!(!sessions.view_open(), "and closes the view");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Type a query into an open view.
+    fn type_query(sessions: &mut Sessions, text: &str) {
+        sessions.view_search(true);
+        for c in text.chars() {
+            sessions.view_query_input(|input| input.insert_char(c));
+        }
+    }
+
+    #[test]
+    fn the_view_narrows_to_the_query_and_switches_to_the_match() {
+        let (mut sessions, dir) = sessions("search");
+        sessions.spawn();
+        sessions.spawn();
+        sessions.iter_mut().nth(1).unwrap().app.model = "beta/two".into();
+
+        sessions.open_view();
+        type_query(&mut sessions, "beta");
+        let rows = sessions.view_rows();
+        assert_eq!(rows.len(), 1, "one session runs beta/two: {rows:?}");
+
+        // The highlight is a position in the matches, so confirming takes the
+        // session the row names rather than the slot at that ordinal.
+        sessions.view_confirm();
+        assert_eq!(sessions.current, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The names are all `session-<timestamp>`, so what tells two sessions apart
+    /// is what they are doing — which is why the activity lines are searchable.
+    #[test]
+    fn the_query_reaches_what_a_session_is_doing() {
+        let (mut sessions, dir) = sessions("activity");
+        sessions.spawn();
+        sessions
+            .app_mut()
+            .transcript
+            .push(crate::app::Entry::User("refactor the parser".into()));
+
+        sessions.open_view();
+        type_query(&mut sessions, "parser");
+        assert_eq!(sessions.view_matches(), vec![1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_leaves_nothing_to_confirm() {
+        let (mut sessions, dir) = sessions("nomatch");
+        sessions.spawn();
+        sessions.open_view();
+        type_query(&mut sessions, "nothing-matches-this");
+
+        assert!(sessions.view_rows().is_empty());
+        assert_eq!(sessions.view_index(), 0, "clamped, not out of range");
+        sessions.view_confirm();
+        assert!(sessions.view_open(), "Enter on nothing does nothing");
+        sessions.view_close_selected();
+        assert_eq!(sessions.len(), 2, "and neither does x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Leaving the search returns the keyboard to the list without undoing the
+    /// narrowing — you filtered in order to walk what was left.
+    #[test]
+    fn leaving_the_search_keeps_the_filter() {
+        let (mut sessions, dir) = sessions("keepfilter");
+        sessions.spawn();
+        sessions.iter_mut().nth(1).unwrap().app.model = "beta/two".into();
+
+        sessions.open_view();
+        type_query(&mut sessions, "beta");
+        sessions.view_search(false);
+        assert!(!sessions.view_searching());
+        assert_eq!(sessions.view_matches(), vec![1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The highlight indexes the matches, so `x` must close the session the row
+    /// names — not the slot that happens to sit at that ordinal.
+    #[test]
+    fn closing_from_a_filtered_view_closes_the_session_on_the_row() {
+        let (mut sessions, dir) = sessions("filteredclose");
+        sessions.spawn();
+        sessions.spawn();
+        let doomed = sessions.rows()[2].id;
+        sessions.iter_mut().nth(2).unwrap().app.model = "beta/two".into();
+
+        sessions.open_view();
+        type_query(&mut sessions, "beta");
+        sessions.view_close_selected();
+
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions.rows().iter().all(|row| row.id != doomed),
+            "the filtered row's session is the one that went"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
