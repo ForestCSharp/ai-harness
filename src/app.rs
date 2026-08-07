@@ -331,6 +331,12 @@ pub struct Picker {
     /// for a session whose file does not say, since loading adopts the saved
     /// model and the picker is where you would want to know which one that is.
     pub models: Vec<String>,
+    /// Whether each session is already running, parallel to `sessions` on the
+    /// same reasoning.
+    ///
+    /// Snapshotted with the rest: nothing can open or close a session while the
+    /// picker owns the keyboard, so asking live would buy nothing.
+    pub open: Vec<Openness>,
     /// What has been typed to narrow the list. Reuses the prompt's editor, the
     /// same way the model picker does for its free-text row.
     pub query: Input,
@@ -343,6 +349,28 @@ pub struct Picker {
     /// The query survives leaving search — you narrow the list *in order to*
     /// walk it, and clearing the filter on the way out would undo the point.
     pub searching: bool,
+    /// Whether confirming opens the session as a new one beside this one, rather
+    /// than replacing this conversation with it.
+    ///
+    /// The same list either way — the same names, previews, order and search —
+    /// so this is a field rather than a second picker. What differs is only what
+    /// `Enter` means, which is also why the panel is titled differently.
+    pub open_as_new: bool,
+}
+
+/// Where a session in the picker already is, which decides what `Enter` does.
+///
+/// A session cannot be open in two slots at once — both would auto-save to one
+/// file and each would overwrite the other's turns — so a running one is offered
+/// as somewhere to *go* rather than something to load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Openness {
+    /// Saved and not running: `Enter` loads it.
+    Closed,
+    /// Running in another slot: `Enter` switches to it.
+    Open,
+    /// The session this picker was opened from: `Enter` has nothing to do.
+    Current,
 }
 
 impl Picker {
@@ -504,6 +532,14 @@ pub struct App {
     /// When `Ctrl+C` was first pressed, while it is still waiting for its
     /// second press. See [`App::request_quit`].
     quit_armed: Option<std::time::Instant>,
+    /// Sessions running in the harness's *other* slots, kept current by
+    /// [`crate::sessions::Sessions::sync_open_set`].
+    ///
+    /// A session cannot see its siblings, but it has to refuse to load one:
+    /// two slots on one session file both auto-save to it, and each overwrites
+    /// the other's turns. Held as names rather than asked for on demand because
+    /// `App` is what the load paths are on.
+    open_elsewhere: Vec<String>,
     /// Frame counter used to animate the waiting indicator.
     pub tick: usize,
     /// Model round-trips since the user last typed. Bounded so a model that
@@ -534,6 +570,10 @@ pub struct App {
     /// Whether `/sessions` has asked for the sessions view. Parked for the event
     /// loop to take, like `pending_fetch` — a session cannot open it itself.
     sessions_requested: bool,
+    /// A saved session the view's `l` picked, parked on the same reasoning as
+    /// `sessions_requested`: opening it means adding a slot, which is the
+    /// harness's business rather than this conversation's.
+    requested_open: Option<String>,
     /// The checkpoint for this turn, opened by the first mutating action.
     ///
     /// Lazily, because most turns mutate nothing and a folder per question would
@@ -699,6 +739,7 @@ impl App {
             follow: true,
             should_quit: false,
             quit_armed: None,
+            open_elsewhere: Vec::new(),
             tick: 0,
             iterations: 0,
             max_iterations,
@@ -708,6 +749,7 @@ impl App {
             turn_number: 0,
             rewind: None,
             sessions_requested: false,
+            requested_open: None,
             turn_prompt: String::new(),
             checkpoint: None,
             keep_checkpoints: None,
@@ -1316,9 +1358,35 @@ impl App {
         self.load_named(name);
     }
 
+    /// Load `name` into this session, reporting whether it worked.
+    ///
+    /// The narrow public way in, for [`crate::sessions::Sessions`] filling a
+    /// fresh slot — on launch, or from the view's `l`. Says nothing on success:
+    /// a slot that exists *because* it was loaded has no news to report, unlike
+    /// `/load`, which replaced something.
+    pub fn open_saved(&mut self, name: &str) -> bool {
+        match crate::session::load(&self.sessions_dir, name) {
+            Ok(session) => {
+                self.apply_session(session);
+                self.current_session = name.to_string();
+                self.refresh_contract();
+                self.last_saved = self.fingerprint();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Load a session by name, replacing the conversation. Shared by `/load
     /// <name>` and the picker. A failed load leaves the current session intact.
     fn load_named(&mut self, name: String) {
+        // A session cannot be open in two slots — both would auto-save to one
+        // file and each would overwrite the other's turns. So naming a running
+        // one means "go there", the same as picking its row.
+        if self.open_elsewhere.contains(&name) {
+            self.requested_open = Some(name);
+            return;
+        }
         match crate::session::load(&self.sessions_dir, &name) {
             Ok(session) => {
                 self.apply_session(session);
@@ -1347,7 +1415,20 @@ impl App {
     /// ago among ones you have not opened in weeks. Ties — two sessions saved in
     /// the same second, which the fixtures do — fall back to the name, so the
     /// order is total rather than dependent on directory iteration.
+    /// Every saved session is listed, running ones included and marked — see
+    /// [`Openness`]. Hiding them would make a session you know exists read as
+    /// one that is gone.
     pub fn open_load_picker(&mut self) {
+        self.open_picker(false);
+    }
+
+    /// The same picker, opened by `l` in the sessions view: confirming adds the
+    /// session rather than replacing this one.
+    pub fn open_session_picker(&mut self) {
+        self.open_picker(true);
+    }
+
+    fn open_picker(&mut self, open_as_new: bool) {
         let mut listed: Vec<(String, crate::session::Head)> =
             crate::session::list(&self.sessions_dir)
                 .into_iter()
@@ -1370,13 +1451,27 @@ impl App {
                 .iter()
                 .map(|(_, head)| head.model.clone().unwrap_or_default())
                 .collect();
+            let open = listed
+                .iter()
+                .map(|(name, _)| {
+                    if *name == self.current_session {
+                        Openness::Current
+                    } else if self.open_elsewhere.contains(name) {
+                        Openness::Open
+                    } else {
+                        Openness::Closed
+                    }
+                })
+                .collect();
             self.picker = Some(Picker {
                 sessions: listed.into_iter().map(|(name, _)| name).collect(),
                 selected: 0,
                 previews,
                 models,
+                open,
                 query: Input::default(),
                 searching: false,
+                open_as_new,
             });
         }
     }
@@ -1463,7 +1558,12 @@ impl App {
         }
     }
 
-    /// Load the highlighted session and close the picker.
+    /// Take the highlighted session and close the picker.
+    ///
+    /// Loads it in place, or — when the picker was opened by the view's `l` —
+    /// parks the name for the event loop to open as a session of its own. Parked
+    /// rather than acted on for the reason `/sessions` is: a session cannot add
+    /// an entry to a list it is one entry of.
     pub fn picker_confirm(&mut self) {
         // Resolve the highlighted match to a session index before taking the
         // picker, since the matches are derived from it.
@@ -1472,14 +1572,32 @@ impl App {
             .get(self.picker_index())
             .copied()
             .and_then(|i| {
-                self.picker
-                    .as_ref()
-                    .and_then(|picker| picker.sessions.get(i).cloned())
+                self.picker.as_ref().and_then(|picker| {
+                    let name = picker.sessions.get(i)?.clone();
+                    Some((name, *picker.open.get(i)?))
+                })
             });
+        let as_new = self.picker.as_ref().is_some_and(|p| p.open_as_new);
         self.picker = None;
-        if let Some(name) = chosen {
-            self.load_named(name);
+        let Some((name, openness)) = chosen else {
+            return;
+        };
+        match openness {
+            // Already here. Closing the picker is the whole of it — saying so
+            // would be telling you where you are standing.
+            Openness::Current => {}
+            // "Go to that session" is the same act from either picker, which is
+            // why this arm does not ask which one it was.
+            Openness::Open => self.requested_open = Some(name),
+            Openness::Closed if as_new => self.requested_open = Some(name),
+            Openness::Closed => self.load_named(name),
         }
+    }
+
+    /// A session the picker chose for the loop to open beside this one, or to
+    /// switch to when it is already running.
+    pub fn take_requested_open(&mut self) -> Option<String> {
+        self.requested_open.take()
     }
 
     pub fn picker_cancel(&mut self) {
@@ -1592,6 +1710,12 @@ impl App {
             Ok(models) => Catalog::Ready(models),
             Err(e) => Catalog::Failed(e),
         });
+    }
+
+    /// Tell this session which others are running, so it can refuse to load one
+    /// of them. See [`App::open_elsewhere`].
+    pub fn set_open_elsewhere(&mut self, names: Vec<String>) {
+        self.open_elsewhere = names;
     }
 
     /// Adopt a catalog another session already has.
@@ -3262,15 +3386,12 @@ impl App {
 
     /// Clear the conversation, keeping any system prompt in place.
     ///
-    /// Guards itself, unlike `begin_undo` and `open_rewind`, because `Ctrl+L`
-    /// reaches it without passing through [`App::submit`]. On the `/clear` path
-    /// it is therefore refused twice, which is the cost of having no way in that
-    /// is unguarded.
-    pub fn reset_conversation(&mut self) {
-        if self.is_busy() {
-            return self
-                .push_notice("/clear needs the turn to finish. Press Esc to cancel it, or wait.");
-        }
+    /// No busy guard of its own, and private, for the reason `begin_undo` and
+    /// `open_rewind` have neither: `/clear` is the only way here, and
+    /// [`App::submit`] refuses it while a turn is in flight. It used to carry
+    /// one because `Ctrl+L` reached it directly; that chord is gone, and with it
+    /// the only entry point that bypassed the single decision.
+    fn reset_conversation(&mut self) {
         self.history
             .retain(|m| m.role == crate::openrouter::Role::System);
         self.transcript.clear();
@@ -5027,6 +5148,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Three sessions in one temp dir: `alpha` running elsewhere, `beta` the one
+    /// we are in, `gamma` merely saved. Ordering pinned, since the picker sorts
+    /// by a whole-second timestamp.
+    fn three_sessions(tag: &str) -> (App, std::path::PathBuf) {
+        let dir = session_temp_dir(tag);
+        let mut app = app_in(&dir);
+        submit_prompt(&mut app, "x");
+        app.input.insert_str("/save alpha");
+        app.submit();
+        app.input.insert_str("/fork gamma");
+        app.submit();
+        app.input.insert_str("/fork beta");
+        app.submit();
+        pin_saved_at(&dir, "alpha", 2_000_000_002);
+        pin_saved_at(&dir, "beta", 2_000_000_001);
+        pin_saved_at(&dir, "gamma", 2_000_000_000);
+        app.set_open_elsewhere(vec!["alpha".into()]);
+        (app, dir)
+    }
+
+    /// Hiding a running session would make one you know exists read as one that
+    /// is gone. It is listed and marked instead.
+    #[test]
+    fn the_picker_lists_running_sessions_and_says_which_they_are() {
+        let (mut app, dir) = three_sessions("picker-openness");
+        app.open_load_picker();
+
+        let picker = app.picker().expect("opened");
+        assert_eq!(picker.sessions, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(
+            picker.open,
+            vec![Openness::Open, Openness::Current, Openness::Closed]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Go to that session" is the same act from either picker, so both park it
+    /// rather than one loading it over the conversation you are in.
+    #[test]
+    fn choosing_a_running_session_parks_a_switch_from_either_picker() {
+        for as_new in [false, true] {
+            let (mut app, dir) = three_sessions("picker-switch");
+            let history_before = app.history.clone();
+            if as_new {
+                app.open_session_picker();
+            } else {
+                app.open_load_picker();
+            }
+            app.picker_confirm(); // `alpha` is first and running
+
+            assert_eq!(app.take_requested_open().as_deref(), Some("alpha"));
+            assert_eq!(app.session_name(), "beta", "nothing loaded in place");
+            assert_eq!(app.history, history_before);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// You are already there. Closing the picker is the whole of it.
+    #[test]
+    fn choosing_the_session_you_are_in_just_closes_the_picker() {
+        let (mut app, dir) = three_sessions("picker-current");
+        let transcript_before = app.transcript.len();
+        app.open_load_picker();
+        app.picker_move(1); // to `beta`, the current one
+        app.picker_confirm();
+
+        assert!(app.picker().is_none());
+        assert_eq!(app.take_requested_open(), None);
+        assert_eq!(
+            app.transcript.len(),
+            transcript_before,
+            "and says nothing: telling you where you are standing is not news"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The picker is not the only way in, so the name path answers the same way.
+    #[test]
+    fn loading_a_running_session_by_name_switches_to_it() {
+        let (mut app, dir) = three_sessions("load-running");
+        let history_before = app.history.clone();
+
+        app.input.insert_str("/load alpha");
+        app.submit();
+
+        assert_eq!(app.take_requested_open().as_deref(), Some("alpha"));
+        assert_eq!(app.session_name(), "beta", "still where it was");
+        assert_eq!(app.history, history_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The view's `l`: same list, different verb. A session cannot add a slot,
+    /// so confirming parks the name instead of loading it here.
+    #[test]
+    fn the_as_new_picker_parks_a_session_that_is_not_running() {
+        let (mut app, dir) = three_sessions("picker-as-new");
+        let history_before = app.history.clone();
+
+        app.open_session_picker();
+        assert!(app.picker().expect("opened").open_as_new);
+        app.picker_move(2); // `gamma`, saved and not running
+        app.picker_confirm();
+
+        assert_eq!(app.take_requested_open().as_deref(), Some("gamma"));
+        assert_eq!(app.session_name(), "beta", "still the session it was in");
+        assert_eq!(
+            app.history, history_before,
+            "and nothing was loaded over it"
+        );
+        assert!(app.picker().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ordinary picker still loads a session that is not running, in place.
+    #[test]
+    fn the_load_picker_still_loads_a_closed_session_in_place() {
+        let (mut app, dir) = three_sessions("picker-in-place");
+        app.open_load_picker();
+        assert!(!app.picker().expect("opened").open_as_new);
+        app.picker_move(2); // `gamma`
+        app.picker_confirm();
+
+        assert_eq!(app.session_name(), "gamma");
+        assert_eq!(app.take_requested_open(), None, "nothing parked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn picker_move_clamps_at_both_ends() {
         let dir = session_temp_dir("picker-move");
@@ -5926,19 +6174,6 @@ mod tests {
             "the notice should name the command: {}",
             last_notice(&app)
         );
-    }
-
-    /// `Ctrl+L` reaches `reset_conversation` without passing through `submit`,
-    /// so the guard has to be there too.
-    #[test]
-    fn ctrl_l_cannot_clear_a_conversation_mid_turn() {
-        let mut app = busy_app();
-        let before = app.history.len();
-        app.reset_conversation();
-
-        assert_eq!(app.history.len(), before);
-        assert!(app.is_busy(), "clearing must not swallow the turn");
-        assert!(last_notice(&app).contains("/clear needs the turn to finish"));
     }
 
     /// The trap `runs_while_busy` exists for: `/save <name>` renames the

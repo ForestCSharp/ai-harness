@@ -15,13 +15,23 @@
 //! They share one working directory. Nothing isolates them from each other — see
 //! the note on checkpoints in the README, which is the sharp edge of that.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
 use crate::app::{App, Catalog, Status};
 use crate::input::Input;
+use crate::session::OpenSet;
 use crate::ui::TranscriptCache;
+
+/// Sessions named in the record that are no longer on disk.
+///
+/// Named rather than passed over: a session that is gone is more likely to be a
+/// surprise than a decision you remember making.
+fn missing_notice(missing: &[String]) -> String {
+    format!("Could not reopen {}: no longer saved.", missing.join(", "))
+}
 
 /// Most sessions kept at once.
 ///
@@ -102,11 +112,21 @@ pub struct Sessions {
     current: usize,
     view: Option<View>,
     next_id: u64,
+    /// The project these sessions belong to, stamped on the open-set record so a
+    /// shared `--sessions-dir` cannot resume another project's work.
+    root: PathBuf,
+    /// The open set as last written, so [`Sessions::maybe_record_open`] can tell
+    /// whether anything changed.
+    recorded: Option<OpenSet>,
 }
 
 impl Sessions {
     /// Start with one session, the way the harness has always started.
     pub fn new(app: App) -> Self {
+        let root = app.sandbox.as_ref().map_or_else(
+            || app.sessions_dir().to_path_buf(),
+            |sandbox| sandbox.root().to_path_buf(),
+        );
         Self {
             slots: vec![Slot {
                 id: 1,
@@ -117,7 +137,81 @@ impl Sessions {
             current: 0,
             view: None,
             next_id: 2,
+            root,
+            recorded: None,
         }
+    }
+
+    /// Reopen the sessions that were open when the harness last quit.
+    ///
+    /// Falls back to [`Sessions::new`] whenever there is nothing usable to
+    /// resume — restore turned off, no record, a record belonging to another
+    /// project, or one whose sessions have all been deleted since. `app` is the
+    /// template either way: it carries this launch's flags, and each restored
+    /// session takes them through [`App::spawn_sibling`] before adopting its own
+    /// saved model and conversation.
+    pub fn restore(app: App, sessions_dir: &Path, root: &Path) -> Self {
+        let Some(open) = crate::session::read_open(sessions_dir) else {
+            return Self::new(app);
+        };
+        if open.root != root {
+            // Another project's set, through a shared `--sessions-dir`. The next
+            // quit overwrites it with this project's.
+            return Self::new(app);
+        }
+
+        let mut sessions = Self::new(app);
+        let mut missing = Vec::new();
+        for name in open.names.iter().take(MAX_SESSIONS) {
+            // Always from slot 0, which is the template. Spawning from the
+            // previously restored session instead would chain each one's
+            // adopted model into the next.
+            let mut fresh = sessions.slots[0].app.spawn_sibling(name.clone());
+            if !fresh.open_saved(name) {
+                missing.push(name.clone());
+                continue;
+            }
+            sessions.push(fresh);
+        }
+
+        let restored = sessions.slots.len() - 1;
+        if restored == 0 {
+            // Nothing came back, so the template stays as the fresh session the
+            // harness has always started with — and says why, if it was meant to
+            // be more than that.
+            if !missing.is_empty() {
+                sessions.app_mut().push_notice(missing_notice(&missing));
+            }
+            return sessions;
+        }
+        sessions.slots.remove(0);
+        sessions.current = open.current.min(sessions.slots.len() - 1);
+
+        sessions
+            .app_mut()
+            .push_notice(format!("Reopened {restored} session(s) from last time."));
+        if !missing.is_empty() {
+            sessions.app_mut().push_notice(missing_notice(&missing));
+        }
+        // Open on the view rather than on a conversation. Resuming work starts
+        // with choosing which work, and dropping straight into whichever session
+        // happened to have focus last would hide that there are others — the
+        // same reason the view exists at all. `Esc` is one key away.
+        sessions.open_view();
+        sessions
+    }
+
+    /// Add a slot holding `app`, focused. The one place a session is appended.
+    fn push(&mut self, app: App) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.slots.push(Slot {
+            id,
+            app,
+            inflight: None,
+            cache: TranscriptCache::default(),
+        });
+        self.current = self.slots.len() - 1;
     }
 
     pub fn len(&self) -> usize {
@@ -222,19 +316,102 @@ impl Sessions {
         let name = self.unique_name();
         let mut app = self.current().app.spawn_sibling(name);
         app.share_catalog(self.catalog());
-        let id = self.next_id;
-        self.next_id += 1;
-        self.slots.push(Slot {
-            id,
-            app,
-            inflight: None,
-            cache: TranscriptCache::default(),
-        });
-        self.current = self.slots.len() - 1;
+        self.push(app);
         let name = self.app().session_name().to_string();
         self.app_mut().push_notice(format!(
             "New session {name:?}. Ctrl+Space switches between them."
         ));
+    }
+
+    /// Put the focus in session `name`, opening it as a slot of its own if it is
+    /// not already running.
+    ///
+    /// The one answer to "go to that session", however it was asked — the `l`
+    /// shortcut in the view, a picker row, or `/load <name>`. Switching comes
+    /// first and is not subject to the cap: a session that is already running
+    /// takes no new slot, and refusing to *move* to one because eight are open
+    /// would be refusing the wrong thing.
+    pub fn reveal(&mut self, name: String) {
+        if let Some(i) = self.slot_of(&name) {
+            self.switch(i);
+            return;
+        }
+        if self.slots.len() >= MAX_SESSIONS {
+            return self.app_mut().push_notice(format!(
+                "Already running {MAX_SESSIONS} sessions, the most at once. Shut one \
+                 down first — Ctrl+Space, then x."
+            ));
+        }
+        let mut app = self.current().app.spawn_sibling(name.clone());
+        app.share_catalog(self.catalog());
+        if !app.open_saved(&name) {
+            return self
+                .app_mut()
+                .push_notice(format!("Could not open session {name:?}."));
+        }
+        self.push(app);
+        self.app_mut()
+            .push_notice(format!("Opened session {name:?}."));
+    }
+
+    /// Which slot is running this session, if any.
+    ///
+    /// Two slots on one session file auto-save over each other, so this is what
+    /// every way of opening one asks first — and the answer is where to go
+    /// rather than a reason to refuse.
+    pub fn slot_of(&self, name: &str) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.app.session_name() == name)
+    }
+
+    /// The names running right now, for the pickers to leave out.
+    pub fn open_names(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .map(|slot| slot.app.session_name().to_string())
+            .collect()
+    }
+
+    /// Make the set of open sessions known — to each session, and to disk.
+    ///
+    /// Both duties derive from the same list, and both are done by deriving and
+    /// comparing rather than by hooking spawn, close, switch and rename: the
+    /// reason [`App::maybe_autosave`] works from a fingerprint. One call site
+    /// cannot be missed, and `/rename` is exactly the hook that would have been.
+    pub fn sync_open_set(&mut self) {
+        // What each session may not load. Its own name is excluded: `/load` of
+        // the session you are already in is a no-op, not a collision.
+        let names = self.open_names();
+        for slot in self.slots.iter_mut() {
+            let mine = slot.app.session_name();
+            let others = names.iter().filter(|n| *n != mine).cloned().collect();
+            slot.app.set_open_elsewhere(others);
+        }
+        self.maybe_record_open(names);
+    }
+
+    /// Write the open set when it has changed.
+    fn maybe_record_open(&mut self, names: Vec<String>) {
+        let open = OpenSet {
+            version: crate::session::VERSION,
+            root: self.root.clone(),
+            current: self.current,
+            names,
+        };
+        if self.recorded.as_ref() == Some(&open) {
+            return;
+        }
+        // Best effort: failing to record which sessions were open must not be
+        // reported as if the conversations themselves were at risk. They are
+        // each auto-saved in their own right.
+        if crate::session::write_open(self.sessions_dir(), &open).is_ok() {
+            self.recorded = Some(open);
+        }
+    }
+
+    fn sessions_dir(&self) -> &Path {
+        self.current().app.sessions_dir()
     }
 
     /// A session name that is taken neither by a running session nor by a
@@ -818,5 +995,265 @@ mod tests {
             "the filtered row's session is the one that went"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- reopening the set that was open ---
+
+    /// Put a loadable session on disk under `name`.
+    fn saved(dir: &Path, name: &str) {
+        let session = crate::session::Session::new(
+            format!("{name}/model"),
+            vec![crate::openrouter::Message::system("contract")],
+            Vec::new(),
+            Vec::new(),
+            crate::ledger::Ledger::default(),
+        );
+        crate::session::save(dir, name, &session).unwrap();
+    }
+
+    fn names_of(sessions: &Sessions) -> Vec<String> {
+        sessions.open_names()
+    }
+
+    /// The template carries this launch's flags, so a restored session has to
+    /// take them — and then its own saved model on top.
+    #[test]
+    fn restore_reopens_the_recorded_set_in_order_with_focus_where_it_was() {
+        let (_, dir) = sessions("restore");
+        saved(&dir, "alpha");
+        saved(&dir, "beta");
+        saved(&dir, "gamma");
+        crate::session::write_open(
+            &dir,
+            &OpenSet {
+                version: crate::session::VERSION,
+                root: dir.clone(),
+                current: 1,
+                names: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            },
+        )
+        .unwrap();
+
+        let mut template = App::new("m".into(), None, 10, dir.clone());
+        template.auto_approve = true;
+        let restored = Sessions::restore(template, &dir, &dir);
+
+        assert_eq!(names_of(&restored), vec!["alpha", "beta", "gamma"]);
+        assert_eq!(restored.current, 1, "focus where it was left");
+        assert!(
+            restored.view_open(),
+            "resuming starts with choosing which work"
+        );
+        assert_eq!(restored.view().unwrap().selected, 1, "on the one you left");
+        assert_eq!(restored.app().model, "beta/model", "its own saved model");
+        assert!(
+            restored.iter().all(|slot| slot.app.auto_approve),
+            "and this launch's flags"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_names_a_session_that_is_no_longer_saved() {
+        let (_, dir) = sessions("restore-missing");
+        saved(&dir, "alpha");
+        crate::session::write_open(
+            &dir,
+            &OpenSet {
+                version: crate::session::VERSION,
+                root: dir.clone(),
+                current: 0,
+                names: vec!["alpha".into(), "deleted-since".into()],
+            },
+        )
+        .unwrap();
+
+        let restored = Sessions::restore(App::new("m".into(), None, 10, dir.clone()), &dir, &dir);
+        assert_eq!(names_of(&restored), vec!["alpha"]);
+        assert!(
+            transcript_says(&restored, "deleted-since"),
+            "a session that is gone should be named, not passed over"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--sessions-dir` can point two projects at one directory, and the set is
+    /// a fact about a project.
+    #[test]
+    fn restore_declines_a_record_from_another_project() {
+        let (_, dir) = sessions("restore-elsewhere");
+        saved(&dir, "alpha");
+        crate::session::write_open(
+            &dir,
+            &OpenSet {
+                version: crate::session::VERSION,
+                root: PathBuf::from("/some/other/project"),
+                current: 0,
+                names: vec!["alpha".into()],
+            },
+        )
+        .unwrap();
+
+        let restored = Sessions::restore(App::new("m".into(), None, 10, dir.clone()), &dir, &dir);
+        assert_eq!(restored.len(), 1);
+        assert_ne!(names_of(&restored), vec!["alpha".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_with_nothing_to_resume_starts_the_one_fresh_session() {
+        let (_, dir) = sessions("restore-empty");
+        // No record at all.
+        let restored = Sessions::restore(App::new("m".into(), None, 10, dir.clone()), &dir, &dir);
+        assert_eq!(restored.len(), 1);
+        assert!(
+            !restored.view_open(),
+            "one fresh session is a prompt to type at, not a list to choose from"
+        );
+
+        // A record whose sessions have all been deleted.
+        crate::session::write_open(
+            &dir,
+            &OpenSet {
+                version: crate::session::VERSION,
+                root: dir.clone(),
+                current: 0,
+                names: vec!["gone".into()],
+            },
+        )
+        .unwrap();
+        let restored = Sessions::restore(App::new("m".into(), None, 10, dir.clone()), &dir, &dir);
+        assert_eq!(restored.len(), 1);
+        assert!(transcript_says(&restored, "gone"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_holds_the_cap() {
+        let (_, dir) = sessions("restore-cap");
+        let names: Vec<String> = (0..MAX_SESSIONS + 3).map(|i| format!("s{i}")).collect();
+        for name in &names {
+            saved(&dir, name);
+        }
+        crate::session::write_open(
+            &dir,
+            &OpenSet {
+                version: crate::session::VERSION,
+                root: dir.clone(),
+                current: 0,
+                names,
+            },
+        )
+        .unwrap();
+
+        let restored = Sessions::restore(App::new("m".into(), None, 10, dir.clone()), &dir, &dir);
+        assert_eq!(restored.len(), MAX_SESSIONS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Derived and compared rather than hooked onto every mutation, so this is
+    /// what checks the comparison actually notices.
+    #[test]
+    fn the_record_is_written_when_the_set_changes_and_not_otherwise() {
+        let (mut sessions, dir) = sessions("record");
+        sessions.sync_open_set();
+        let first = crate::session::read_open(&dir).expect("recorded");
+        assert_eq!(first.names.len(), 1);
+        assert_eq!(first.root, dir);
+
+        // Nothing changed, so nothing is written — the deleted file stays gone.
+        std::fs::remove_file(dir.join(crate::session::OPEN_FILE)).unwrap();
+        sessions.sync_open_set();
+        assert!(crate::session::read_open(&dir).is_none());
+
+        sessions.spawn();
+        sessions.sync_open_set();
+        assert_eq!(crate::session::read_open(&dir).unwrap().names.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_a_session_drops_it_from_the_record() {
+        let (mut sessions, dir) = sessions("record-close");
+        sessions.spawn();
+        let doomed = sessions.app().session_name().to_string();
+        sessions.sync_open_set();
+        assert!(
+            crate::session::read_open(&dir)
+                .unwrap()
+                .names
+                .contains(&doomed)
+        );
+
+        sessions.close(1);
+        sessions.sync_open_set();
+        let record = crate::session::read_open(&dir).unwrap();
+        assert!(
+            !record.names.contains(&doomed),
+            "a session you shut down should not come back: {record:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- going to a session, opening it if it is not running ---
+
+    #[test]
+    fn revealing_a_saved_session_adds_it_rather_than_replacing_anything() {
+        let (mut sessions, dir) = sessions("reveal-saved");
+        saved(&dir, "archived");
+        let already = sessions.app().session_name().to_string();
+
+        sessions.reveal("archived".into());
+        assert_eq!(sessions.len(), 2, "the running session is untouched");
+        assert_eq!(sessions.app().session_name(), "archived");
+        assert_eq!(sessions.app().model, "archived/model");
+        assert!(sessions.slot_of(&already).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two slots on one session file auto-save over each other, so the second
+    /// ask has to move you rather than duplicate it.
+    #[test]
+    fn revealing_a_running_session_switches_instead_of_opening_it_twice() {
+        let (mut sessions, dir) = sessions("reveal-twice");
+        saved(&dir, "archived");
+        sessions.reveal("archived".into());
+        let first = sessions.app().session_name().to_string();
+        sessions.spawn();
+        assert_ne!(sessions.app().session_name(), first);
+
+        sessions.reveal("archived".into());
+        assert_eq!(sessions.len(), 3, "no duplicate slot");
+        assert_eq!(sessions.app().session_name(), "archived", "but you moved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Switching takes no new slot, so refusing to *move* at the cap would be
+    /// refusing the wrong thing.
+    #[test]
+    fn the_cap_stops_opening_a_session_but_not_going_to_one() {
+        let (mut sessions, dir) = sessions("reveal-cap");
+        saved(&dir, "archived");
+        sessions.reveal("archived".into());
+        while sessions.len() < MAX_SESSIONS {
+            sessions.spawn();
+        }
+        saved(&dir, "not-running");
+
+        sessions.reveal("not-running".into());
+        assert_eq!(sessions.len(), MAX_SESSIONS, "the cap holds");
+        assert!(transcript_says(&sessions, "the most at once"));
+
+        sessions.reveal("archived".into());
+        assert_eq!(sessions.app().session_name(), "archived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether the focused session's transcript mentions `needle`.
+    fn transcript_says(sessions: &Sessions, needle: &str) -> bool {
+        sessions.app().transcript.iter().any(|entry| match entry {
+            crate::app::Entry::Notice(text) => text.contains(needle),
+            _ => false,
+        })
     }
 }

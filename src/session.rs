@@ -116,6 +116,52 @@ pub const PLAN_FILE: &str = "plan.md";
 /// Not appended to, because concatenated JSON documents do not parse.
 pub const ARCHIVE_PREFIX: &str = "compaction-";
 
+/// Which sessions were open when the harness last quit, beside the session
+/// folders rather than inside one — it is a fact about the set, not about any
+/// member of it.
+///
+/// Invisible to [`list`], which keys on `<entry>/session.json` rather than on
+/// "is a directory" precisely so a neighbour like this cannot be mistaken for a
+/// session.
+pub const OPEN_FILE: &str = "open.json";
+
+/// The sessions that were open, so relaunching resumes where you left off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenSet {
+    pub version: u32,
+    /// The project this set belongs to.
+    ///
+    /// This is what lets one file serve: `--sessions-dir` can point two projects
+    /// at one directory, and "the sessions you had open" is a fact about a
+    /// project. A record from elsewhere is declined rather than acted on.
+    pub root: PathBuf,
+    /// Index into `names` of the session that had focus.
+    pub current: usize,
+    pub names: Vec<String>,
+}
+
+/// Read the open set, or `None` when there is not a usable one.
+///
+/// Missing, unreadable and unparseable all answer `None` rather than an error:
+/// this file is a convenience, and nothing is lost by starting fresh. A record
+/// from a newer version is declined for the reason [`load`] declines one — an
+/// old reader guessing at a new format is worse than not resuming.
+pub fn read_open(dir_: &Path) -> Option<OpenSet> {
+    let text = std::fs::read_to_string(dir_.join(OPEN_FILE)).ok()?;
+    let open: OpenSet = serde_json::from_str(&text).ok()?;
+    (open.version <= VERSION).then_some(open)
+}
+
+/// Write the open set, creating the sessions directory if it is not there yet.
+pub fn write_open(dir_: &Path, open: &OpenSet) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir_)
+        .with_context(|| format!("creating sessions directory {}", dir_.display()))?;
+    let path = dir_.join(OPEN_FILE);
+    let json = serde_json::to_string_pretty(open).context("serialising the open set")?;
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
 /// Lines kept in a preview, which is also what the picker shows.
 pub const PREVIEW_LINES: usize = 3;
 
@@ -605,6 +651,57 @@ mod tests {
         std::fs::write(dir.join("stray.json"), "{}").unwrap();
 
         assert_eq!(list(&dir), vec!["real".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn open_set(root: &str, names: &[&str], current: usize) -> OpenSet {
+        OpenSet {
+            version: VERSION,
+            root: PathBuf::from(root),
+            current,
+            names: names.iter().map(|n| (*n).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_open_set_round_trips() {
+        let dir = temp_dir("openset");
+        let open = open_set("/projects/thing", &["alpha", "beta"], 1);
+        write_open(&dir, &open).unwrap();
+        assert_eq!(read_open(&dir), Some(open));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record is a convenience. Every way of not having one answers the
+    /// same: start fresh, rather than fail to start.
+    #[test]
+    fn an_unusable_open_set_reads_as_nothing() {
+        let dir = temp_dir("openset-broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_open(&dir), None, "no file at all");
+
+        std::fs::write(dir.join(OPEN_FILE), "{ truncated").unwrap();
+        assert_eq!(read_open(&dir), None, "not JSON");
+
+        // A newer writer's format, declined for the reason `load` declines one:
+        // guessing at it is worse than not resuming.
+        let mut future = open_set("/projects/thing", &["alpha"], 0);
+        future.version = VERSION + 1;
+        write_open(&dir, &future).unwrap();
+        assert_eq!(read_open(&dir), None, "from a newer build");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// It lives among the session folders, so the thing that enumerates those
+    /// must not see it.
+    #[test]
+    fn the_open_set_is_not_a_session() {
+        let dir = temp_dir("openset-listing");
+        save(&dir, "real", &sample()).unwrap();
+        write_open(&dir, &open_set("/projects/thing", &["real"], 0)).unwrap();
+
+        assert_eq!(list(&dir), vec!["real".to_string()]);
+        assert!(!exists(&dir, "open.json"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -133,6 +133,18 @@ pub struct Args {
     #[arg(long, env = "AI_HARNESS_STRICT_REPLIES")]
     pub strict_replies: bool,
 
+    /// Start with one fresh session instead of reopening the ones that were
+    /// open when the harness last quit in this project.
+    ///
+    /// Restoring is on by default: every session auto-saves, so quitting already
+    /// loses nothing except *which* conversations you had going — and rebuilding
+    /// that by hand through `/load`, once per session, is the tedious half of
+    /// starting work again. The record is per project (see
+    /// [`Args::sessions_dir`]), so this only ever reopens sessions belonging to
+    /// the directory you launched in.
+    #[arg(long, env = "AI_HARNESS_NO_RESTORE")]
+    pub no_restore: bool,
+
     /// Directory holding session folders.
     ///
     /// Defaults to `.ai_harness/sessions` under the sandbox root, so sessions

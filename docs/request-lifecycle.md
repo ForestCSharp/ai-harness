@@ -28,6 +28,20 @@ nothing means the session was shut down while its work was in flight. Terminal
 events go to the focused slot, or to the sessions view when it is open. Everything
 below describes one session; the others are doing the same thing beside it.
 
+The set of slots is not built fresh each launch. `Sessions::restore` reads
+`open.json` from the sessions directory and reopens what was running when this
+project last quit — the `App` built in `run` becomes the template each restored
+session takes its flags from, before adopting its own saved model and
+conversation. When anything came back it also leaves the sessions view open, so
+the first frame is the list rather than a conversation. `sync_open_set` runs once
+per loop iteration beside
+`maybe_autosave` and does the mirror of that job: it tells each session which
+others are running, so none loads a conversation another slot already holds
+(both would auto-save to one file), and writes the record when the set has
+changed. Both are derived and compared rather than hooked onto spawn, close,
+switch and rename, for the reason `maybe_autosave` works from a fingerprint —
+one call site cannot be missed.
+
 ## 1. You press Enter
 
 The keypress reaches `handle_key` ([src/main.rs:210](../src/main.rs)). With no
@@ -485,10 +499,10 @@ lands on the next request, because the one in flight already carries its model.
 Refused input is left in the buffer rather than consumed, which is why `submit`
 parses `input.text()` and only clears once it has decided to act.
 
-The guard lives at every entry point that is *not* `submit`. `/undo` and
-`/rewind` have none, so they carry no busy check of their own. `Ctrl+L` does have
-one — it calls `reset_conversation` directly — so that function guards itself,
-and the `/clear` path is therefore refused twice.
+`submit` is the *only* entry point, so it is the only guard: `/undo`, `/rewind`
+and `/clear` carry no busy check of their own. `reset_conversation` used to,
+because `Ctrl+L` called it directly; removing that chord removed the one path
+that bypassed the single decision, and the redundant guard went with it.
 
 ### The one update that is not part of a turn
 
@@ -527,7 +541,7 @@ cannot be run.
 | `src/highlight.rs` | Language detection and per-line tokenising for code blocks |
 | `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
-| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`) |
+| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `open.json`) |
 | `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

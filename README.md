@@ -445,7 +445,7 @@ keyboard layout, and the system takes the key before the terminal sees it.
 │      you: clean up the tmp directory
 │      rm -rf tmp/*
 │
-│/ search · j/k or ↑/↓ · Enter switch · n new · x shut down · Esc close
+│/ search · j/k · Enter switch · n new · l open saved · x shut down · Esc close
 └────────────────────────────────────────────────────────────────────
 ```
 
@@ -487,9 +487,60 @@ a reply that was in flight, which cancelling would have lost anyway. The last
 session cannot be shut down, since a harness with nowhere to type is not a state
 worth having; `/quit` is how you leave.
 
-The list shows sessions that are *running*. Opening a saved one is still `/load`,
-which replaces the conversation you are in rather than opening it beside the
-others.
+The list shows sessions that are *running*. **`l` opens a saved one beside
+them** — the picker with `Enter` meaning "open", so the picked session becomes a
+slot of its own and nothing already running is disturbed. `/load` inside a
+session keeps its own meaning, replacing that conversation; the two are different
+operations rather than one with a surprising second mode. Picking a session that
+is *already* running means the same thing from either, and is covered next.
+
+**A session cannot be open in two slots at once** — both would auto-save to one
+file and each would overwrite the other's turns. So the picker lists every saved
+session and marks the running ones with a green `●`, in the same column the view
+above puts `!` and the spinner; the one you are in also says `‹current›`:
+
+```
+┌ load session ─────────────────────────────────────────────────
+│  / to search
+│
+│› ● auth-refactor  ‹current›            deepseek/deepseek-v4-pro
+│  ─────────────────────────────────────────────────────────────
+│    you: rework the token refresh
+│
+│  ● session-1785873241                  z-ai/glm-5.2
+│  ─────────────────────────────────────────────────────────────
+│    you: add a checkpoint module
+│
+│    old-experiment                      z-ai/glm-5.2
+│● running · Enter switches to it · Esc cancel
+└───────────────────────────────────────────────────────────────
+```
+
+`Enter` on a dotted row **switches to that session** rather than loading it, and
+`/load <name>` naming a running one does the same. Nothing is refused: the
+picker is the one place that answers "where is that session", whether the answer
+is "loading it" or "over there". The footer says which of the two `Enter` will
+do, because that differs per row.
+
+### Picking up where you left off
+
+The set of sessions you had open is recorded in
+`.ai_harness/sessions/open.json`, and **launching reopens it**. Every session
+already auto-saves, so what this adds is only the *set* — which was the tedious
+half of starting again, since rebuilding it by hand meant `/load` once per
+session.
+
+When anything was reopened, the harness **starts on the sessions view** rather
+than on a conversation, highlighting the one you were last in. Resuming work
+begins with choosing which work, and dropping straight into whichever session had
+focus would hide that there are others — which is what the view exists to show.
+`Enter` takes the highlight and `Esc` closes it. A launch with nothing to reopen
+starts at the prompt, as it always has.
+
+The record names the project it belongs to, so pointing `--sessions-dir` at a
+directory two projects share never reopens the other one's work. A session
+deleted between runs is named in a notice rather than passed over. `--no-restore`
+starts with one fresh session instead.
 
 Two things they share, deliberately: the working directory and the sandbox.
 Nothing isolates one session from another, and the boundary is still the project
@@ -810,7 +861,9 @@ searches behind the approval modal along with everything else, and
 `--confirm-fetch` does the same for URL fetches.
 `--strict-replies` rejects a reply that narrates before its element rather than
 dropping the narration, `--no-reasoning` starts with the reasoning window
-hidden, and `--keep-checkpoints` caps how many turns of
+hidden, `--no-restore` starts with one fresh session instead of
+[reopening the ones you had](#picking-up-where-you-left-off), and
+`--keep-checkpoints` caps how many turns of
 [undo history](#checkpoints-and-undo) a fresh session keeps.
 `--auto-approve` goes the other way and removes the modal entirely — read
 [Sandboxing](#sandboxing) before using it. Every flag also has an environment
@@ -825,9 +878,9 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | `Esc` | Interrupt the in-flight reply or running command (while busy) |
 | `↑` / `↓` | Recall previous / next prompt (on an empty prompt) |
 | `Ctrl+Space` | Open the sessions view (see [Sessions](#sessions)); `Ctrl+T` does the same |
+| `l` (in the sessions view) | Open a saved session beside the running ones |
 | `Ctrl+C` | Quit — **twice within a second**; one press arms it and the status bar says so |
 | `Ctrl+D` | Quit when the prompt is empty |
-| `Ctrl+L` | Clear the conversation (keeps the system prompt); refused while a turn is running |
 | `PageUp` / `PageDown` | Scroll the transcript |
 | `Ctrl+↑` / `Ctrl+↓` | Scroll one line |
 | `End` | Jump back to the newest message when scrolled up |
@@ -965,7 +1018,7 @@ reading while you choose which conversation to be in.
 | `src/highlight.rs` | Language detection and tokenising for code blocks |
 | `src/markdown.rs` | Markdown subset for rendering model responses |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
-| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`) |
+| `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`, `open.json`) |
 | `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
@@ -1022,8 +1075,7 @@ matches what was sent.
 
 `/save <name>` is in the second list because it *renames* the session, and the
 folder it moves is where the running turn's checkpoint is being written; a plain
-`/save` is a snapshot and is fine. `Ctrl+L` is refused for the same reason
-`/clear` is.
+`/save` is a snapshot and is fine.
 
 A refusal leaves what you typed **in the prompt**, so a mistimed `Enter` on a
 paragraph does not throw the paragraph away. Sending a plain prompt still waits
@@ -1071,6 +1123,7 @@ The session **auto-saves after every turn**. Each session is a *folder*, under
 ```
 .ai_harness/
 └── sessions/
+    ├── open.json
     └── <name>/
         ├── session.json
         ├── preview.txt
@@ -1081,6 +1134,11 @@ A folder rather than a file because the conversation is only the first thing a
 session owns: `plan.md` is [plan mode](#plan-mode)'s output and sits beside it, and
 a folder means `/rename` and `/fork` carry it along without knowing it exists.
 `plan.md` is only there once a plan has been written.
+
+`open.json` is the one file that is about the *set* rather than a member of it:
+which sessions were open, so launching can reopen them. It sits among the folders
+and is not mistaken for one, because listing keys on `<entry>/session.json`
+rather than on "is a directory".
 
 `preview.txt` is the session's last few lines of prose, written on every save so
 the `/load` picker can show what each session was about. It exists as its own file

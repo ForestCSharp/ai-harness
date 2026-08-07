@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{App, Choice, Direction, Entry, Pending, Status};
+use crate::app::{App, Choice, Direction, Entry, Openness, Pending, Status};
 use crate::diff::Change;
 use crate::highlight;
 use crate::protocol::Action;
@@ -188,7 +188,7 @@ struct Panel {
     body: Vec<Line<'static>>,
     /// The footer line. `None` leaves it to the caller, which is how the
     /// approval panel puts its buttons there.
-    hint: Option<&'static str>,
+    hint: Option<String>,
     height: u16,
     /// Rows of `body` before the selectable list starts, so a click can be
     /// mapped back to a row.
@@ -262,11 +262,14 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             title: " the model is asking ",
             colour: Color::Yellow,
             body,
-            hint: Some(if question.on_other() {
-                "type your answer · Enter send · ↑/↓ choose · Esc dismiss"
-            } else {
-                "j/k or ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
-            }),
+            hint: Some(
+                if question.on_other() {
+                    "type your answer · Enter send · ↑/↓ choose · Esc dismiss"
+                } else {
+                    "j/k or ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
+                }
+                .into(),
+            ),
             height,
             header,
             offset,
@@ -423,7 +426,7 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             title: " rewind to ",
             colour: Color::Yellow,
             body,
-            hint: Some("j/k or ↑/↓ · Enter rewind · Esc cancel"),
+            hint: Some("j/k or ↑/↓ · Enter rewind · Esc cancel".into()),
             height,
             // The summary row and the blank under it.
             header: 2,
@@ -461,16 +464,19 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             body.extend(rows);
         }
 
+        // Same list, different verb. `Enter` here either replaces the
+        // conversation you are in or opens the session beside it, and the title
+        // and hint are the only place that difference is visible.
         return Some(Panel {
             kind: PanelKind::Picker,
-            title: " load session ",
+            title: if picker.open_as_new {
+                " open session "
+            } else {
+                " load session "
+            },
             colour: Color::Blue,
             body,
-            hint: Some(if picker.searching {
-                "typing filters · Enter load · Esc back to the list"
-            } else {
-                "/ search · j/k or ↑/↓ · Enter load · Esc cancel"
-            }),
+            hint: Some(picker_hint(picker, &matches, app.picker_index())),
             height,
             // The query row and the blank under it.
             header: 2,
@@ -530,11 +536,14 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
             title: " choose a model ",
             colour: Color::Blue,
             body,
-            hint: Some(if picker.searching {
-                "typing filters · Enter select · Esc back to the list"
-            } else {
-                "/ search · j/k or ↑/↓ · Enter select · Esc cancel"
-            }),
+            hint: Some(
+                if picker.searching {
+                    "typing filters · Enter select · Esc back to the list"
+                } else {
+                    "/ search · j/k or ↑/↓ · Enter select · Esc cancel"
+                }
+                .into(),
+            ),
             height,
             // The query row and the blank under it.
             header: 2,
@@ -676,6 +685,30 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: Panel) -> (Rect, Rect) {
     (content, footer)
 }
 
+/// The picker's footer, which says what `Enter` will do to the highlighted row.
+///
+/// Dynamic rather than a fixed legend because the answer genuinely differs per
+/// row: a running session is somewhere to go, a saved one is something to load
+/// or open, and the one you are in is neither. A static footer would have to
+/// describe all three and so describe none.
+fn picker_hint(picker: &crate::app::Picker, matches: &[usize], index: usize) -> String {
+    let openness = matches
+        .get(index)
+        .and_then(|&i| picker.open.get(i).copied())
+        .unwrap_or(Openness::Closed);
+    let verb = match openness {
+        Openness::Current => "● you are here",
+        Openness::Open => "● running · Enter switches to it",
+        Openness::Closed if picker.open_as_new => "Enter open",
+        Openness::Closed => "Enter load",
+    };
+    if picker.searching {
+        format!("typing filters · {verb} · Esc back to the list")
+    } else {
+        format!("/ search · j/k or ↑/↓ · {verb} · Esc cancel")
+    }
+}
+
 /// Rendered rows for one session: its name, a rule, and its last few lines.
 ///
 /// A blank row trails each entry, because with three lines under every name a
@@ -686,6 +719,7 @@ fn picker_entry(
     model: &str,
     lines: &[String],
     focused: bool,
+    open: Openness,
     width: usize,
 ) -> Vec<Line<'static>> {
     let title = if focused {
@@ -700,16 +734,46 @@ fn picker_entry(
     // between. Only slightly, though — loading adopts it, so it is not trivia.
     let aside = selected_aside(focused);
     let marker = if focused { "› " } else { "  " };
+    // Two leading columns, focus then state — the shape `session_entry` already
+    // has, so the picker and the sessions view read the same way. The dot aligns
+    // down the list, which is what makes "which of these are running" a glance
+    // rather than a read.
+    let mark = match open {
+        Openness::Closed => "  ",
+        Openness::Open | Openness::Current => "● ",
+    };
+    // `‹current›` where the sessions view puts it, and for the same reason.
+    let here = if open == Openness::Current {
+        "  ‹current›"
+    } else {
+        ""
+    };
 
     // The name gives way to the model rather than the other way round: a name
     // truncated in the middle of a timestamp is still recognisable, a price of
-    // admission cut in half is not.
-    let room = width.saturating_sub(model.chars().count() + 3);
+    // admission cut in half is not. Both leading columns and the suffix come out
+    // of its budget, or a wide model pushes the row past the panel.
+    let head = marker.chars().count() + mark.chars().count() + here.chars().count();
+    let room = width.saturating_sub(model.chars().count() + head + 1);
     let shown = truncate(name, room.max(1));
-    let mut title_row = vec![Span::styled(format!("{marker}{shown}"), title)];
+    let mut title_row = vec![
+        Span::styled(marker.to_string(), title),
+        // Coloured rather than merely drawn, so it reads as a state and not as
+        // punctuation. Green for "running", the yellow having been spent on
+        // "wants you" in the sessions view.
+        Span::styled(
+            mark.to_string(),
+            if focused {
+                title
+            } else {
+                Style::default().fg(Color::Green)
+            },
+        ),
+        Span::styled(format!("{shown}{here}"), title),
+    ];
     if !model.is_empty() {
         let gap = width
-            .saturating_sub(2 + shown.chars().count() + model.chars().count())
+            .saturating_sub(head + shown.chars().count() + model.chars().count())
             .max(1);
         title_row.push(Span::styled(format!("{}{model}", " ".repeat(gap)), aside));
     }
@@ -768,7 +832,8 @@ fn picker_rows(
             let name = &picker.sessions[i];
             let lines = picker.previews.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let model = picker.models.get(i).map_or("", String::as_str);
-            picker_entry(name, model, lines, pos == selected, width)
+            let open = picker.open.get(i).copied().unwrap_or(Openness::Closed);
+            picker_entry(name, model, lines, pos == selected, open, width)
         })
         .collect();
 
@@ -2348,7 +2413,7 @@ pub fn draw_sessions(
     let hint = if view.searching {
         "typing filters · Enter switch · Esc back to the list"
     } else {
-        "/ search · j/k or ↑/↓ · Enter switch · n new · x shut down · Esc close"
+        "/ search · j/k · Enter switch · n new · l open saved · x shut down · Esc close"
     };
     // The armed quit takes the footer, as it takes the status bar on the other
     // screen. Quitting from here takes every session with it, so this is the
@@ -2529,13 +2594,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize
         "  ←/→ choose · Enter confirm · Esc keep planning"
     } else if app.question().is_some() {
         "  j/k or ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
-    } else if app.picker().is_some() {
+    } else if let Some(picker) = app.picker() {
         // The picker coexists with `Idle`, so without this the bar offers to
         // send a prompt while the panel below it is asking you to choose.
-        if app.picker_searching() {
-            "  typing filters · Enter load · Esc back to the list"
-        } else {
-            "  / search · j/k or ↑/↓ · Enter load · Esc cancel"
+        match (picker.searching, picker.open_as_new) {
+            (true, false) => "  typing filters · Enter load · Esc back to the list",
+            (false, false) => "  / search · j/k or ↑/↓ · Enter load · Esc cancel",
+            (true, true) => "  typing filters · Enter open · Esc back to the list",
+            (false, true) => "  / search · j/k or ↑/↓ · Enter open · Esc cancel",
         }
     } else if app.model_picker().is_some() {
         if app.model_searching() {
@@ -2552,7 +2618,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize
         // the box looks like it is there for nothing.
         "  Esc cancel · slash commands still run · Ctrl+C quit"
     } else {
-        "  Enter send · Alt+Enter newline · Ctrl+L clear · Ctrl+C quit"
+        // `/clear` where `Ctrl+L` used to be: the hint advertised clearing, and
+        // the command is now the only way to do it.
+        "  Enter send · Alt+Enter newline · /clear · Ctrl+C quit"
     };
     // An armed Ctrl+C replaces every other hint and is the one thing on this bar
     // that is not dim: it is a question with a deadline, and a hint nobody
@@ -2970,6 +3038,45 @@ mod tests {
     /// Starts from a cold cache, which is what most tests want to pin down.
     fn render(app: &mut App, width: u16, height: u16) -> (Vec<String>, Metrics) {
         render_cached(app, &mut TranscriptCache::default(), width, height)
+    }
+
+    /// The two pickers are one list with two meanings for `Enter`, and the
+    /// title and hint are the only place that difference shows.
+    #[test]
+    fn the_picker_says_whether_enter_loads_or_opens() {
+        let dir = std::env::temp_dir().join(format!("ai-harness-ui-verb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new("test/model".into(), None, 10, dir.clone());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_response("<ai-harness-response>ok</ai-harness-response>".into(), None);
+        app.input.insert_str("/save alpha");
+        app.submit();
+
+        app.open_load_picker();
+        let (screen, _) = render(&mut app, 78, 20);
+        let joined = screen.join("\n");
+        assert!(joined.contains("load session"), "{joined}");
+        assert!(joined.contains("Enter load"), "{joined}");
+
+        app.picker_cancel();
+        app.open_session_picker();
+        let (screen, _) = render(&mut app, 78, 20);
+        let joined = screen.join("\n");
+        assert!(joined.contains("open session"), "{joined}");
+        assert!(joined.contains("Enter open"), "{joined}");
+        assert!(!joined.contains("Enter load"), "{joined}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sessions_footer_offers_the_saved_sessions_key() {
+        let rows = vec![session_row("one", "ready", true)];
+        let (screen, _) = render_sessions(&rows, 0, 90, 10);
+        assert!(
+            screen.iter().any(|r| r.contains("l open saved")),
+            "{screen:?}"
+        );
     }
 
     /// A first Ctrl+C that changed nothing on screen would read as a key that
@@ -4255,8 +4362,10 @@ mod tests {
         let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
         app.input.insert_str("what is 2+2");
         let (rows, _) = render(&mut app, 70, 20);
+        // The menu's bordered title, not the bare word — which the status bar
+        // also says, and matching that would pass or fail for the wrong reason.
         assert!(
-            !rows.join("\n").contains("commands"),
+            !rows.join("\n").contains(" commands "),
             "no menu for ordinary text"
         );
     }
@@ -4839,6 +4948,92 @@ mod tests {
         (app, dir)
     }
 
+    /// A running session should be findable, marked as somewhere to go — hiding
+    /// it would make one you know exists read as one that is gone.
+    #[test]
+    fn the_picker_dots_a_running_session_and_names_the_current_one() {
+        let (mut app, dir) = app_with_picker(&["running", "here", "archived"]);
+        app.set_open_elsewhere(vec!["running".into()]);
+        // The picker snapshots on open, so it has to be reopened to see this.
+        app.open_load_picker();
+
+        let (rows, _) = render(&mut app, 70, 20);
+        let row = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}:\n{}", rows.join("\n")))
+                .clone()
+        };
+        assert!(row("running").contains("● running"), "{:?}", row("running"));
+        assert!(
+            !row("archived").contains('●'),
+            "a saved session is not running: {:?}",
+            row("archived")
+        );
+
+        // And the session the picker was opened from, marked the way the
+        // sessions view marks it.
+        app.picker_cancel();
+        app.input.insert_str("/save here");
+        app.submit();
+        app.open_load_picker();
+        let (rows, _) = render(&mut app, 70, 20);
+        let here = rows
+            .iter()
+            .find(|r| r.contains("here"))
+            .expect("the current session is listed");
+        assert!(
+            here.contains("● here") && here.contains("‹current›"),
+            "{here:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The footer answers "what will Enter do", which differs per row — a static
+    /// legend would have to describe all three cases and so describe none.
+    #[test]
+    fn the_picker_footer_follows_the_highlighted_row() {
+        let (mut app, dir) = app_with_picker(&["running", "archived"]);
+        app.set_open_elsewhere(vec!["running".into()]);
+        app.open_load_picker();
+
+        let (rows, _) = render(&mut app, 70, 20);
+        assert!(
+            rows.iter().any(|r| r.contains("Enter switches to it")),
+            "on the running row:\n{}",
+            rows.join("\n")
+        );
+
+        app.picker_move(1);
+        let (rows, _) = render(&mut app, 70, 20);
+        assert!(
+            rows.iter().any(|r| r.contains("Enter load")),
+            "on the saved row:\n{}",
+            rows.join("\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two leading columns plus a suffix come out of the name's budget, or a
+    /// wide model runs off the panel. That arithmetic has broken twice here.
+    #[test]
+    fn a_marked_picker_row_still_fits_its_panel() {
+        let (mut app, dir) = app_with_picker(&["a-fairly-long-session-name"]);
+        app.set_open_elsewhere(vec!["a-fairly-long-session-name".into()]);
+        app.open_load_picker();
+
+        for width in [40, 52, 70] {
+            let (rows, _) = render(&mut app, width, 20);
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "row overflows at width {width}: {row:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A save time that puts `names[i]` at position `i` in the picker.
     ///
     /// The picker orders by recency, so without this the fixtures depend on a
@@ -5176,8 +5371,11 @@ mod tests {
         // the recency order they are listed in falls back to the name.
         let selected = app.picker().unwrap().sessions[1].clone();
         let (rows, metrics) = render(&mut app, 60, 20);
+        // The focus marker leads, then the state column — two leading columns,
+        // as in the sessions view. These fixtures are not running, so the state
+        // column is blank.
         assert!(
-            rows.iter().any(|r| r.contains(&format!("› {selected}"))),
+            rows.iter().any(|r| r.contains(&format!("›   {selected}"))),
             "the selected row should carry the marker:\n{}",
             rows.join("\n")
         );

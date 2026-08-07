@@ -119,11 +119,15 @@ async fn main() -> Result<()> {
 }
 
 async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Args) -> Result<()> {
+    // Kept by value: the sandbox moves into `Ctx` below, and both the open-set
+    // record and its restore are keyed on which project this is.
+    let sandbox_root = sandbox.root().to_path_buf();
+    let sessions_dir = args.sessions_dir(&sandbox_root);
     let mut app = App::new(
         client.model().to_string(),
         args.system.clone(),
         args.max_iterations.max(1),
-        args.sessions_dir(sandbox.root()),
+        sessions_dir.clone(),
     );
     app.debug = args.debug || cfg!(debug_assertions);
     app.max_retries = args.max_retries;
@@ -170,9 +174,14 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         tx,
     };
     spawn_catalog_fetch(&ctx);
-    // Every conversation, its background work, and its rendering. Starts as one,
-    // which is how the harness has always started; `Ctrl+Space` opens more.
-    let mut sessions = Sessions::new(app);
+    // Every conversation, its background work, and its rendering. Starts as the
+    // set that was open when this project was last quit, or as one fresh session
+    // when there is nothing to resume; `Ctrl+Space` opens more.
+    let mut sessions = if args.no_restore {
+        Sessions::new(app)
+    } else {
+        Sessions::restore(app, &sessions_dir, &sandbox_root)
+    };
     let mut ticker = tokio::time::interval(TICK);
     let mut metrics = ui::Metrics::default();
 
@@ -228,6 +237,11 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                 if sessions.app_mut().take_sessions_request() {
                     sessions.open_view();
                 }
+                // And a session the view's `l` picked, parked for the same
+                // reason: adding a slot is the harness's business.
+                if let Some(name) = sessions.app_mut().take_requested_open() {
+                    sessions.reveal(name);
+                }
                 dirty = true;
             }
 
@@ -270,6 +284,11 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         for slot in sessions.iter_mut() {
             slot.app.maybe_autosave();
         }
+        // And which sessions those are — told to each session, so none tries to
+        // load one another slot has open, and written to disk so the next launch
+        // reopens this set. Before the quit check rather than inside it, so the
+        // last iteration records the final state.
+        sessions.sync_open_set();
 
         if sessions.app().should_quit {
             // Leaving takes every session with it, so nothing in flight is left
@@ -489,6 +508,13 @@ fn handle_sessions_event(event: Event, sessions: &mut Sessions, metrics: &ui::Me
                 KeyCode::Enter => sessions.view_confirm(),
                 KeyCode::Char('/') if !ctrl => sessions.view_search(true),
                 KeyCode::Char('n') if !ctrl => sessions.view_spawn(),
+                // Closes the view, as `n` does: the picker is a panel in the
+                // prompt's slot and this is a whole screen, so they cannot both
+                // be up — and a session you just opened is one you want to be in.
+                KeyCode::Char('l') if !ctrl => {
+                    sessions.close_view();
+                    sessions.app_mut().open_session_picker();
+                }
                 KeyCode::Char('x') if !ctrl => sessions.view_close_selected(),
                 // Esc, or the chord that opened it.
                 KeyCode::Esc => sessions.close_view(),
@@ -1258,10 +1284,8 @@ fn handle_key(
         // --- Editing ---
         // Not frozen while work is in flight: the prompt stays usable so a
         // command can be typed at a session that is busy. What such a command is
-        // allowed to *do* is decided in `App::submit`, and `Ctrl+L` — the one
-        // way to clear a conversation that does not pass through it — is guarded
-        // inside `reset_conversation`.
-        KeyCode::Char('l') if ctrl => app.reset_conversation(),
+        // allowed to *do* is decided in `App::submit`, which every way of
+        // clearing a conversation now goes through — there is no chord for it.
         KeyCode::Char('u') if ctrl => app.input.delete_to_line_start(),
         KeyCode::Char('w') if ctrl => app.input.delete_word_before(),
         // Ctrl+Backspace only arrives *as* Ctrl+Backspace under the kitty
