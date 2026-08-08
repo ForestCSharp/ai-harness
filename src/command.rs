@@ -19,6 +19,10 @@ pub enum Command {
     Rewind,
     /// Open the sessions view, the same as `Ctrl+Space`.
     Sessions,
+    /// List the project's memory notes and what the index made of them.
+    Memory,
+    /// Open the page of what this session has done.
+    Stats,
     /// List checkpoints; `Some` sets how many turns to keep.
     Checkpoints(Option<String>),
     /// Toggle plan mode. `Some` carries the task to start planning immediately.
@@ -71,6 +75,10 @@ impl Command {
             // Parks a flag the event loop takes; the view is about the harness
             // rather than about this conversation.
             Command::Sessions => true,
+            // Reads the memory directory and reports. Touches no conversation.
+            Command::Memory => true,
+            // A page of numbers derived from what already happened.
+            Command::Stats => true,
             // The in-flight request already carries its model, so this lands on
             // the next turn — which is usually why it is being typed.
             Command::Model(_) => true,
@@ -110,6 +118,8 @@ impl Command {
             Command::Undo => "undo",
             Command::Rewind => "rewind",
             Command::Sessions => "sessions",
+            Command::Memory => "memory",
+            Command::Stats => "stats",
             Command::Checkpoints(_) => "checkpoints",
             Command::Plan(_) => "plan",
             Command::Help => "help",
@@ -162,6 +172,8 @@ pub fn parse(input: &str) -> Input {
         "undo" => Command::Undo,
         "rewind" => Command::Rewind,
         "sessions" => Command::Sessions,
+        "memory" | "memories" => Command::Memory,
+        "stats" => Command::Stats,
         "checkpoints" | "checkpoint" => Command::Checkpoints(arg),
         "plan" => Command::Plan(arg),
         "help" | "h" | "?" => Command::Help,
@@ -230,6 +242,14 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "sessions",
         description: "switch between running sessions, or start one (also Ctrl+Space)",
+    },
+    Spec {
+        name: "memory",
+        description: "list the notes in .ai_harness/memory and how they index",
+    },
+    Spec {
+        name: "stats",
+        description: "what this session has done, including how memory was used",
     },
     Spec {
         name: "save",

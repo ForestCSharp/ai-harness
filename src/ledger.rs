@@ -131,6 +131,57 @@ impl Ledger {
         text
     }
 
+    /// The Conversation section of the `/stats` page.
+    ///
+    /// Lives here rather than in the page that assembles it because the ledger
+    /// already owns how its own numbers are written — `thousands`, `money` and
+    /// `duration` stay private, and there is one answer to "how is a token count
+    /// spelled" instead of two that can drift.
+    ///
+    /// Denser than [`Ledger::report`] on purpose: `/cost` is a notice with the
+    /// whole transcript width, this is a panel competing for rows with two other
+    /// sections.
+    pub fn summary_lines(
+        &self,
+        price_in: Option<f64>,
+        price_out: Option<f64>,
+        context_limit: Option<u32>,
+    ) -> Vec<String> {
+        if self.is_empty() {
+            return vec!["  no model requests yet".to_string()];
+        }
+        let mut lines = vec![format!(
+            "  requests {} · waiting {}",
+            self.requests,
+            duration(self.waiting_ms)
+        )];
+
+        // The whole conversation is resent every request, so this is what each
+        // further one costs — and the limit is the wall the session ends at.
+        let mut context = format!("  context   {}", thousands(self.last_prompt_tokens));
+        if let Some(limit) = context_limit {
+            let pct = (self.last_prompt_tokens as f64 / f64::from(limit)) * 100.0;
+            context.push_str(&format!(" of {} ({pct:.0}%)", thousands(u64::from(limit))));
+        }
+        lines.push(context);
+
+        let mut tokens = format!(
+            "  tokens    {} in · {} out",
+            thousands(self.prompt_tokens),
+            thousands(self.completion_tokens)
+        );
+        if let Some(rate) = self.cache_hit_rate() {
+            tokens.push_str(&format!(" · {:.0}% cached", rate * 100.0));
+        }
+        lines.push(tokens);
+
+        lines.push(match self.cost(price_in, price_out) {
+            Some(cost) => format!("  cost      {} (estimated)", money(cost)),
+            None => "  cost      set --price-in and --price-out to estimate".to_string(),
+        });
+        lines
+    }
+
     /// The multi-line breakdown `/cost` prints.
     pub fn report(&self, price_in: Option<f64>, price_out: Option<f64>) -> String {
         if self.is_empty() {

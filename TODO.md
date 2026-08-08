@@ -1,13 +1,9 @@
 
 # DO IN ORDER
 
--   memory system under .ai_harness/
-
 -   code indexing support, also stored in .ai_harness/
 
--   Load `AGENTS.md` from the project root at startup, appended to the contract in
-    the same slot `--system` uses (never replacing it). `--system` is per-launch
-    only; nothing picks up per-project conventions today.
+-   more organized context management. Don't just keep appending, but store in a structured manner.
 
 -   Prompt cache breakpoints. The client sends no cache directives of its own, so
     for models where caching is opt-in via `cache_control` the 0% in `/cost` is the

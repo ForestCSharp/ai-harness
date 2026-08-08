@@ -11,12 +11,14 @@ mod highlight;
 mod input;
 mod ledger;
 mod markdown;
+mod memory;
 mod openrouter;
 mod protocol;
 mod sandbox;
 mod search;
 mod session;
 mod sessions;
+mod stats;
 mod tui;
 mod ui;
 mod wrap;
@@ -1156,6 +1158,19 @@ fn handle_key(
             // reaches us as Ctrl+H.
             KeyCode::Char('h') if ctrl => app.question_input(|input| input.delete_word_before()),
             KeyCode::Char('w') if ctrl => app.question_input(|input| input.delete_word_before()),
+            _ => {}
+        }
+        return;
+    }
+
+    // The stats page owns the keyboard while it is up, but only to give it back:
+    // there is nothing on it to choose. Placed above the lists and below the
+    // modals, matching where `prepare_panel` puts it.
+    if app.stats_open() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.close_stats(),
+            KeyCode::PageUp => app.scroll_up(page),
+            KeyCode::PageDown => app.scroll_down(page, max_scroll),
             _ => {}
         }
         return;

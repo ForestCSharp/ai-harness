@@ -175,6 +175,11 @@ const COMPACT_FALLBACK_BYTES: usize = 384 * 1024;
 /// prevented.
 pub const QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The project's conventions file, read from the working directory into the
+/// contract. `AGENTS.md` rather than a name of our own: it is the convention
+/// several harnesses now share, so a project that has one already works here.
+pub const AGENTS_FILE: &str = "AGENTS.md";
+
 impl RunningCommand {
     fn new(command: String) -> Self {
         Self {
@@ -570,6 +575,11 @@ pub struct App {
     /// Whether `/sessions` has asked for the sessions view. Parked for the event
     /// loop to take, like `pending_fetch` — a session cannot open it itself.
     sessions_requested: bool,
+    /// Whether the `/stats` page is up.
+    ///
+    /// An overlay beside `Status`, exactly as `picker` is: the page coexists
+    /// with `Idle` and is not a state the conversation is in.
+    stats: bool,
     /// A saved session the view's `l` picked, parked on the same reasoning as
     /// `sessions_requested`: opening it means adding a slot, which is the
     /// harness's business rather than this conversation's.
@@ -749,6 +759,7 @@ impl App {
             turn_number: 0,
             rewind: None,
             sessions_requested: false,
+            stats: false,
             requested_open: None,
             turn_prompt: String::new(),
             checkpoint: None,
@@ -1073,6 +1084,8 @@ impl App {
             // of. The event loop takes this the same way it takes a parked
             // fetch or search.
             Command::Sessions => self.sessions_requested = true,
+            Command::Memory => self.memory_report(),
+            Command::Stats => self.stats = true,
             Command::Checkpoints(arg) => self.checkpoints_command(arg),
             Command::Reasoning => {
                 self.show_reasoning = !self.show_reasoning;
@@ -1168,6 +1181,66 @@ impl App {
         }
     }
 
+    /// Whether a write to `path` would land on a file the memory index reads.
+    ///
+    /// Matches exactly the set [`crate::memory::list`] indexes: a `.md` file
+    /// directly inside the memory directory. A `.txt` there, or a file one level
+    /// down, is not indexed and so is not held to a note's rules.
+    ///
+    /// **Lexical**, unlike [`App::targets_plan_file`], which resolves through
+    /// [`crate::files::resolve_target`]. That canonicalises the *parent*, so it
+    /// requires the directory to already exist — and the first note a project
+    /// ever keeps is written into a directory that does not. The one case this
+    /// has to answer is the one resolving cannot. Being lexical is safe here
+    /// because the answer only decides whether to *check a note's format*: the
+    /// sandbox is still what decides whether the write may happen at all.
+    fn targets_memory_note(&self, path: &str) -> bool {
+        let Some(root) = self.sandbox.as_ref().map(crate::sandbox::Sandbox::root) else {
+            return false;
+        };
+        let requested = std::path::Path::new(path);
+        let joined = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        };
+        // Collapse `.` and `..` without touching the filesystem.
+        let mut normal = std::path::PathBuf::new();
+        for part in joined.components() {
+            match part {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normal.pop();
+                }
+                other => normal.push(other),
+            }
+        }
+        normal.extension().is_some_and(|ext| ext == "md")
+            && normal.parent() == Some(crate::memory::dir(root).as_path())
+    }
+
+    /// Refuse a note that the index would silently skip.
+    ///
+    /// `None` when the contents are fine. A note without a `description:` is
+    /// written, approved, and then never listed — a failure that looks exactly
+    /// like a success, and the only thing that would ever reveal it is
+    /// `/memory`. Checked with [`crate::memory::description_in`], the same
+    /// parser the index uses, so the two cannot disagree.
+    fn memory_note_problem(&self, path: &str, contents: &str) -> Option<String> {
+        if !self.targets_memory_note(path) || crate::memory::description_in(contents).is_some() {
+            return None;
+        }
+        Some(format!(
+            "{path} is a memory note, and a note needs a description or it is \
+             never indexed and never offered to anyone again. Write it again \
+             with these as the first three lines:\n\n\
+             ---\n\
+             description: one line saying when a future session would want this\n\
+             ---\n\n\
+             then the notes. Say when you would want it, not what it is."
+        ))
+    }
+
     /// Turn plan mode on or off, optionally starting the first turn with `task`.
     fn toggle_plan_mode(&mut self, task: Option<String>) -> Option<Vec<Message>> {
         if self.planning {
@@ -1230,6 +1303,19 @@ impl App {
     /// drop.
     fn refresh_contract(&mut self) {
         let mut contract = protocol::system_prompt(self.extra_system.as_deref());
+        // Both of these are read from disk rather than stored, the rule
+        // `plan_path` and `rewind_rows` already follow: the files change
+        // underneath a session — the model writes memories itself — and a cached
+        // copy would be a second source of truth that goes stale silently. The
+        // cost is a small read and a directory listing per prompt.
+        if let Some(text) = self.project_guidance() {
+            contract.push_str("\n\n");
+            contract.push_str(&protocol::project_guidance(&text));
+        }
+        if let Some((dir, index)) = self.memory_state() {
+            contract.push_str("\n\n");
+            contract.push_str(&protocol::memory_section(&dir, index.as_deref()));
+        }
         if self.planning
             && let Some(path) = self.plan_path()
         {
@@ -1244,6 +1330,206 @@ impl App {
             // better answer than dropping the rules on the floor.
             _ => self.history.insert(0, Message::system(contract)),
         }
+    }
+
+    /// The project's `AGENTS.md`, if there is one worth sending.
+    ///
+    /// Capped, because the contract goes out again on **every round-trip** of an
+    /// agentic turn rather than once per prompt — a file that is merely large is
+    /// paid for ten times in a turn that runs ten commands. Truncated rather than
+    /// refused: half the conventions beat none, and the marker says which half.
+    fn project_guidance(&self) -> Option<String> {
+        const MAX: usize = 16 * 1024;
+        let path = self.sandbox.as_ref()?.root().join(AGENTS_FILE);
+        let text = std::fs::read_to_string(path).ok()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        if text.len() <= MAX {
+            return Some(text);
+        }
+        // On a char boundary, since this is prose and may be any encoding.
+        let cut = (0..=MAX).rev().find(|i| text.is_char_boundary(*i))?;
+        Some(format!(
+            "{}\n\n[{AGENTS_FILE} truncated at {MAX} bytes]",
+            &text[..cut]
+        ))
+    }
+
+    /// Whether the `/stats` page is up.
+    pub fn stats_open(&self) -> bool {
+        self.stats
+    }
+
+    pub fn close_stats(&mut self) {
+        self.stats = false;
+    }
+
+    /// The `/stats` page, as lines for the panel to draw.
+    ///
+    /// Assembled here because it needs four things — the ledger, the transcript,
+    /// the memory directory and the context limit — and nothing else needs all
+    /// four. The *counting* is [`crate::stats`], which is pure and tested on its
+    /// own; this only decides what order to say it in.
+    ///
+    /// **Memory comes before Actions.** A panel's height is derived from its
+    /// content and then capped, so on a short terminal the bottom is what goes —
+    /// and the section this page exists for must not be the one that disappears.
+    pub fn stats_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("{} · {}", self.current_session, self.model),
+            String::new(),
+            "Conversation".to_string(),
+        ];
+        // Turns first, since it is the only one of these the ledger cannot know:
+        // it counts prompts, where the ledger counts round-trips.
+        lines.push(format!("  turns     {}", self.turn_number));
+        lines.extend(self.ledger.summary_lines(
+            self.price_in,
+            self.price_out,
+            self.context_limit(),
+        ));
+
+        lines.push(String::new());
+        lines.push("Memory".to_string());
+        lines.extend(self.memory_lines());
+
+        let counts = crate::stats::actions(&self.transcript);
+        lines.push(String::new());
+        lines.push("Actions".to_string());
+        if counts.is_empty() {
+            lines.push("  nothing yet".to_string());
+        } else {
+            lines.push(format!(
+                "  {} reads · {} searches · {} fetches",
+                counts.reads, counts.searches, counts.fetches
+            ));
+            lines.push(format!(
+                "  {} commands · {} writes · {} denied",
+                counts.shells, counts.writes, counts.denied
+            ));
+        }
+        lines
+    }
+
+    /// The Memory section: what is indexed, what was used, and what was not.
+    ///
+    /// The last line is the point of the whole page. A note that is indexed and
+    /// never opened is paying for a line in the contract on every request and
+    /// buying nothing, and the only place that shows up is the difference
+    /// between what is listed and what was read.
+    fn memory_lines(&self) -> Vec<String> {
+        let Some(root) = self.sandbox.as_ref().map(crate::sandbox::Sandbox::root) else {
+            return vec!["  unavailable without a sandbox root".to_string()];
+        };
+        let notes = crate::memory::list(&crate::memory::dir(root));
+        let used = crate::stats::memory_use(&self.transcript);
+        if notes.is_empty() && used.reads == 0 && used.writes == 0 {
+            return vec!["  no notes yet".to_string()];
+        }
+
+        let mut lines = vec![
+            format!("  indexed   {} note(s)", notes.len()),
+            format!(
+                "  read      {} read(s) across {} note(s)",
+                used.reads,
+                used.read.len()
+            ),
+            format!("  written   {}", used.writes),
+        ];
+
+        // Only notes that are *in the index* can be said to have gone unread —
+        // one read and then deleted is not dead weight, and one read from an
+        // earlier session is invisible here either way.
+        let unread: Vec<&str> = notes
+            .iter()
+            .filter(|note| !used.read.contains(&note.name))
+            .map(|note| note.name.as_str())
+            .collect();
+        if !unread.is_empty() {
+            const SHOWN: usize = 4;
+            let mut said = unread
+                .iter()
+                .take(SHOWN)
+                .map(|name| format!("{name}.md"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Some(rest) = unread.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+                said.push_str(&format!(", +{rest}"));
+            }
+            lines.push(format!("  unread    {said}"));
+        }
+        lines
+    }
+
+    /// What `/memory` says: every note, and everything the index did *not* say.
+    ///
+    /// The listing is the easy half. The rest is what makes the directory
+    /// auditable — a note left out for want of a description is invisible to the
+    /// model, and one dropped for budget is invisible too, and neither announces
+    /// itself anywhere else. Rot is what kills a memory system, and this is
+    /// where you find it.
+    fn memory_report(&mut self) {
+        let Some(root) = self.sandbox.as_ref().map(|s| s.root().to_path_buf()) else {
+            return self.push_notice("No memory directory without a sandbox root.");
+        };
+        let dir = crate::memory::dir(&root);
+        let notes = crate::memory::list(&dir);
+        let skipped = crate::memory::skipped(&dir);
+        if notes.is_empty() && skipped.is_empty() {
+            return self.push_notice(format!(
+                "No memory notes yet. They live in {}, one markdown file each, \
+                 with a `description:` line in frontmatter.",
+                dir.display()
+            ));
+        }
+
+        let (kept, dropped) = crate::memory::within(&notes, crate::memory::Caps::default());
+        let mut lines = vec![format!("{} note(s) in {}:", notes.len(), dir.display())];
+        for note in &notes {
+            // Marked rather than silently absent: a note the model cannot see is
+            // the thing you opened this listing to find.
+            let mark = if kept.contains(note) { "  " } else { "· " };
+            lines.push(format!("{mark}{}.md — {}", note.name, note.description));
+        }
+        if dropped > 0 {
+            lines.push(format!(
+                "· {dropped} not in the index (over budget; the least recently \
+                 changed go first)."
+            ));
+        }
+        if !skipped.is_empty() {
+            lines.push(format!(
+                "Skipped, no `description:` in frontmatter: {}.",
+                skipped.join(", ")
+            ));
+        }
+        self.push_notice(lines.join("\n"));
+    }
+
+    /// The memory directory and its index, whenever there is a project to have
+    /// memory about.
+    ///
+    /// `None` only without a sandbox — an empty directory still gets a section,
+    /// because that is the case where the model most needs telling that memory
+    /// exists and how to start one.
+    ///
+    /// Returns the path too: the contract has to name where the notes are, since
+    /// the index carries only file names and the model needs a path to read or
+    /// write one.
+    fn memory_state(&self) -> Option<(String, Option<String>)> {
+        let root = self.sandbox.as_ref()?.root();
+        let dir = crate::memory::dir(root);
+        let notes = crate::memory::list(&dir);
+        let index = crate::memory::index(&notes, crate::memory::Caps::default());
+        // Relative to the root, which is how every other path the model is given
+        // is expressed — and what it has to pass back to a read.
+        let shown = dir
+            .strip_prefix(root)
+            .unwrap_or(&dir)
+            .to_string_lossy()
+            .to_string();
+        Some((shown, index))
     }
 
     /// Snapshot the current session for persistence. Pure.
@@ -2013,6 +2299,14 @@ impl App {
         if self.is_busy() || text.trim().is_empty() {
             return None;
         }
+        // Rebuild before the history is cloned, so a memory written earlier in
+        // this session is in the index for this prompt and an edit to AGENTS.md
+        // takes effect without a restart. Per prompt, not per round-trip: the
+        // turn loop re-sends the contract many times and re-reading the disk for
+        // each would be paying repeatedly for an answer that cannot change
+        // mid-turn.
+        self.refresh_contract();
+
         // Record for Up/Down recall, de-duping an immediate repeat. Browsing
         // ends on submit.
         if self.prompt_history.last() != Some(&text) {
@@ -2202,6 +2496,26 @@ impl App {
                     cancelled: false,
                 }));
             }
+            // A memory note that would not index is refused here, on the same
+            // reasoning as plan mode above and the edit below: the user is never
+            // asked to approve a write that was going to disappear, and the
+            // model gets a reason it can act on. Ordered after plan mode, since
+            // a note written in plan mode is refused for the more fundamental
+            // reason.
+            Action::Write {
+                ref path,
+                ref contents,
+            } if self.memory_note_problem(path, contents).is_some() => {
+                let error = self.memory_note_problem(path, contents);
+                let path = path.clone();
+                return Some(self.push_write_result(WriteOutcome {
+                    bytes: 0,
+                    error,
+                    path,
+                    timed_out: false,
+                    cancelled: false,
+                }));
+            }
             // An edit is resolved against the file *before* the modal, so a
             // hopeless one (no match, ambiguous) never bothers the user — it goes
             // straight back to the model to fix.
@@ -2211,6 +2525,16 @@ impl App {
                     None => Err("file access is not configured".to_string()),
                 };
                 match planned {
+                    // The resolved edit carries the whole new file, so an edit
+                    // that strips a note's description is caught by the same
+                    // rule a write is. Only checkable here, once there is a
+                    // result to check.
+                    Ok(plan) if self.memory_note_problem(&path, &plan.updated).is_some() => {
+                        let problem = self
+                            .memory_note_problem(&path, &plan.updated)
+                            .expect("just checked");
+                        return Some(self.push_edit_failure(&path, problem));
+                    }
                     Ok(plan) => {
                         self.status = Status::AwaitingApproval(Pending {
                             action: Action::Edit { path, old, new },
@@ -8322,6 +8646,12 @@ mod plan_tests {
 
         let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
         app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        // `App::new` built the contract before the sandbox existed, so it has
+        // none of the sections derived from the project root. Rebuild, as the
+        // first prompt does in a real session — otherwise a test that compares
+        // the contract before and after something is comparing two different
+        // baselines.
+        app.refresh_contract();
         (app, dir)
     }
 
@@ -8507,12 +8837,17 @@ mod plan_tests {
             "<ai-harness-response>Plan written.</ai-harness-response>".into(),
             None,
         );
-        let plain = crate::protocol::system_prompt(None);
-
         let messages = app.execute_plan().expect("Execute starts the work");
 
         assert!(!app.planning(), "the mode must end when the work begins");
-        assert_eq!(contract(&app), plain, "the restriction is lifted too");
+        // The plan section specifically, not the whole contract: other sections
+        // — project memory, AGENTS.md — come and go for their own reasons and an
+        // equality check against the bare prompt would break on each of them.
+        assert!(
+            !contract(&app).contains("PLAN MODE IS ON"),
+            "the restriction is lifted too:\n{}",
+            contract(&app)
+        );
         assert!(app.is_waiting());
         let sent = &messages.last().unwrap().content;
         assert!(
@@ -8554,5 +8889,414 @@ mod plan_tests {
             contract(&app).contains(&after.to_string_lossy().to_string()),
             "the model must be told the new path"
         );
+    }
+}
+
+/// The two tiers of standing project knowledge: `AGENTS.md` whole, and the
+/// memory index. Both need a real sandbox, since both are keyed on its root.
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn app_in_temp() -> (App, std::path::PathBuf) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let unique = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ai-harness-memory-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
+        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.refresh_contract();
+        (app, dir)
+    }
+
+    fn contract(app: &App) -> &str {
+        &app.history[0].content
+    }
+
+    fn note(dir: &std::path::Path, name: &str, description: &str) {
+        let memory = crate::memory::dir(dir);
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(
+            memory.join(format!("{name}.md")),
+            // Distinctive on purpose: the contract's own prose says "the body"
+            // in several places, and a fixture that collided with it would make
+            // the body-stays-on-disk assertion pass or fail for the wrong
+            // reason.
+            format!("---\ndescription: {description}\n---\n\nBODY-MUST-NOT-BE-SENT"),
+        )
+        .unwrap();
+    }
+
+    /// `--system` is this launch's operator; `AGENTS.md` is how the project is
+    /// worked on. Both, distinguishably — the TODO's "never replacing it".
+    #[test]
+    fn agents_md_lands_beside_the_system_flag_rather_than_instead_of_it() {
+        let (mut app, dir) = app_in_temp();
+        app.extra_system = Some("operator says hello".into());
+        std::fs::write(dir.join(AGENTS_FILE), "run cargo fmt before you finish").unwrap();
+        app.refresh_contract();
+
+        let text = contract(&app);
+        assert!(text.contains("operator says hello"), "{text}");
+        assert!(text.contains("run cargo fmt before you finish"), "{text}");
+        assert!(text.contains("Additional operator instructions"));
+        assert!(text.contains("Project conventions"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_agents_md_means_no_section() {
+        let (app, dir) = app_in_temp();
+        assert!(!contract(&app).contains("Project conventions"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The contract goes out again on every round-trip of an agentic turn, so a
+    /// merely large file is paid for many times in one turn.
+    #[test]
+    fn an_oversized_agents_md_is_truncated_rather_than_refused() {
+        let (mut app, dir) = app_in_temp();
+        std::fs::write(dir.join(AGENTS_FILE), "x".repeat(64 * 1024)).unwrap();
+        app.refresh_contract();
+
+        let text = contract(&app);
+        assert!(
+            text.contains("truncated at"),
+            "{}",
+            &text[..200.min(text.len())]
+        );
+        assert!(
+            text.len() < 40 * 1024,
+            "the cap should bound the contract: {} bytes",
+            text.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The index carries names and descriptions. The bodies stay on disk until
+    /// the model decides a description is worth opening — that split is the
+    /// whole feature.
+    #[test]
+    fn the_memory_index_carries_descriptions_and_not_bodies() {
+        let (mut app, dir) = app_in_temp();
+        note(&dir, "auth-flow", "how sessions are validated");
+        app.refresh_contract();
+
+        let text = contract(&app);
+        assert!(text.contains("Project memory"), "{text}");
+        assert!(text.contains("auth-flow.md — how sessions are validated"));
+        assert!(
+            !text.contains("BODY-MUST-NOT-BE-SENT"),
+            "the body must stay on disk until the model reads it"
+        );
+        // And where to find it, since the index gives only file names.
+        assert!(text.contains(".ai_harness/memory"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note written during a session has to be usable in that session — which
+    /// is why the contract is rebuilt when a prompt is sent, not at startup.
+    #[test]
+    fn a_note_written_mid_session_is_in_the_index_on_the_next_prompt() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("first");
+        app.submit().unwrap();
+        assert!(
+            !contract(&app).contains("learned.md"),
+            "the note does not exist yet"
+        );
+
+        note(&dir, "learned", "something worked out during the session");
+        app.status = Status::Idle;
+        app.input.insert_str("second");
+        app.submit().unwrap();
+
+        assert!(
+            contract(&app).contains("learned.md — something worked out"),
+            "{}",
+            contract(&app)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_reply(path: &str, contents: &str) -> String {
+        format!("<ai-harness-write file={path}>\n{contents}</ai-harness-write>")
+    }
+
+    fn last_error(app: &App) -> String {
+        app.transcript
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::WriteResult(outcome) => outcome.error.clone(),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The defect this closes: a note with no description is written, approved,
+    /// and then never indexed — a failure that looks exactly like a success.
+    #[test]
+    fn a_note_without_a_description_is_refused_before_the_modal() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("remember something");
+        app.submit().unwrap();
+
+        let sent = app.push_response(
+            write_reply(".ai_harness/memory/learned.md", "just some prose\n"),
+            None,
+        );
+
+        assert!(app.pending().is_none(), "the user is never asked");
+        assert!(
+            sent.is_some(),
+            "and the model is given the reason to fix it"
+        );
+        let said = last_error(&app);
+        assert!(said.contains("description:"), "{said}");
+        assert!(!crate::memory::dir(&dir).join("learned.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_well_formed_note_reaches_the_modal_like_any_write() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("remember something");
+        app.submit().unwrap();
+
+        app.push_response(
+            write_reply(
+                ".ai_harness/memory/learned.md",
+                "---\ndescription: when you would want this\n---\n\nnotes\n",
+            ),
+            None,
+        );
+        assert!(app.pending().is_some(), "this one is the user's to approve");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check applies to exactly what the index reads, and nothing else.
+    #[test]
+    fn only_files_the_index_would_read_are_held_to_a_notes_rules() {
+        let (app, _dir) = app_in_temp();
+        assert!(app.targets_memory_note(".ai_harness/memory/a.md"));
+        assert!(app.targets_memory_note("./.ai_harness/memory/a.md"));
+        assert!(app.targets_memory_note(".ai_harness/sessions/../memory/a.md"));
+
+        // Not indexed, so not a note: wrong extension, one level down, or a
+        // perfectly ordinary file somewhere else.
+        assert!(!app.targets_memory_note(".ai_harness/memory/notes.txt"));
+        assert!(!app.targets_memory_note(".ai_harness/memory/sub/a.md"));
+        assert!(!app.targets_memory_note("src/app.rs"));
+        assert!(!app.targets_memory_note("memory/a.md"));
+    }
+
+    /// The directory does not exist until the first note lands in it, which is
+    /// precisely why this check cannot resolve through the filesystem.
+    #[test]
+    fn the_first_note_is_checked_before_the_directory_exists() {
+        let (app, dir) = app_in_temp();
+        assert!(
+            !crate::memory::dir(&dir).exists(),
+            "the fixture must not have created it"
+        );
+        assert!(app.targets_memory_note(".ai_harness/memory/first.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edit is resolved into the whole new file before the modal, so the same
+    /// rule catches an edit that strips a note's description out.
+    #[test]
+    fn an_edit_that_removes_the_description_is_refused_too() {
+        let (mut app, dir) = app_in_temp();
+        note(&dir, "existing", "when you would want this");
+        app.input.insert_str("tidy that note");
+        app.submit().unwrap();
+
+        app.push_response(
+            "<ai-harness-edit file=.ai_harness/memory/existing.md>\
+             <ai-harness-old>---\ndescription: when you would want this\n---\n</ai-harness-old>\
+             <ai-harness-new></ai-harness-new></ai-harness-edit>"
+                .to_string(),
+            None,
+        );
+
+        assert!(app.pending().is_none(), "the user is never asked");
+        assert!(
+            last_error(&app).contains("description:"),
+            "{}",
+            last_error(&app)
+        );
+        assert!(
+            crate::memory::description_in(
+                &std::fs::read_to_string(crate::memory::dir(&dir).join("existing.md")).unwrap()
+            )
+            .is_some(),
+            "and the note on disk still has one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan mode is the more fundamental refusal: in plan mode nothing but the
+    /// plan may be written, whatever shape it is in.
+    #[test]
+    fn plan_mode_refuses_a_note_before_the_description_rule_does() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Plan(None));
+        app.input.insert_str("remember something");
+        app.submit();
+        app.push_response(
+            write_reply(".ai_harness/memory/learned.md", "no frontmatter"),
+            None,
+        );
+
+        let said = last_error(&app);
+        assert!(said.contains("plan mode is on"), "{said}");
+        assert!(!said.contains("description:"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// This asserted the defect: the section used to appear only once a note
+    /// existed, so a fresh project never learned memory was an option and could
+    /// not write its first note. It is the test that should have caught that.
+    #[test]
+    fn the_memory_section_is_there_before_any_note_is() {
+        let (app, dir) = app_in_temp();
+        let text = contract(&app);
+        assert!(text.contains("Project memory"), "{text}");
+        assert!(text.contains("No notes have been kept yet"), "{text}");
+        // And how to start one, which is the half that was missing entirely.
+        assert!(text.contains("description:"), "{text}");
+        assert!(text.contains(".ai_harness/memory"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both sections are read from disk on every rebuild rather than stored, so
+    /// a note deleted between prompts leaves the contract.
+    #[test]
+    fn a_deleted_note_leaves_the_contract() {
+        let (mut app, dir) = app_in_temp();
+        note(&dir, "temporary", "here for now");
+        app.refresh_contract();
+        assert!(contract(&app).contains("temporary.md"));
+
+        std::fs::remove_file(crate::memory::dir(&dir).join("temporary.md")).unwrap();
+        app.refresh_contract();
+        assert!(!contract(&app).contains("temporary.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note the model cannot see is exactly what you open this listing to
+    /// find, so both ways of being invisible have to be named.
+    #[test]
+    fn the_memory_command_names_what_the_index_left_out() {
+        let (mut app, dir) = app_in_temp();
+        note(&dir, "listed", "a described note");
+        std::fs::write(
+            crate::memory::dir(&dir).join("undescribed.md"),
+            "no frontmatter here",
+        )
+        .unwrap();
+        app.run_command(Command::Memory);
+
+        let said = match super::tests::last_visible(&app) {
+            Entry::Notice(text) => text.clone(),
+            other => panic!("expected a notice, got {other:?}"),
+        };
+        assert!(said.contains("listed.md — a described note"), "{said}");
+        assert!(said.contains("undescribed"), "{said}");
+        assert!(said.contains("no `description:`"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_memory_command_says_where_notes_go_when_there_are_none() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Memory);
+
+        let said = match super::tests::last_visible(&app) {
+            Entry::Notice(text) => text.clone(),
+            other => panic!("expected a notice, got {other:?}"),
+        };
+        assert!(said.contains("No memory notes yet"), "{said}");
+        assert!(
+            said.contains("description:"),
+            "and how to write one: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a sandbox there is no project root, so neither tier exists — the
+    /// state most of the suite runs in.
+    /// The page exists to answer one question: is the index earning its tokens?
+    /// The `unread` line is the only place a bad description shows up.
+    #[test]
+    fn the_stats_page_names_notes_that_were_never_opened() {
+        let (mut app, dir) = app_in_temp();
+        note(&dir, "was-read", "this one gets opened");
+        note(&dir, "never-opened", "this one does not");
+        app.transcript
+            .push(Entry::ReadResult(crate::files::ReadOutcome::whole_file(
+                ".ai_harness/memory/was-read.md",
+                "contents",
+            )));
+
+        let page = app.stats_lines().join("\n");
+        assert!(page.contains("indexed   2 note(s)"), "{page}");
+        assert!(
+            page.contains("read      1 read(s) across 1 note(s)"),
+            "{page}"
+        );
+        assert!(page.contains("unread    never-opened.md"), "{page}");
+        assert!(
+            !page.contains("was-read.md"),
+            "a note that was read is not unread: {page}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stats_page_names_the_session_and_model() {
+        let (app, dir) = app_in_temp();
+        let page = app.stats_lines().join("\n");
+        assert!(page.contains(app.session_name()), "{page}");
+        assert!(page.contains(&app.model), "{page}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Zeros with no context read as a broken feature. An empty directory says
+    /// it is empty.
+    #[test]
+    fn the_stats_page_says_when_there_are_no_notes_at_all() {
+        let (app, dir) = app_in_temp();
+        let page = app.stats_lines().join("\n");
+        assert!(page.contains("no notes yet"), "{page}");
+        assert!(!page.contains("unread"), "{page}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A short terminal caps the panel from the bottom, so the section this page
+    /// exists for must not be the one that goes.
+    #[test]
+    fn memory_is_above_actions_on_the_page() {
+        let (app, dir) = app_in_temp();
+        let page = app.stats_lines();
+        let at = |heading: &str| page.iter().position(|line| line == heading);
+        assert!(at("Conversation") < at("Memory"), "{page:?}");
+        assert!(at("Memory") < at("Actions"), "{page:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn neither_section_appears_without_a_sandbox() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        app.refresh_contract();
+        assert!(!contract(&app).contains("Project conventions"));
+        assert!(!contract(&app).contains("Project memory"));
     }
 }

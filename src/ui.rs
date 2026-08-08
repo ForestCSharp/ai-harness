@@ -178,6 +178,7 @@ enum PanelKind {
     Undo,
     Rewind,
     Models,
+    Stats,
 }
 
 /// A panel measured and laid out, ready to be drawn into the bottom slot.
@@ -552,6 +553,57 @@ fn prepare_panel(app: &App, area: Rect) -> Option<Panel> {
         });
     }
 
+    // Last, so anything that needs an answer takes the slot from it. A page you
+    // are reading loses to a modal that is waiting on you — and it is still
+    // there when the modal is gone.
+    if app.stats_open() {
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines = app.stats_lines();
+
+        // Trim to what there is room for, then drop any heading or blank left
+        // dangling by the trim, and only then measure. A short terminal cutting
+        // the page is expected — the sections are ordered so the least important
+        // goes first — but a heading with nothing under it reads as a bug rather
+        // than as a page that ran out of room, and measuring afterwards keeps
+        // the gap the popped rows would otherwise leave above the footer.
+        lines.truncate(max.saturating_sub(3) as usize);
+        while lines
+            .last()
+            .is_some_and(|line| line.is_empty() || !line.starts_with(' '))
+        {
+            lines.pop();
+        }
+        let height = (lines.len() as u16 + 3).min(max).max(MIN_PANEL_ROWS);
+
+        let body: Vec<Line<'static>> = lines
+            .into_iter()
+            .map(|line| {
+                // Section headings carry the weight; the numbers under them are
+                // indented and read as detail, the division `picker_entry` makes
+                // between a name and its aside.
+                let style = if line.starts_with(' ') {
+                    Style::default().fg(Color::Gray)
+                } else if line.is_empty() {
+                    dim
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                Line::from(Span::styled(truncate(&line, inner_width), style))
+            })
+            .collect();
+        return Some(Panel {
+            kind: PanelKind::Stats,
+            title: " session stats ",
+            colour: Color::Blue,
+            body,
+            hint: Some("Esc close".into()),
+            height,
+            header: 0,
+            offset: 0,
+            owners: Vec::new(),
+        });
+    }
+
     None
 }
 
@@ -578,6 +630,9 @@ fn draw_prepared_panel(
     );
 
     match kind {
+        // Nothing to record: no list, no selection, no buttons. The one panel
+        // that is only something to read.
+        PanelKind::Stats => {}
         PanelKind::Approval => {
             if let Some(pending) = app.pending() {
                 let (allow, deny) = draw_buttons(frame, footer, pending.selected, APPROVE_LABELS);
@@ -1727,14 +1782,19 @@ fn render_entry(
             }
         }
         Entry::Malformed { reason, raw } => {
+            // Red, like every other failure in the transcript. Yellow here meant
+            // this read as a warning beside the `!` in the sessions view and the
+            // partial-checkpoint note, when a rejected reply is a failure: the
+            // action did not happen and the turn spent a round-trip on nothing.
+            //
+            // The raw reply stays dim, as a failed write's body does. The reason
+            // is the error; the text is the evidence for it.
             lines.push(Line::from(vec![
                 Span::styled(
                     "protocol error",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {reason}"), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("  {reason}"), Style::default().fg(Color::Red)),
             ]));
             lines.extend(body_lines(raw, Style::default().fg(Color::DarkGray), width));
         }
@@ -2594,6 +2654,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize
         "  ←/→ choose · Enter confirm · Esc keep planning"
     } else if app.question().is_some() {
         "  j/k or ↑/↓ or 1-9 choose · Enter answer · Esc dismiss"
+    } else if app.stats_open() {
+        // Coexists with `Idle` like the pickers, so without this the bar would
+        // offer to send a prompt while a page is covering the prompt box.
+        "  Esc close"
     } else if let Some(picker) = app.picker() {
         // The picker coexists with `Idle`, so without this the bar offers to
         // send a prompt while the panel below it is asking you to choose.
@@ -3077,6 +3141,45 @@ mod tests {
             screen.iter().any(|r| r.contains("l open saved")),
             "{screen:?}"
         );
+    }
+
+    /// A page you are reading loses the slot to a modal that is waiting on you —
+    /// and gets it back when the modal is gone.
+    #[test]
+    fn an_approval_takes_the_slot_from_the_stats_page() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("do a thing");
+        app.submit().unwrap();
+        app.run_command(crate::command::Command::Stats);
+
+        let (screen, _) = render(&mut app, 78, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("session stats")),
+            "{screen:?}"
+        );
+
+        app.push_response("<ai-harness-shell>ls</ai-harness-shell>".into(), None);
+        let (screen, _) = render(&mut app, 78, 24);
+        assert!(
+            !screen.iter().any(|r| r.contains("session stats")),
+            "the approval should have the slot:\n{}",
+            screen.join("\n")
+        );
+        assert!(screen.iter().any(|r| r.contains("Allow")), "{screen:?}");
+    }
+
+    /// The page coexists with `Idle`, so without its own arm the bar would offer
+    /// to send a prompt while covering the prompt box.
+    #[test]
+    fn the_status_bar_does_not_offer_the_prompt_under_the_stats_page() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.run_command(crate::command::Command::Stats);
+
+        let (screen, _) = render(&mut app, 78, 24);
+        let joined = screen.join("\n");
+        assert!(joined.contains("session stats"), "{joined}");
+        assert!(!joined.contains("Enter send"), "{joined}");
+        assert!(joined.contains("Esc close"), "{joined}");
     }
 
     /// A first Ctrl+C that changed nothing on screen would read as a key that
@@ -5650,6 +5753,42 @@ mod tests {
         assert!(
             screen.contains("Sure, I can help"),
             "raw reply should be visible for debugging:\n{screen}"
+        );
+    }
+
+    /// A rejected reply is a failure, not a warning: the action did not happen
+    /// and the turn spent a round-trip on nothing. It was drawn in yellow, which
+    /// put it beside the sessions view's `!` and the partial-checkpoint note.
+    #[test]
+    fn a_protocol_error_is_red_like_every_other_failure() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        app.input.insert_str("hi");
+        app.submit().unwrap();
+        app.push_response("Sure, I can help with that!".into(), None);
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+        let mut cache = TranscriptCache::default();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app, &mut cache, (1, 0));
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Sample the header's own cells, not the row's first column — that is
+        // the transcript border.
+        let (row, at) = (0..buffer.area.height)
+            .find_map(|y| {
+                let text: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                text.find("protocol error").map(|at| (y, at as u16))
+            })
+            .expect("the header is on screen");
+        assert_eq!(
+            buffer[(at, row)].style().fg,
+            Some(Color::Red),
+            "the header should read as a failure"
         );
     }
 

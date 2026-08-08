@@ -267,6 +267,8 @@ Commands are handled locally and never sent to the model.
 | `/undo` | Put back the files the last changing turn touched (see [Checkpoints and undo](#checkpoints-and-undo)) |
 | `/rewind` | Choose how far back to undo, from a list of the conversation |
 | `/sessions` | Switch between running sessions, or start one (also `Ctrl+Space`) |
+| `/memory` | List the project's notes and what the index made of them (see [Project memory](#project-memory)) |
+| `/stats` | A page of what this session has done, including how memory was used |
 | `/checkpoints [n]` | List what can be undone; with a number, keep only the last `n` turns |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -421,6 +423,107 @@ actions cannot spin forever; reads and edits count against it like anything else
 It is bounded by `--max-turn-bytes` as well, because round-trips are the wrong
 unit for the damage a few whole-file reads can do: a handful of them can crowd
 out the context window well inside the round-trip budget.
+
+## Project memory
+
+Two tiers of standing knowledge about the project, differing in *when* the bytes
+reach the model.
+
+### `AGENTS.md` — always loaded
+
+An `AGENTS.md` in the working directory is appended to the contract, in its own
+section, on every request. It is for what changes *how* the model works: build
+commands, house style, what not to touch.
+
+It sits **beside** `--system`, never instead of it. The two have different
+provenance — one is whoever launched the harness this time, the other is how the
+project is worked on regardless — and the contract labels them separately so the
+model can tell. Capped at 16 KB and truncated with a marker if it is longer,
+because the contract goes out again on every round-trip of an agentic turn: a
+large file is paid for ten times in a turn that runs ten commands.
+
+### `.ai_harness/memory/` — an index loaded, bodies on demand
+
+Notes that outlive a session. One markdown file each, with a description in
+frontmatter:
+
+```markdown
+---
+description: how sessions are validated — read before touching anything under auth/
+---
+
+Long-form notes…
+```
+
+Only the **names and descriptions** go into the contract:
+
+```
+Project memory — notes kept from earlier sessions, in .ai_harness/memory:
+
+  auth-flow.md — how sessions are validated; read before touching auth/
+  deploy.md — the staging deploy sequence and its gotchas
+```
+
+The body enters the conversation only when the model decides a description is
+relevant and opens the file with `<ai-harness-read>`. That is the whole point: a
+note costs about fifteen tokens standing and its real size only when it is used,
+so forty notes are affordable where forty pasted-in documents are not.
+
+Write the description as *when you would want this*, not as a title. "Auth
+architecture" is a bad description; the one above is a good one — it is the only
+thing the model sees, and it is what decides whether the note is ever read. **A
+file with no `description:` is left out of the index entirely**, since an entry
+that cannot earn its line is dead weight in a budget paid on every request.
+
+The model writes these itself, when you ask it to, through the ordinary
+`<ai-harness-write>` — so a memory goes through the approval modal like any other
+write and you see it before it exists. The contract carries the format and tells
+it these are notes rather than authority, to be checked against the code before
+being relied on.
+
+**A note that would not index is refused before you are asked about it.** A write
+into the memory directory with no `description:` never reaches the approval
+modal; the model is told what is missing and writes it again. Without that, such
+a note is written, approved, and then silently never listed — a failure that
+looks exactly like a success, and one only `/memory` would ever reveal. An edit
+that strips the description out of an existing note is refused on the same rule,
+since an edit is resolved into the whole new file before the modal. The check
+uses the same parser the index does, so the two cannot disagree about what counts
+as a note.
+
+The index is capped at 128 entries and 8 KB. Over that, the least recently
+changed drop out and the section says how many went, so a partial list looks
+partial. `/memory` lists every note, marks the ones the index left out, and names
+files skipped for a missing description — which is how you find rot.
+
+**`/stats` is how you tell whether a description is earning its line.** Its
+Memory section counts reads and writes for the session and then names the notes
+that went *unread*:
+
+```
+Memory
+  indexed   3 note(s)
+  read      2 read(s) across 1 note(s)
+  written   0
+  unread    ci.md, deploy.md
+```
+
+A note that is indexed and never opened is paying for a line in the contract on
+every request and buying nothing — almost always because its description says
+what the note is rather than when you would want it. The numbers are derived
+from the transcript, so they cover this conversation only, and `/rewind` rewinds
+them along with everything else.
+
+Three things worth knowing:
+
+- **`/undo` does not cover memories.** Checkpoints skip `.ai_harness/` so that a
+  snapshot cannot swallow session transcripts and the checkpoints themselves, and
+  memories live inside it. They are ordinary files; delete a bad one.
+- **The model cannot grep or glob the memory directory**, for the same reason.
+  The index is the entire discovery path.
+- **Memory is an injection surface.** Something the model read from a fetched
+  page can end up in a file loaded into every later session. The approval modal
+  is the check on that.
 
 ## Sessions
 
@@ -1018,7 +1121,9 @@ reading while you choose which conversation to be in.
 | `src/highlight.rs` | Language detection and tokenising for code blocks |
 | `src/markdown.rs` | Markdown subset for rendering model responses |
 | `src/ledger.rs` | Cumulative token accounting and the `/cost` report |
+| `src/stats.rs` | What a session did, counted from its transcript for `/stats` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`, `open.json`) |
+| `src/memory.rs` | The `.ai_harness/memory/` index: descriptions in the contract, bodies on demand |
 | `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
@@ -1122,6 +1227,8 @@ The session **auto-saves after every turn**. Each session is a *folder*, under
 
 ```
 .ai_harness/
+├── memory/                     ← project notes; see Project memory
+│   └── <slug>.md
 └── sessions/
     ├── open.json
     └── <name>/

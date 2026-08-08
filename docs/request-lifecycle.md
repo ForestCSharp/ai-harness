@@ -183,6 +183,24 @@ prepared full rewrite is stashed in `Pending.edit_plan` and the modal shows a
 execution reuses the write path entirely — the file is not re-read after you
 approve, so the bytes that land are exactly the ones the diff showed.
 
+**(c″) A memory note that would not index** is refused on the same principle.
+A write into `.ai_harness/memory/` whose contents carry no `description:` in
+frontmatter never reaches the modal: `App::memory_note_problem` hands the model a
+reason and one round-trip to fix it. Without that the note is written, approved,
+and then silently skipped by `memory::list` — a failure that looks like a success.
+The check calls `memory::description_in`, the same parser the index uses, because
+a validator that disagreed would pass a note that then vanished anyway. An edit
+is checked against `EditPlan.updated`, the full post-edit file, so stripping a
+description out is caught too.
+
+`App::targets_memory_note` decides what counts, and does it **lexically** rather
+than through `files::resolve_target` the way `targets_plan_file` does — resolving
+canonicalises the parent, so it needs the directory to exist, and the first note a
+project keeps is written into one that does not. That is three path rules at three
+strictnesses: exact where a write is *permitted*, lexical where a format is
+*checked*, and a loose substring in `stats::note_name` where a *metric* is
+counted and missing one only understates a number.
+
 A **write** now has a pre-flight of its own, for a different reason. `App::diff_against_disk`
 reads the target through the same `files::read_all` and diffs the proposed
 contents against it, so a full rewrite shows what changes rather than what it
@@ -399,7 +417,25 @@ Plan mode reaches the lifecycle in three places, all small:
 
 The contract itself is `history[0]`, rewritten by `App::refresh_contract` whenever
 the mode or the session name changes — the plan path is embedded in the text, so a
-`/rename` mid-plan has to update it.
+`/rename` mid-plan has to update it — **and at the start of every prompt**, since
+two of its sections come from disk.
+
+Those two are the project's standing knowledge, both keyed on the sandbox root:
+
+- **`AGENTS.md`**, whole, in its own section beside the one `--system` fills.
+  Capped at 16 KB, because this document goes out again on every round-trip of
+  an agentic turn rather than once per prompt.
+- **The memory index** ([src/memory.rs](../src/memory.rs)): the names and
+  descriptions of `.ai_harness/memory/*.md`, and nothing else. The bodies are
+  files the model opens with `<ai-harness-read>` when a description matches what
+  it is doing, so a note costs a line standing and its real size only when used.
+  Descriptions come out of a bounded head read, the trick `session::head` uses.
+
+Both are read on each rebuild rather than stored, the rule `plan_path` and
+`rewind_rows` follow: the model writes memories itself, so a cached copy would go
+stale inside the session that wrote it. Rebuilding per *prompt* rather than per
+round-trip is what makes the disk access affordable — nothing on disk can change
+mid-turn without the model having done it, and it will see that next prompt.
 
 ## The loop closes
 
@@ -542,6 +578,7 @@ cannot be run.
 | `src/markdown.rs` | Markdown subset for rendering `<ai-harness-response>` |
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `open.json`) |
+| `src/memory.rs` | The `.ai_harness/memory/` index: descriptions in the contract, bodies on demand |
 | `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

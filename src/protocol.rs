@@ -1757,6 +1757,61 @@ itself is in the file, and repeating it here wastes the user's money."
     )
 }
 
+/// The project's own `AGENTS.md`, appended after [`system_prompt`].
+///
+/// Its own section rather than folded into the `extra` slot `--system` uses,
+/// because the two have different provenance and the model should be able to
+/// tell them apart: one is whoever launched the harness this time, the other is
+/// how this project is worked on regardless of who is at the keyboard.
+pub fn project_guidance(text: &str) -> String {
+    format!(
+        "Project conventions, from AGENTS.md in the working directory. These \
+         describe how this codebase is worked on and apply to everything you do \
+         here:\n\n{text}"
+    )
+}
+
+/// The memory index, appended after [`system_prompt`].
+///
+/// Names and one-line descriptions only. The bodies are files the model opens
+/// when a description matches what it is doing, which is the entire point: a
+/// note costs a line standing and its real size only when it is used.
+///
+/// The framing is load-bearing. A note is a durable assertion that the model
+/// will trust *more* than the code, because it is in the prompt and the code is
+/// not — so the contract has to say what kind of thing it is, and that checking
+/// beats believing.
+pub fn memory_section(dir: &str, index: Option<&str>) -> String {
+    // One wording whether or not any notes exist. The section used to appear
+    // only once the directory had something in it, which meant a fresh project
+    // never learned that memory existed and could not write its first note —
+    // a feature that cannot start itself.
+    let listing = match index {
+        Some(index) => format!("Notes kept so far:\n\n{index}"),
+        None => "No notes have been kept yet.\n".to_string(),
+    };
+    format!(
+        "Project memory — notes that outlive a session, in {dir}:\n\n\
+         {listing}\n\
+         Open one with <{READ_TAG}> when its description matches what you are \
+         doing; the descriptions are all you have been given, and the bodies are \
+         where the detail is. These are notes, not authority: they were written \
+         at some point in the past and the code has moved since, so check what a \
+         note claims before you rely on it, and say so if you find one wrong.\n\n\
+         To keep one — only when the user asks you to — write \
+         <{WRITE_TAG} {FILE_ATTR}={dir}/short-name.md> whose first lines are \
+         exactly:\n\n\
+         ---\n\
+         description: one line saying when a future session would want this\n\
+         ---\n\n\
+         and then the notes. That description line is what puts the note in the \
+         list above; a file without one is not indexed and will never be offered \
+         to anyone again, so the harness refuses such a write rather than let it \
+         disappear. Write the description as *when you would want this*, not as a \
+         title — it is the only thing a future session sees."
+    )
+}
+
 /// Shorten a snippet for an error message, on a char boundary.
 fn snippet(s: &str) -> String {
     const MAX: usize = 120;
