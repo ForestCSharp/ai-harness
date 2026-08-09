@@ -124,17 +124,28 @@ and returns `Some(messages)`, which `handle_update` immediately re-sends. That i
 a loop back to step 2. Malformed replies do **not** count against the agentic
 `iterations` budget — only valid ones do.
 
-One shape is recovered rather than retried. A sentence of narration in front of
-an otherwise perfect element — "Let me read that.`<ai-harness-read>`…" — is the
-commonest way a model breaks the contract and the least informative: the action
-it wrote was right, so the round-trip buys nothing. `recover_preamble` drops the
-prose, runs the element, and posts a notice saying how much it dropped. It is
-deliberately narrow: only `ProtocolError::NotATag`, only when the element behind
-the prose parses on its own, and it is the **stripped** text that goes into
-history, since sending the preamble back is how the habit gets reinforced.
-Everything else — trailing content, two elements, a fabricated result, any
-attribute error — is rejected exactly as before. `--strict-replies` turns the
-recovery off and takes the retry instead.
+Two shapes are recovered rather than retried, both through `recover_reply`. They
+are near-misses rather than mistakes — the model said the right thing in a shape
+the parser does not take — and both are common enough that correcting them by
+round-trip would be the dominant cost of the loop. Everything else is rejected
+exactly as before, and `--strict-replies` turns both off.
+
+**A preamble.** A sentence of narration in front of an otherwise perfect element
+— "Let me read that.`<ai-harness-read>`…" — is the commonest way a model breaks
+the contract and the least informative: the action it wrote was right, so the
+round-trip buys nothing. `recover_preamble` drops the prose, runs the element,
+and posts a notice saying how much it dropped. Narrow: only
+`ProtocolError::NotATag`, only when the element behind the prose parses on its
+own, and it is the **stripped** text that goes into history, since sending the
+preamble back is how the habit gets reinforced.
+
+**A bare response.** `<ai-harness-response-text>` is required around the prose,
+which makes the commonest reply there is into an error until the model adapts —
+and an untreated wave of those is retry thrash. `recover_bare_response` wraps the
+body itself. Narrow on the same terms: only a response, only when the body
+carries no child tag at all, so a *half*-wrapped reply is a real mistake and
+still earns its correction. The **wrapped** text goes into history, so the model
+sees the shape it should have used rather than its own near-miss echoed back.
 
 When a reply *is* retried and it contained one valid element,
 `encode_correction` quotes that element back and asks for it alone, rather than
@@ -182,6 +193,39 @@ prepared full rewrite is stashed in `Pending.edit_plan` and the modal shows a
 `-`/`+` diff. `approve` then turns that plan into an ordinary `Action::Write`, so
 execution reuses the write path entirely — the file is not re-read after you
 approve, so the bytes that land are exactly the ones the diff showed.
+
+**(c‴) `<ai-harness-memory>`** — a note attached to a reply. It rides on the
+reply rather than being an action of its own, because a separate write would cost
+a round-trip out of the `iterations` budget and a second approval, which is what
+made keeping notes too expensive to do at all.
+
+`take_memory` lifts it off the **front or the back** of any element's body before
+the tag-specific parse — never the middle, so a grep pattern or an edit span that
+merely mentions the tag keeps it, and never on a `<ai-harness-write>` at all,
+whose body is file bytes preserved exactly. Shape decides whether an occurrence
+*is* a note (`split_memory`) and attributes decide whether it is a *valid* one
+(`read_memory`), which is what lets a trailing mention fall through to content
+while a trailing note with a missing `description=` still gets named.
+
+`Attached` has three states, not two: `Absent`, `Declined` — the empty
+`<ai-harness-memory/>` — and `Note`. `App` raises
+`ProtocolError::MissingMemory` when a response is `Absent` and `require_memory`
+is on, routed through `retry_after` like any other violation. The requirement is
+checked there rather than in the parser because it is a setting, and
+`parse_reply` answers about shape alone. Requiring the *element* rather than a
+*note* is deliberate: a model told it must produce a note produces one whether or
+not there is anything to say. `App::keep_note`
+writes it immediately: the model supplies a *name*, `memory::write_note`
+sanitises it and builds the frontmatter from the required `description=`, so
+neither a path outside the memory directory nor an unindexable note is
+expressible. The result is pushed as an `Entry::WriteResult`, which is what makes
+`/stats` and `/memory` see it through the machinery every other memory write
+already goes through. In plan mode it is dropped with a notice instead.
+
+The memory rides *beside* the action in `protocol::Reply`, not inside
+`Action::Response`. `Action` is serialised into every `session.json`, so changing
+that variant's shape would stop saved sessions loading, and bumping
+`session::VERSION` would orphan the ones already on disk.
 
 **(c″) A memory note that would not index** is refused on the same principle.
 A write into `.ai_harness/memory/` whose contents carry no `description:` in

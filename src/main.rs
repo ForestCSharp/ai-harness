@@ -135,6 +135,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     app.max_retries = args.max_retries;
     app.strip_preamble = !args.strict_replies;
     app.show_reasoning = !args.no_reasoning;
+    app.require_memory = !args.no_require_memory;
     app.keep_checkpoints = args.keep_checkpoints;
     // Reads resolve paths in-process against the sandbox root, so the app needs
     // the sandbox itself, not just its root.

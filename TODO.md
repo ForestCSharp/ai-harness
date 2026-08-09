@@ -1,4 +1,77 @@
 
+# From the harness-engineering post
+
+Untriaged — read against Lilian Weng's ["Harness Engineering"][post], which sorts
+harness design into three patterns: a closed plan → execute → observe → improve
+loop, the file system as persistent memory, and subagents with background jobs
+whose logs live as files. We are ahead of the post on the second one; the memory
+index in `src/memory.rs` is a more careful design than "put things in files".
+The other two are where the gaps are. Nothing here is ordered against the queue
+below.
+
+[post]: https://lilianweng.github.io/posts/2026-07-04-harness/
+
+-   **Background jobs.** `exec::run_streaming` holds the turn open for the
+    command's lifetime, so there is no way to start a test run or a dev server
+    and keep working. A `background` attribute on `<ai-harness-shell>` that
+    returns a job id immediately and writes `cmd`/`stdout`/`stderr`/`status`
+    under `.ai_harness/jobs/<id>/`. The file part is the point rather than the
+    parallelism: `.ai_harness/` is not in `search::SKIP_DIRS`, so a job log is
+    already reachable by `<ai-harness-read>` and `<ai-harness-grep>` without
+    inventing a tag to inspect one. Fits the parked-then-spawned shape
+    `pending_fetch` already uses — park in `App`, spawn from `handle_update`,
+    generation-tag the updates.
+
+-   **A verification step, to close the loop.** Plan mode is plan → execute, and
+    `<ai-harness-response>` ends the turn; nothing ever asks whether the change
+    worked. `src/stats.rs` counts what happened but no outcome feeds back. A
+    project-declared check command — from `AGENTS.md` or config — run after any
+    turn that produced a `WriteResult`, with failure coming back as a result
+    rather than ending the turn. Reuses the sandboxed exec path whole. Opt-in per
+    project, since it costs a round-trip on every writing turn.
+
+-   **Read-only subagents.** `src/sessions.rs` already holds a `Slot` per running
+    conversation sharing one channel, which is most of the plumbing. The argument
+    for them is context isolation: compaction is currently the only defence
+    against growth and it is lossy for the whole conversation, where a subagent
+    spends its own context on a search and returns a paragraph. Restrict the
+    first version to read/grep/glob/fetch. A subagent that could write or shell
+    would break "one mutating action, one approval", and confining it to the
+    actions that never reach the modal preserves that invariant structurally
+    rather than by discipline.
+
+-   **Tell the model its own history exists.** The post counts error traces and
+    past trajectories as things that belong on disk. `compaction-NNN.json` and
+    the checkpoints are both recovery artifacts for the user — they sit under the
+    root and are readable, but nothing says so. One line in the contract pointing
+    at the session folder makes prior-turn history greppable for near-zero
+    standing cost.
+
+-   **Notes are write-only.** Eviction in `memory::within` is least-recently-
+    modified first, and nothing ever revises or merges a note, so a long project
+    accumulates stale ones that keep costing index lines. A `/memory`
+    consolidation pass — the model reads some notes and proposes merges and
+    deletions through the ordinary approval path — is the post's "update the
+    playbook by delta rather than appending" in the shape we already have.
+
+-   **Keep the protocol failures we already compute.** `Entry::Malformed`, the
+    retry counts and which `ProtocolError` fired are all recorded and then thrown
+    away by `roll_back_retries`. A running tally of which violations models
+    actually make is what would say which parser recovery or which line of the
+    contract to fix next. This is the only slice of the post's self-improving-
+    harness material worth taking: the rest (ADAS, AlphaEvolve, Darwin Gödel
+    Machine, joint weight-and-harness optimisation) is population search over
+    harness variants, which needs an automated evaluator this project has no
+    reason to build.
+
+Two things the post argues for that are already here, worth not regressing: the
+approval modal and the `iterations` cap are exactly its "permission controls
+outside the loop", and its bottlenecks on reward hacking and on human oversight
+at the right abstraction level are the standing reason `--auto-approve` should
+stay a deliberate choice.
+
+---
+
 # DO IN ORDER
 
 -   code indexing support, also stored in .ai_harness/

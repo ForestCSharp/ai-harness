@@ -63,7 +63,26 @@ fn main() { println!("hi"); }
 ```
 
 ```xml
-<ai-harness-response>There are 8 Rust source files.</ai-harness-response>
+<ai-harness-response>
+<ai-harness-response-text>There are 8 Rust source files.</ai-harness-response-text>
+<ai-harness-memory/>
+</ai-harness-response>
+```
+
+Every response says what to remember — either the empty form above, meaning
+"considered, nothing durable", or a note to keep. `<ai-harness-memory>` may ride
+on **any** element but a write, at the very start or end of its body, so a note
+can be recorded on the next action rather than held until the answer. See
+[Project memory](#project-memory).
+
+```xml
+<ai-harness-response>
+<ai-harness-response-text>Here's how src/ is laid out…</ai-harness-response-text>
+<ai-harness-memory name=architecture
+    description="how src/ is laid out and which module owns what">
+One tokio::select! loop in main.rs owns every session…
+</ai-harness-memory>
+</ai-harness-response>
 ```
 
 The contract is sent as the system prompt on every request, and replies are
@@ -475,21 +494,52 @@ thing the model sees, and it is what decides whether the note is ever read. **A
 file with no `description:` is left out of the index entirely**, since an entry
 that cannot earn its line is dead weight in a budget paid on every request.
 
-The model writes these itself, when you ask it to, through the ordinary
-`<ai-harness-write>` — so a memory goes through the approval modal like any other
-write and you see it before it exists. The contract carries the format and tells
-it these are notes rather than authority, to be checked against the code before
-being relied on.
+### How a note gets written
 
-**A note that would not index is refused before you are asked about it.** A write
-into the memory directory with no `description:` never reaches the approval
-modal; the model is told what is missing and writes it again. Without that, such
-a note is written, approved, and then silently never listed — a failure that
-looks exactly like a success, and one only `/memory` would ever reveal. An edit
-that strips the description out of an existing note is refused on the same rule,
-since an edit is resolved into the whole new file before the modal. The check
-uses the same parser the index does, so the two cannot disagree about what counts
-as a note.
+**The model attaches one to a reply it was making anyway**, with
+`<ai-harness-memory>`. That is the only way it can keep a note, and it is
+deliberate: a note written as a *separate* action would cost a round-trip out of
+the agentic budget and a second approval, which is what made keeping them too
+expensive to bother with. Riding on a reply costs neither.
+
+The element may go on **any element but a write**, at the very start or the very
+end of the body — never the middle, so a grep pattern or an edit span that merely
+mentions the tag keeps it. A write is excluded because its body is the file's
+exact bytes, and carving an element out of them would corrupt a file that begins
+or ends with one. That matters here: this harness edits its own source.
+
+Allowing it anywhere is what puts capture at the moment of learning. A note about
+what a read established can ride on the *next* action rather than waiting for the
+answer, by which point the model is composing prose and the detail has faded.
+
+**A response must carry one**, which is the part that made memory actually
+happen — offering was not enough, and a session that read seven files and
+summarised them kept nothing. `<ai-harness-memory/>` with no attributes satisfies
+it and means "considered, nothing durable this turn". Requiring the *element*
+rather than a *note* is the whole design: a model told it must produce a note
+will produce one, and a directory of notes about arithmetic is worse than an
+empty directory. `--no-require-memory` turns the requirement off if the
+corrective round-trips cost more than the notes are worth; `/stats` is how you
+tell.
+
+**It is written without asking**, and the containment is what makes that
+defensible rather than alarming: the model supplies a **name**, never a path. The
+harness sanitises it, appends `.md`, and joins it to the memory directory, so
+there is no value it can send that writes anywhere else. `description` is a
+required attribute, so the harness builds the frontmatter itself and a note that
+cannot be indexed is impossible to express. `/memory` and `/stats` are the audit
+surfaces, and a note you did not want is one `rm`.
+
+In [plan mode](#plan-mode) a note is dropped rather than written, with a notice
+saying so — the mode's promise is that nothing but the plan is written, and it is
+enforced by the kernel besides.
+
+Writing a note by hand with `<ai-harness-write>` still works, and is still
+checked: one into the memory directory with no `description:` is refused before
+you are asked about it, since otherwise it would be written, approved, and then
+silently never listed. An edit that strips the description out of an existing
+note is refused on the same rule. Both use the same parser the index does, so the
+two cannot disagree about what counts as a note.
 
 The index is capped at 128 entries and 8 KB. Over that, the least recently
 changed drop out and the section says how many went, so a partial list looks
@@ -965,8 +1015,9 @@ searches behind the approval modal along with everything else, and
 `--strict-replies` rejects a reply that narrates before its element rather than
 dropping the narration, `--no-reasoning` starts with the reasoning window
 hidden, `--no-restore` starts with one fresh session instead of
-[reopening the ones you had](#picking-up-where-you-left-off), and
-`--keep-checkpoints` caps how many turns of
+[reopening the ones you had](#picking-up-where-you-left-off),
+`--no-require-memory` lets a reply end a turn without saying what to
+[remember](#project-memory), and `--keep-checkpoints` caps how many turns of
 [undo history](#checkpoints-and-undo) a fresh session keeps.
 `--auto-approve` goes the other way and removes the modal entirely — read
 [Sandboxing](#sandboxing) before using it. Every flag also has an environment

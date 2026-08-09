@@ -575,6 +575,17 @@ pub struct App {
     /// Whether `/sessions` has asked for the sessions view. Parked for the event
     /// loop to take, like `pending_fetch` — a session cannot open it itself.
     sessions_requested: bool,
+    /// Whether a response must say what to remember.
+    ///
+    /// Not the parser's business — `parse_reply` answers about shape, and this
+    /// is a setting. Checked here so a reply that fails it earns the same
+    /// corrective round-trip any other violation does.
+    ///
+    /// **On in the product, off in [`App::new`].** The default lives with the
+    /// flag that spells it (`--no-require-memory`), which `main` applies; a
+    /// constructor default of `true` would make every test that pushes an
+    /// ordinary response spend a round-trip on a requirement it is not about.
+    pub require_memory: bool,
     /// Whether the `/stats` page is up.
     ///
     /// An overlay beside `Status`, exactly as `picker` is: the page coexists
@@ -759,6 +770,7 @@ impl App {
             turn_number: 0,
             rewind: None,
             sessions_requested: false,
+            require_memory: false,
             stats: false,
             requested_open: None,
             turn_prompt: String::new(),
@@ -1978,6 +1990,7 @@ impl App {
         fresh.confirm_fetches = self.confirm_fetches;
         fresh.strip_preamble = self.strip_preamble;
         fresh.show_reasoning = self.show_reasoning;
+        fresh.require_memory = self.require_memory;
         fresh.keep_checkpoints = self.keep_checkpoints;
         fresh.max_turn_bytes = self.max_turn_bytes;
         fresh.max_retries = self.max_retries;
@@ -2353,13 +2366,23 @@ impl App {
             self.ledger.record(usage);
         }
 
-        let (content, action) = match protocol::parse_reply(&content) {
-            Ok(action) => (content, action),
-            Err(err) => match self.recover_preamble(&content, &err) {
+        let (content, reply) = match protocol::parse_reply(&content) {
+            Ok(reply) => (content, reply),
+            Err(err) => match self.recover_reply(&content, &err) {
                 Some(recovered) => recovered,
                 None => return self.retry_after(content, err),
             },
         };
+        let protocol::Reply { action, memory } = reply;
+
+        // Requiring the element, not a note: `<ai-harness-memory/>` satisfies
+        // this. What is being insisted on is that the question got asked.
+        if self.require_memory
+            && matches!(action, Action::Response(_))
+            && memory == protocol::Attached::Absent
+        {
+            return self.retry_after(content, protocol::ProtocolError::MissingMemory);
+        }
 
         // Only a valid reply counts as progress against the loop budget.
         self.iterations += 1;
@@ -2389,6 +2412,13 @@ impl App {
             usage,
             diff: action_diff.clone(),
         });
+
+        // A note attached to the answer, kept before the turn ends. Written
+        // rather than proposed: it rode in on the reply the model was making
+        // anyway, and the harness — not the model — decides the path.
+        if let Some(note) = memory.note() {
+            self.keep_note(note.clone());
+        }
 
         match action {
             // In plan mode a final answer means the plan is ready, so the turn
@@ -2661,6 +2691,114 @@ impl App {
         }
     }
 
+    /// Keep a note the model attached to its answer.
+    ///
+    /// Recorded as an `Entry::WriteResult`, which is not decoration: it is what
+    /// makes `/stats` count the note and `/memory` find it, through the same
+    /// path-matching every other memory write already goes through. A note that
+    /// arrived by a different route and had to be counted separately would be
+    /// two sources of truth about the same thing.
+    fn keep_note(&mut self, memory: protocol::Memory) {
+        // Plan mode means the filesystem is read-only apart from the plan file,
+        // and that promise is the whole of the mode. A note is dropped rather
+        // than written, and said so — silently discarding it would look like the
+        // model failed to offer one.
+        if self.planning {
+            return self.push_notice(format!(
+                "Plan mode: did not keep the note {:?}. Ask again once the plan is running.",
+                memory.name
+            ));
+        }
+        let Some(root) = self.sandbox.as_ref().map(|s| s.root().to_path_buf()) else {
+            return self.push_notice("No project root, so there is nowhere to keep a note.");
+        };
+
+        let dir = crate::memory::dir(&root);
+        match crate::memory::write_note(&dir, &memory.name, &memory.description, &memory.body) {
+            Ok(path) => {
+                let shown = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                let bytes = memory.body.len();
+                self.transcript
+                    .push(Entry::WriteResult(crate::exec::WriteOutcome {
+                        path: shown,
+                        bytes,
+                        error: None,
+                        timed_out: false,
+                        cancelled: false,
+                    }));
+            }
+            // An error rather than a silent no-op: a note the model believes it
+            // kept and that is not there is worse than one it knows it lost.
+            Err(why) => self
+                .transcript
+                .push(Entry::Error(format!("could not keep a note: {why}"))),
+        }
+    }
+
+    /// Salvage a reply that broke the contract in one of the two ways that are
+    /// common, obvious, and cost a round-trip to correct.
+    ///
+    /// Both are near-misses rather than mistakes: the model said the right thing
+    /// in a shape the parser does not take. Everything else is rejected exactly
+    /// as before, and `--strict-replies` turns both off.
+    fn recover_reply(
+        &mut self,
+        content: &str,
+        error: &protocol::ProtocolError,
+    ) -> Option<(String, protocol::Reply)> {
+        self.recover_preamble(content, error)
+            .or_else(|| self.recover_bare_response(content, error))
+    }
+
+    /// Recover a `<ai-harness-response>` whose body is plain prose.
+    ///
+    /// The text wrapper is required, which makes the commonest reply there is
+    /// into a protocol error until the model adapts — and an untreated wave of
+    /// those is retry thrash, the failure this harness was already diagnosed for
+    /// once. So the harness wraps the body itself rather than spending a
+    /// round-trip teaching it.
+    ///
+    /// Narrow, on the same terms as the preamble recovery: only a response, only
+    /// when the body carries no child tag at all — a *half*-wrapped reply is a
+    /// real mistake and still earns its correction — and it says so each time,
+    /// so the drift stays visible rather than being quietly absorbed.
+    fn recover_bare_response(
+        &mut self,
+        content: &str,
+        error: &protocol::ProtocolError,
+    ) -> Option<(String, protocol::Reply)> {
+        if !self.strip_preamble {
+            return None;
+        }
+        // The parser reports the missing wrapper as an absent child.
+        let protocol::ProtocolError::MissingChildTag { parent, .. } = error else {
+            return None;
+        };
+        if parent != protocol::RESPONSE_TAG {
+            return None;
+        }
+        let element = protocol::sole_element(content)?;
+        let body = protocol::element_body(element, protocol::RESPONSE_TAG)?;
+        if body.contains(&format!("<{}", protocol::MEMORY_TAG))
+            || body.contains(&format!("<{}", protocol::RESPONSE_TEXT_TAG))
+        {
+            return None;
+        }
+        let wrapped = protocol::encode_response(body.trim());
+        let reply = protocol::parse_reply(&wrapped).ok()?;
+        self.push_notice(format!(
+            "Wrapped a bare response in <{}>.",
+            protocol::RESPONSE_TEXT_TAG
+        ));
+        // The *wrapped* text goes into history, so the model sees the shape it
+        // should have used rather than its own near-miss echoed back.
+        Some((wrapped, reply))
+    }
+
     /// Recover a reply that is one valid element behind a sentence of prose.
     ///
     /// The commonest way a model breaks the contract by far, and the most
@@ -2680,19 +2818,19 @@ impl App {
         &mut self,
         content: &str,
         error: &protocol::ProtocolError,
-    ) -> Option<(String, Action)> {
+    ) -> Option<(String, protocol::Reply)> {
         if !self.strip_preamble || !matches!(error, protocol::ProtocolError::NotATag { .. }) {
             return None;
         }
         let element = protocol::sole_element(content)?;
-        let action = protocol::parse_reply(element).ok()?;
+        let reply = protocol::parse_reply(element).ok()?;
         let dropped = content.len() - element.len();
         // A notice rather than nothing: the relaxation has to stay visible, or
         // protocol drift is exactly what it hides.
         self.push_notice(format!(
             "Dropped {dropped} bytes of prose before the element.",
         ));
-        Some((element.to_string(), action))
+        Some((element.to_string(), reply))
     }
 
     /// Roll an abandoned retry loop out of context, back to where history was
@@ -3493,7 +3631,11 @@ impl App {
                 let text = completion.content.trim().to_string();
                 if text.is_empty() {
                     (None, Some("the summary came back empty".to_string()))
-                } else if protocol::parse_reply(&text).is_ok() {
+                    // Shape rather than `parse_reply`: a summariser that answered
+                    // the contract has produced an action whether or not it got
+                    // the action's own shape right, and a malformed one is no
+                    // more a summary than a valid one is.
+                } else if protocol::looks_like_element(&text) {
                     // The model answered the contract instead of the
                     // instruction. Its reply is an action, not a summary.
                     (
@@ -9161,6 +9303,244 @@ mod memory_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The whole point: the note rides on the answer, costs no round-trip and
+    /// no approval, and lands somewhere the index will read it back.
+    #[test]
+    fn a_note_attached_to_an_answer_is_kept_and_indexed() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("what is this project");
+        app.submit().unwrap();
+
+        app.push_response(
+            format!(
+                "<{r}><{txt}>It is a terminal harness.</{txt}>\
+                 <{mem} name=architecture description=\"how src/ is laid out\">\
+                 One loop owns every session.</{mem}></{r}>",
+                r = crate::protocol::RESPONSE_TAG,
+                txt = crate::protocol::RESPONSE_TEXT_TAG,
+                mem = crate::protocol::MEMORY_TAG,
+            ),
+            None,
+        );
+
+        let notes = crate::memory::list(&crate::memory::dir(&dir));
+        assert_eq!(notes.len(), 1, "the note should be on disk");
+        assert_eq!(notes[0].name, "architecture");
+        assert_eq!(notes[0].description, "how src/ is laid out");
+        assert!(!app.is_busy(), "and the answer still ended the turn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note arriving this way must be counted like any other, or `/stats`
+    /// would report memory as unused while the directory filled up.
+    #[test]
+    fn a_kept_note_is_visible_to_stats() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("x");
+        app.submit().unwrap();
+        app.push_response(
+            format!(
+                "<{r}><{txt}>done</{txt}><{mem} name=learned description=\"when\">\
+                 body</{mem}></{r}>",
+                r = crate::protocol::RESPONSE_TAG,
+                txt = crate::protocol::RESPONSE_TEXT_TAG,
+                mem = crate::protocol::MEMORY_TAG,
+            ),
+            None,
+        );
+        assert_eq!(crate::stats::memory_use(&app.transcript).writes, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writing without asking is only defensible because the model names a note,
+    /// never a path. Nothing it can put in `name=` reaches outside the directory.
+    #[test]
+    fn a_note_cannot_name_its_way_out_of_the_memory_directory() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("x");
+        app.submit().unwrap();
+        app.push_response(
+            format!(
+                "<{r}><{txt}>done</{txt}>\
+                 <{mem} name=\"../../escaped\" description=\"when\">body</{mem}></{r}>",
+                r = crate::protocol::RESPONSE_TAG,
+                txt = crate::protocol::RESPONSE_TEXT_TAG,
+                mem = crate::protocol::MEMORY_TAG,
+            ),
+            None,
+        );
+
+        assert!(!dir.join("escaped.md").exists());
+        assert!(!dir.parent().unwrap().join("escaped.md").exists());
+        assert!(crate::memory::list(&crate::memory::dir(&dir)).is_empty());
+        assert!(
+            matches!(super::tests::last_visible(&app), Entry::Error(e) if e.contains("could not keep a note")),
+            "and it is reported rather than silently dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan mode means the filesystem is read-only apart from the plan, and that
+    /// promise is the whole of the mode.
+    #[test]
+    fn a_note_offered_in_plan_mode_is_dropped_with_a_notice() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Plan(None));
+        app.input.insert_str("x");
+        app.submit();
+        app.push_response(
+            format!(
+                "<{r}><{txt}>done</{txt}><{mem} name=learned description=\"when\">\
+                 body</{mem}></{r}>",
+                r = crate::protocol::RESPONSE_TAG,
+                txt = crate::protocol::RESPONSE_TEXT_TAG,
+                mem = crate::protocol::MEMORY_TAG,
+            ),
+            None,
+        );
+
+        assert!(crate::memory::list(&crate::memory::dir(&dir)).is_empty());
+        assert!(
+            app.transcript
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(n) if n.contains("Plan mode: did not keep"))),
+            "silently discarding it would look like the model never offered one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wrapper is required, which makes the commonest reply there is an
+    /// error until the model adapts. Untreated that is retry thrash.
+    #[test]
+    fn a_bare_response_is_wrapped_rather_than_retried() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("x");
+        app.submit().unwrap();
+
+        let sent = app.push_response(
+            "<ai-harness-response>All done.</ai-harness-response>".into(),
+            None,
+        );
+
+        assert!(sent.is_none(), "no retry was spent");
+        assert!(!app.is_busy(), "the turn ended on the answer");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|e| matches!(e, Entry::Notice(n) if n.contains("Wrapped a bare response"))),
+            "and the drift stays visible"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_replies_retries_a_bare_response_instead() {
+        let (mut app, dir) = app_in_temp();
+        app.strip_preamble = false;
+        app.input.insert_str("x");
+        app.submit().unwrap();
+
+        let sent = app.push_response(
+            "<ai-harness-response>All done.</ai-harness-response>".into(),
+            None,
+        );
+        assert!(sent.is_some(), "strictness takes the round-trip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Requiring the element, not the note. What is insisted on is that the
+    /// question got asked — a model told it must produce a note produces one
+    /// whether or not there is anything to say.
+    #[test]
+    fn a_required_memory_accepts_a_declination_and_refuses_silence() {
+        let mem = crate::protocol::MEMORY_TAG;
+        let r = crate::protocol::RESPONSE_TAG;
+        let txt = crate::protocol::RESPONSE_TEXT_TAG;
+
+        // Silence: retried, and the correction names both ways out.
+        let (mut app, dir) = app_in_temp();
+        app.require_memory = true;
+        app.input.insert_str("what is 2+2");
+        app.submit().unwrap();
+        let sent = app.push_response(format!("<{r}><{txt}>4.</{txt}></{r}>"), None);
+        assert!(sent.is_some(), "silence earns a round-trip");
+        let correction = app.history.last().unwrap().content.clone();
+        assert!(correction.contains(mem), "{correction}");
+
+        // Declined: accepted, turn over, nothing written.
+        let (mut app, _) = app_in_temp();
+        app.require_memory = true;
+        app.input.insert_str("what is 2+2");
+        app.submit().unwrap();
+        let sent = app.push_response(format!("<{r}><{txt}>4.</{txt}><{mem}/></{r}>"), None);
+        assert!(sent.is_none(), "a declination is an answer");
+        assert!(!app.is_busy());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_requirement_can_be_turned_off() {
+        let (mut app, dir) = app_in_temp();
+        app.require_memory = false;
+        app.input.insert_str("what is 2+2");
+        app.submit().unwrap();
+        let sent = app.push_response(
+            format!(
+                "<{r}><{txt}>4.</{txt}></{r}>",
+                r = crate::protocol::RESPONSE_TAG,
+                txt = crate::protocol::RESPONSE_TEXT_TAG,
+            ),
+            None,
+        );
+        assert!(sent.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a response is held to it. Demanding a judgement on the first read of
+    /// a file the model has not seen is asking for one it cannot make.
+    #[test]
+    fn an_action_needs_no_memory_even_when_one_is_required() {
+        let (mut app, dir) = app_in_temp();
+        app.require_memory = true;
+        app.input.insert_str("look at something");
+        app.submit().unwrap();
+
+        let sent = app.push_response("<ai-harness-read>src/app.rs</ai-harness-read>".into(), None);
+        assert!(sent.is_some(), "the read runs and returns its result");
+        assert!(
+            !app.history
+                .last()
+                .unwrap()
+                .content
+                .contains("must say what to remember"),
+            "and is not corrected for having no note"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole reason the element was generalised: capture belongs right after
+    /// the read that produced the knowledge.
+    #[test]
+    fn a_note_on_a_read_is_kept_at_that_moment() {
+        let (mut app, dir) = app_in_temp();
+        app.input.insert_str("look at something");
+        app.submit().unwrap();
+
+        app.push_response(
+            format!(
+                "<ai-harness-read><{mem} name=layout description=\"where things live\">\
+                 src/ holds one module per concern.</{mem}>src/app.rs</ai-harness-read>",
+                mem = crate::protocol::MEMORY_TAG,
+            ),
+            None,
+        );
+
+        let notes = crate::memory::list(&crate::memory::dir(&dir));
+        assert_eq!(notes.len(), 1, "kept during the turn, not at the end");
+        assert_eq!(notes[0].name, "layout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// This asserted the defect: the section used to appear only once a note
     /// existed, so a fresh project never learned memory was an option and could
     /// not write its first note. It is the test that should have caught that.
@@ -9171,7 +9551,10 @@ mod memory_tests {
         assert!(text.contains("Project memory"), "{text}");
         assert!(text.contains("No notes have been kept yet"), "{text}");
         // And how to start one, which is the half that was missing entirely.
-        assert!(text.contains("description:"), "{text}");
+        // The attribute, not the frontmatter: the harness writes the file, so
+        // the format is no longer the model's business.
+        assert!(text.contains(crate::protocol::MEMORY_TAG), "{text}");
+        assert!(text.contains("description="), "{text}");
         assert!(text.contains(".ai_harness/memory"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }

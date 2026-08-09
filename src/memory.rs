@@ -197,6 +197,44 @@ fn modified(path: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+/// Write a note the model asked to keep, returning where it landed.
+///
+/// The model supplies a **name**, never a path: this sanitises it, appends
+/// `.md`, and joins it to `dir`. That is what makes writing one without asking
+/// defensible — there is no value of `name` that reaches outside the memory
+/// directory, so the blast radius is a file in a directory whose whole purpose
+/// is holding files like it.
+///
+/// The frontmatter is built here from `description` rather than trusted from the
+/// model, so a note this path produces is always one [`list`] will index.
+pub fn write_note(
+    dir: &Path,
+    name: &str,
+    description: &str,
+    body: &str,
+) -> Result<PathBuf, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a note needs a name".to_string());
+    }
+    if name.contains(['/', '\\']) || name.contains("..") || name.starts_with('.') {
+        return Err(format!(
+            "invalid note name {name:?}: names cannot contain path separators or '..'"
+        ));
+    }
+    // One line, collapsed, exactly as `description_in` will read it back.
+    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if description.is_empty() {
+        return Err("a note needs a description".to_string());
+    }
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{name}.md"));
+    let contents = format!("---\ndescription: {description}\n---\n\n{}\n", body.trim());
+    std::fs::write(&path, contents).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// The `description:` from a note's frontmatter, on disk.
 ///
 /// Read out of a bounded head rather than by loading the file, the trick

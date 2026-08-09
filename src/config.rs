@@ -133,6 +133,21 @@ pub struct Args {
     #[arg(long, env = "AI_HARNESS_STRICT_REPLIES")]
     pub strict_replies: bool,
 
+    /// Let a reply end a turn without saying what to remember.
+    ///
+    /// The requirement is on by default because offering was not enough: a
+    /// session that read seven files and summarised them kept nothing, which is
+    /// what the whole memory system exists to stop. Requiring the *element*
+    /// rather than a *note* makes the judgement mandatory every turn without
+    /// making the note mandatory — `<ai-harness-memory/>` means "considered,
+    /// nothing durable", and a model told it must produce a note will produce
+    /// one whether or not there is anything to say.
+    ///
+    /// Turn it off if the corrective round-trips cost more than the notes are
+    /// worth; `/stats` is how you tell.
+    #[arg(long, env = "AI_HARNESS_NO_REQUIRE_MEMORY")]
+    pub no_require_memory: bool,
+
     /// Start with one fresh session instead of reopening the ones that were
     /// open when the harness last quit in this project.
     ///

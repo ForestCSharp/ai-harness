@@ -62,8 +62,30 @@ pub const OPTION_TAG: &str = "ai-harness-option";
 pub const OPTION_QUESTION_TAG: &str = "ai-harness-option-question";
 /// One answer to choose between. A child of [`OPTION_TAG`], repeated.
 pub const OPTION_CHOICE_TAG: &str = "ai-harness-option-choice";
+/// The prose a response shows the user. A child of [`RESPONSE_TAG`].
+pub const RESPONSE_TEXT_TAG: &str = "ai-harness-response-text";
+/// A note to keep. A child **any** element may carry, which is why it is not
+/// named after one.
+///
+/// Carried on the reply the model was making anyway, rather than written as an
+/// action of its own: a separate write would cost a round-trip out of the
+/// agentic budget and a second approval, which is what made keeping notes too
+/// expensive to do at all. Allowing it on any element puts the capture at the
+/// moment of learning — right after the read that produced it — rather than
+/// several actions later when the answer is being composed.
+///
+/// `<ai-harness-memory/>` with no attributes means *considered, nothing worth
+/// keeping*. That distinction is what lets the element be required without the
+/// note being required; see [`Attached`].
+pub const MEMORY_TAG: &str = "ai-harness-memory";
 /// The path attribute on a write or an edit.
 pub const FILE_ATTR: &str = "file";
+/// What a kept note is called. The harness turns it into a filename; the model
+/// never supplies a path.
+pub const NAME_ATTR: &str = "name";
+/// When a future session would want a note. Required, which is what makes an
+/// unindexable note impossible to express.
+pub const DESCRIPTION_ATTR: &str = "description";
 /// A read's 1-based first line. Optional; the top of the file without it.
 pub const OFFSET_ATTR: &str = "offset";
 /// How many lines a read returns. Optional; as many as fit without it.
@@ -370,6 +392,22 @@ pub enum ProtocolError {
     },
     /// A `<ai-harness-write>` without a usable `file=` attribute.
     MissingFileAttribute,
+    /// A response arrived with no `<ai-harness-memory>` at all, while one was
+    /// required.
+    ///
+    /// Raised by `App` rather than by the parser: the requirement is a setting,
+    /// and keeping `parse_reply` free of settings keeps it one answer about
+    /// shape alone. It travels as a `ProtocolError` so it earns the same
+    /// corrective round-trip every other violation does.
+    MissingMemory,
+    /// A tag that requires an attribute did not carry it.
+    ///
+    /// Distinct from [`Self::MissingFileAttribute`], whose message names the one
+    /// element it is about; this one is general and says which attribute.
+    MissingAttribute {
+        tag: String,
+        attr: String,
+    },
     /// A shell/response tag carried an attribute it should not have.
     UnexpectedAttribute {
         tag: String,
@@ -461,6 +499,16 @@ impl fmt::Display for ProtocolError {
                 f,
                 "<{WRITE_TAG}> needs a file path, e.g. <{WRITE_TAG} file=path/to/file>…</{WRITE_TAG}>"
             ),
+            Self::MissingMemory => write!(
+                f,
+                "every <{RESPONSE_TAG}> must say what to remember. Add \
+                 <{MEMORY_TAG} {NAME_ATTR}=short-name {DESCRIPTION_ATTR}=\"when a future \
+                 session would want this\">…</{MEMORY_TAG}> if this turn established \
+                 something worth keeping, or <{MEMORY_TAG}/> if it did not"
+            ),
+            Self::MissingAttribute { tag, attr } => {
+                write!(f, "<{tag}> needs a {attr}= attribute, and had none")
+            }
             Self::UnexpectedAttribute { tag, attr } => write!(
                 f,
                 "<{tag}> does not take attributes, but had: {}",
@@ -519,6 +567,56 @@ impl std::error::Error for ProtocolError {}
 /// Wrap user input for sending to the model.
 pub fn encode_query(text: &str) -> String {
     format!("<{QUERY_TAG}>{}</{QUERY_TAG}>", text.trim())
+}
+
+/// A response in the shape the parser takes, for the harness's own use.
+///
+/// Used where a bare response is wrapped rather than rejected — see
+/// `App::recover_bare_response`. Built here so there is one spelling of the
+/// wrapped form and the recovery cannot drift from what `parse_reply` accepts.
+pub fn encode_response(text: &str) -> String {
+    format!(
+        "<{RESPONSE_TAG}>\n<{RESPONSE_TEXT_TAG}>\n{}\n</{RESPONSE_TEXT_TAG}>\n</{RESPONSE_TAG}>",
+        text.trim()
+    )
+}
+
+/// Whether `raw` is, in its entirety, one of the model's reply elements.
+///
+/// Shape only: the children are not validated, so a *malformed* element answers
+/// true as readily as a valid one. That is what the callers want — the question
+/// is "did the model reply with an action instead of the prose I asked for",
+/// and an action it got wrong is still not prose. Asking [`parse_reply`] instead
+/// would let every near-miss through.
+pub fn looks_like_element(raw: &str) -> bool {
+    let raw = raw.trim();
+    REPLY_TAGS.iter().any(|tag| {
+        // `element_body` proves it opens with the tag and closes somewhere;
+        // `ends_with` proves nothing trails the close, which is what makes this
+        // "is one element" rather than "mentions one".
+        element_body(raw, tag).is_some() && raw.ends_with(&format!("</{tag}>"))
+    })
+}
+
+/// The body of `element`, when it opens with `tag`.
+///
+/// A shallow accessor for a reply that has already been recognised as one
+/// element: it does not validate, and the caller is expected to hand the result
+/// back through [`parse_reply`].
+pub fn element_body<'a>(element: &'a str, tag: &str) -> Option<&'a str> {
+    let element = element.trim();
+    let close_bracket = element.find('>')?;
+    let head = &element[1..close_bracket];
+    let name = match head.find(char::is_whitespace) {
+        Some(i) => &head[..i],
+        None => head,
+    };
+    if name != tag {
+        return None;
+    }
+    let after_open = &element[close_bracket + 1..];
+    let closing_at = after_open.find(&format!("</{tag}>"))?;
+    Some(&after_open[..closing_at])
 }
 
 /// Report a completed command back to the model.
@@ -1000,8 +1098,58 @@ pub fn sole_element(raw: &str) -> Option<&str> {
         .map(|at| &raw[at..])
 }
 
+/// A note the model asked to keep, attached to its response.
+///
+/// The model supplies a *name*, never a path: the harness turns it into a file
+/// inside the memory directory, so there is no spelling of this element that
+/// writes anywhere else. `description` is required by the parser, which is what
+/// makes a note that cannot be indexed impossible to express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Memory {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// What a reply said about keeping a note.
+///
+/// Three states rather than an `Option`, because "said nothing" and "said
+/// nothing is worth keeping" are different answers and the requirement turns on
+/// telling them apart: requiring the *element* makes the judgement mandatory
+/// every turn, where requiring a *note* would only make the model invent one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attached {
+    /// No memory element at all.
+    Absent,
+    /// `<{MEMORY_TAG}/>` — considered, and nothing this turn is worth keeping.
+    Declined,
+    Note(Memory),
+}
+
+impl Attached {
+    /// The note, if there is one to write.
+    pub fn note(&self) -> Option<&Memory> {
+        match self {
+            Self::Note(memory) => Some(memory),
+            _ => None,
+        }
+    }
+}
+
+/// One parsed model reply: the action, and a note to keep alongside it.
+///
+/// The memory rides *beside* the action rather than inside it, because [`Action`]
+/// is serialised into every `session.json` — changing the shape of
+/// `Action::Response` would stop every saved session loading, and bumping
+/// `crate::session::VERSION` would orphan the ones already on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub action: Action,
+    pub memory: Attached,
+}
+
 /// Parse a model reply, rejecting anything that is not exactly one valid element.
-pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
+pub fn parse_reply(raw: &str) -> Result<Reply, ProtocolError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(ProtocolError::Empty);
@@ -1107,6 +1255,16 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         });
     }
 
+    // A note may lead or trail the body of any element **but a write**, whose
+    // body is file bytes preserved byte-for-byte. Carving an element out of
+    // those would silently corrupt a file that happens to begin or end with one
+    // — and this harness edits its own source, so such a file is reachable.
+    let (body, memory) = if tag == WRITE_TAG {
+        (body, Attached::Absent)
+    } else {
+        take_memory(body)?
+    };
+
     if tag == WRITE_TAG {
         let path = attribute(&pairs, FILE_ATTR)
             .map(str::to_string)
@@ -1119,9 +1277,12 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
                 tag: tag.to_string(),
             });
         }
-        return Ok(Action::Write {
-            path,
-            contents: contents.to_string(),
+        return Ok(Reply {
+            action: Action::Write {
+                path,
+                contents: contents.to_string(),
+            },
+            memory,
         });
     }
 
@@ -1130,12 +1291,25 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
             .map(str::to_string)
             .ok_or(ProtocolError::MissingFileAttribute)?;
         let (old, new) = parse_edit_children(body)?;
-        return Ok(Action::Edit { path, old, new });
+        return Ok(Reply {
+            action: Action::Edit { path, old, new },
+            memory,
+        });
     }
 
     if tag == OPTION_TAG {
         let (question, choices) = parse_option_children(body)?;
-        return Ok(Action::Options { question, choices });
+        return Ok(Reply {
+            action: Action::Options { question, choices },
+            memory,
+        });
+    }
+
+    if tag == RESPONSE_TAG {
+        return Ok(Reply {
+            action: Action::Response(parse_response_text(body)?),
+            memory,
+        });
     }
 
     let body = body.trim();
@@ -1145,7 +1319,7 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         });
     }
 
-    Ok(match tag {
+    let action = match tag {
         SHELL_TAG => Action::Shell(body.to_string()),
         READ_TAG => {
             let (offset, limit) = read_window;
@@ -1170,8 +1344,15 @@ pub fn parse_reply(raw: &str) -> Result<Action, ProtocolError> {
         FETCH_TAG => Action::Fetch {
             url: body.to_string(),
         },
-        _ => Action::Response(body.to_string()),
-    })
+        // Every tag in `REPLY_TAGS` is handled above or here; a response is
+        // taken by its own arm, since it is the one with children.
+        other => {
+            return Err(ProtocolError::UnknownTag {
+                tag: other.to_string(),
+            });
+        }
+    };
+    Ok(Reply { action, memory })
 }
 
 /// Which attributes an element accepts. Empty for the elements that take none.
@@ -1185,6 +1366,7 @@ fn allowed_attrs(tag: &str) -> &'static [&'static str] {
         GREP_TAG => &[DIR_ATTR, GLOB_ATTR],
         GLOB_TAG => &[DIR_ATTR],
         WRITE_TAG | EDIT_TAG => &[FILE_ATTR],
+        MEMORY_TAG => &[NAME_ATTR, DESCRIPTION_ATTR],
         _ => &[],
     }
 }
@@ -1418,6 +1600,146 @@ fn parse_option_children(body: &str) -> Result<(String, Vec<String>), ProtocolEr
 /// `parent` is passed in rather than assumed: two elements have children now, and
 /// a correction that names the wrong one sends the model looking in the wrong
 /// place.
+/// The prose a response shows, out of its required wrapper.
+///
+/// The wrapper is required whether or not a note rides along. One shape to learn
+/// beats a rule that changes with what else is present — and the harness
+/// recovers a bare body rather than spending a round-trip on it, so the
+/// strictness costs nothing in practice. See `App::recover_bare_response`.
+fn parse_response_text(body: &str) -> Result<String, ProtocolError> {
+    let (text, rest) = expect_child(body, RESPONSE_TAG, RESPONSE_TEXT_TAG)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ProtocolError::EmptyBody {
+            tag: RESPONSE_TEXT_TAG.to_string(),
+        });
+    }
+    if !rest.trim().is_empty() {
+        return Err(ProtocolError::UnexpectedChildContent {
+            parent: RESPONSE_TAG.to_string(),
+            found: rest.trim().to_string(),
+        });
+    }
+    Ok(text.to_string())
+}
+
+/// Take a `<{MEMORY_TAG}>` off the front or the back of `body`.
+///
+/// **Never the middle.** A positional rule rather than a search, so an element
+/// whose body merely *contains* the tag — a grep pattern, a shell command, an
+/// edit's old span quoting this protocol — keeps it. Front or back rather than
+/// front alone because both read naturally: a note leads a read it prompted, and
+/// trails the response it summarises.
+fn take_memory(body: &str) -> Result<(&str, Attached), ProtocolError> {
+    let trimmed = body.trim();
+    let open = format!("<{MEMORY_TAG}");
+    if trimmed.starts_with(&open) {
+        let (attrs, note, after) =
+            split_memory(trimmed).ok_or(ProtocolError::MissingClosingTag {
+                tag: MEMORY_TAG.to_string(),
+            })?;
+        return Ok((after, read_memory(attrs, note)?));
+    }
+    // Trailing only when the element is complete *and* runs to the very end.
+    // Shape decides whether this is a note at all; a body that merely mentions
+    // the tag has no closing one and stays content. Once it is a note, an
+    // attribute mistake is reported rather than swallowed — the model plainly
+    // meant to keep something, and "unexpected child content" would send it
+    // looking in the wrong place.
+    if let Some(at) = trimmed.rfind(&open)
+        && let Some((attrs, note, after)) = split_memory(&trimmed[at..])
+        && after.trim().is_empty()
+    {
+        return Ok((&trimmed[..at], read_memory(attrs, note)?));
+    }
+    Ok((body, Attached::Absent))
+}
+
+/// Split a memory element at the front of `input` into its attribute text, its
+/// body, and whatever follows — or `None` when it is not a complete element.
+///
+/// Shape only, so the caller can tell "this is not a note" from "this is a note
+/// with something wrong in it". Both `<{MEMORY_TAG}/>` and a closed pair count.
+fn split_memory(input: &str) -> Option<(&str, &str, &str)> {
+    let close_bracket = input.find('>')?;
+    let head = &input[1..close_bracket];
+    // A self-closing tag ends the element outright: no body, no closing tag.
+    let (head, self_closing) = match head.strip_suffix('/') {
+        Some(head) => (head, true),
+        None => (head, false),
+    };
+    let attrs = head.strip_prefix(MEMORY_TAG)?.trim();
+    if self_closing {
+        return Some((attrs, "", &input[close_bracket + 1..]));
+    }
+    let after_open = &input[close_bracket + 1..];
+    let closing_at = after_open.find(&format!("</{MEMORY_TAG}>"))?;
+    Some((
+        attrs,
+        &after_open[..closing_at],
+        &after_open[closing_at + MEMORY_TAG.len() + 3..],
+    ))
+}
+
+/// Turn a split memory element into what it says.
+///
+/// Both `<{MEMORY_TAG}/>` and an empty `<{MEMORY_TAG}></{MEMORY_TAG}>` mean
+/// [`Attached::Declined`]: the two spellings say the same thing, and neither is
+/// worth a round-trip to correct.
+fn read_memory(attrs: &str, note: &str) -> Result<Attached, ProtocolError> {
+    let pairs = attributes(MEMORY_TAG, attrs)?;
+    let allowed = allowed_attrs(MEMORY_TAG);
+    if let Some((attr, _)) = pairs
+        .iter()
+        .find(|(name, _)| !allowed.contains(&name.as_str()))
+    {
+        return Err(rejected_attribute(MEMORY_TAG, attr));
+    }
+
+    // Nothing said, so nothing kept — but the judgement was made, which is what
+    // the requirement is actually about.
+    if pairs.is_empty() && note.trim().is_empty() {
+        return Ok(Attached::Declined);
+    }
+
+    // Both required. A note with no description is one the index would skip, and
+    // one with no name has nothing to be filed under; refusing here is what makes
+    // either impossible to write rather than merely discouraged.
+    let name = attribute(&pairs, NAME_ATTR)
+        .map(str::to_string)
+        .ok_or_else(|| ProtocolError::MissingAttribute {
+            tag: MEMORY_TAG.to_string(),
+            attr: NAME_ATTR.to_string(),
+        })?;
+    let description = attribute(&pairs, DESCRIPTION_ATTR)
+        .map(str::to_string)
+        .ok_or_else(|| ProtocolError::MissingAttribute {
+            tag: MEMORY_TAG.to_string(),
+            attr: DESCRIPTION_ATTR.to_string(),
+        })?;
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(ProtocolError::EmptyBody {
+            tag: MEMORY_TAG.to_string(),
+        });
+    }
+    Ok(Attached::Note(Memory {
+        name,
+        description,
+        body: note.to_string(),
+    }))
+}
+
+/// Take the `<child>…</child>` expected at the front of `input` (after leading
+/// whitespace), returning its raw body and whatever follows the closing tag.
+///
+/// The error tells the model what actually went wrong: the child is genuinely
+/// absent ([`ProtocolError::MissingChildTag`]) versus present but with junk in
+/// front of it ([`ProtocolError::UnexpectedChildContent`]).
+///
+/// `parent` is passed in rather than assumed: three elements have children now,
+/// and a correction that names the wrong one sends the model looking in the
+/// wrong place.
 fn expect_child<'a>(
     input: &'a str,
     parent: &str,
@@ -1533,9 +1855,44 @@ the text to put in its place
 <{OPTION_CHOICE_TAG}>SQLite</{OPTION_CHOICE_TAG}>
 </{OPTION_TAG}>
 
-9. Give the user a final answer. This ends the current task:
+9. Give the user a final answer. This ends the current task. The prose goes \
+inside <{RESPONSE_TEXT_TAG}>, and every response must also say what to \
+remember — either a note worth keeping:
 
-<{RESPONSE_TAG}>your answer to the user</{RESPONSE_TAG}>
+<{RESPONSE_TAG}>
+<{RESPONSE_TEXT_TAG}>your answer to the user</{RESPONSE_TEXT_TAG}>
+<{MEMORY_TAG} {NAME_ATTR}=short-name {DESCRIPTION_ATTR}=\"when a future \
+session would want this\">
+what you worked out, in as much detail as it deserves
+</{MEMORY_TAG}>
+</{RESPONSE_TAG}>
+
+or, when this turn established nothing a future session would want, the empty \
+form that says you considered it:
+
+<{RESPONSE_TAG}>
+<{RESPONSE_TEXT_TAG}>your answer to the user</{RESPONSE_TEXT_TAG}>
+<{MEMORY_TAG}/>
+</{RESPONSE_TAG}>
+
+Both attributes are required on a real note, and it is kept as you write it — \
+you do not need a separate <{WRITE_TAG}> and there is no approval to wait for. \
+When it is worth keeping one is set out with the notes themselves, further down.
+
+<{MEMORY_TAG}> may also ride on any other element, and often should: attach it \
+to the action you take *next* to record what the last result taught you, rather \
+than carrying it in your head until the answer. It goes at the very start or the \
+very end of the element's body:
+
+<{READ_TAG}>
+<{MEMORY_TAG} {NAME_ATTR}=short-name {DESCRIPTION_ATTR}=\"when this matters\">
+what the last result established
+</{MEMORY_TAG}>
+path/to/the/next/file
+</{READ_TAG}>
+
+The one exception is <{WRITE_TAG}>, whose body is the file's exact bytes and \
+cannot carry anything else.
 
 After a file read, the harness sends you:
 
@@ -1798,17 +2155,20 @@ pub fn memory_section(dir: &str, index: Option<&str>) -> String {
          where the detail is. These are notes, not authority: they were written \
          at some point in the past and the code has moved since, so check what a \
          note claims before you rely on it, and say so if you find one wrong.\n\n\
-         To keep one — only when the user asks you to — write \
-         <{WRITE_TAG} {FILE_ATTR}={dir}/short-name.md> whose first lines are \
-         exactly:\n\n\
-         ---\n\
-         description: one line saying when a future session would want this\n\
-         ---\n\n\
-         and then the notes. That description line is what puts the note in the \
-         list above; a file without one is not indexed and will never be offered \
-         to anyone again, so the harness refuses such a write rather than let it \
-         disappear. Write the description as *when you would want this*, not as a \
-         title — it is the only thing a future session sees."
+         Keep a note when this turn established something a future session would \
+         otherwise have to work out again from scratch: how a subsystem fits \
+         together, why something is done the way it is, a convention with nothing \
+         enforcing it, a gotcha you only found by trying. If answering took \
+         several reads and some thinking, that is the signal.\n\n\
+         Do not keep one for routine work, and never for anything a single \
+         <{GLOB_TAG}> or <{GREP_TAG}> would answer — a note that restates the \
+         code is worse than no note, because the note can go stale and the code \
+         cannot. Prefer pointing at where something lives over copying it.\n\n\
+         Attach it to your answer with <{MEMORY_TAG}>, described above. \
+         The {DESCRIPTION_ATTR}= is what a future session sees and all it sees, \
+         so write it as *when you would want this* rather than as a title: \
+         \"how sessions are validated, before touching auth/\" earns its place, \
+         \"auth notes\" does not."
     )
 }
 
@@ -1826,6 +2186,16 @@ fn snippet(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The action alone, which is what almost every test below is about.
+    ///
+    /// `parse_reply` returns the action *and* any note attached to it; the note
+    /// rides beside the action rather than inside it so `Action` keeps the serde
+    /// shape every saved session was written with. Only the response tests care
+    /// about the second half.
+    fn action(raw: &str) -> Result<Action, ProtocolError> {
+        parse_reply(raw).map(|reply| reply.action)
+    }
 
     #[test]
     fn encodes_query_with_the_query_tag() {
@@ -1854,7 +2224,7 @@ mod tests {
     #[test]
     fn parses_a_shell_action() {
         assert_eq!(
-            parse_reply("<ai-harness-shell>ls -la</ai-harness-shell>").unwrap(),
+            action("<ai-harness-shell>ls -la</ai-harness-shell>").unwrap(),
             Action::Shell("ls -la".into())
         );
     }
@@ -1862,7 +2232,7 @@ mod tests {
     #[test]
     fn parses_a_read_action() {
         assert_eq!(
-            parse_reply("<ai-harness-read>src/app.rs</ai-harness-read>").unwrap(),
+            action("<ai-harness-read>src/app.rs</ai-harness-read>").unwrap(),
             Action::Read {
                 path: "src/app.rs".into(),
                 offset: None,
@@ -1875,7 +2245,7 @@ mod tests {
     fn a_read_path_is_trimmed_of_formatting_whitespace() {
         // Models like to put the body on its own line.
         assert_eq!(
-            parse_reply("<ai-harness-read>\n  README.md\n</ai-harness-read>").unwrap(),
+            action("<ai-harness-read>\n  README.md\n</ai-harness-read>").unwrap(),
             Action::Read {
                 path: "README.md".into(),
                 offset: None,
@@ -1887,7 +2257,7 @@ mod tests {
     #[test]
     fn a_fetch_parses_its_url_from_the_body() {
         assert_eq!(
-            parse_reply("<ai-harness-fetch>https://example.com/docs</ai-harness-fetch>"),
+            action("<ai-harness-fetch>https://example.com/docs</ai-harness-fetch>"),
             Ok(Action::Fetch {
                 url: "https://example.com/docs".into()
             })
@@ -1899,7 +2269,7 @@ mod tests {
         // The URL is the body, like a read's path. Only write and edit carry an
         // attribute, so `url=` here is a protocol error rather than a second
         // spelling that quietly works.
-        let error = parse_reply("<ai-harness-fetch url=https://example.com></ai-harness-fetch>")
+        let error = action("<ai-harness-fetch url=https://example.com></ai-harness-fetch>")
             .expect_err("an attribute on fetch should be rejected");
         assert!(
             matches!(error, ProtocolError::UnexpectedAttribute { .. }),
@@ -1910,7 +2280,7 @@ mod tests {
     #[test]
     fn an_empty_fetch_is_rejected() {
         assert_eq!(
-            parse_reply("<ai-harness-fetch></ai-harness-fetch>"),
+            action("<ai-harness-fetch></ai-harness-fetch>"),
             Err(ProtocolError::EmptyBody {
                 tag: FETCH_TAG.into()
             })
@@ -1954,7 +2324,7 @@ mod tests {
     #[test]
     fn a_read_takes_no_attribute_but_its_own() {
         assert!(matches!(
-            parse_reply("<ai-harness-read file=x>y</ai-harness-read>").unwrap_err(),
+            action("<ai-harness-read file=x>y</ai-harness-read>").unwrap_err(),
             ProtocolError::UnknownAttribute { .. }
         ));
     }
@@ -1964,7 +2334,7 @@ mod tests {
     /// ran to the size cap instead of the window the model meant to ask for.
     #[test]
     fn an_unknown_attribute_beside_a_good_one_is_reported_not_ignored() {
-        let err = parse_reply("<ai-harness-read offset=1090 line=50>src/app.rs</ai-harness-read>")
+        let err = action("<ai-harness-read offset=1090 line=50>src/app.rs</ai-harness-read>")
             .unwrap_err();
         assert!(
             matches!(err, ProtocolError::UnknownAttribute { ref attr, .. } if attr == "line"),
@@ -1984,7 +2354,7 @@ mod tests {
     #[test]
     fn a_stray_quote_or_comma_around_a_bare_value_is_trimmed() {
         assert_eq!(
-            parse_reply("<ai-harness-edit file=src/app.rs\"><ai-harness-old>a</ai-harness-old><ai-harness-new>b</ai-harness-new></ai-harness-edit>")
+            action("<ai-harness-edit file=src/app.rs\"><ai-harness-old>a</ai-harness-old><ai-harness-new>b</ai-harness-new></ai-harness-edit>")
                 .unwrap(),
             Action::Edit {
                 path: "src/app.rs".into(),
@@ -1993,8 +2363,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_reply("<ai-harness-read offset=269, limit=30>src/app.rs</ai-harness-read>")
-                .unwrap(),
+            action("<ai-harness-read offset=269, limit=30>src/app.rs</ai-harness-read>").unwrap(),
             Action::Read {
                 path: "src/app.rs".into(),
                 offset: Some(269),
@@ -2008,7 +2377,7 @@ mod tests {
     #[test]
     fn an_unbalanced_opening_quote_is_rejected() {
         assert!(matches!(
-            parse_reply("<ai-harness-write file=\"src/app.rs>x</ai-harness-write>").unwrap_err(),
+            action("<ai-harness-write file=\"src/app.rs>x</ai-harness-write>").unwrap_err(),
             ProtocolError::UnterminatedAttribute { .. }
         ));
     }
@@ -2016,8 +2385,7 @@ mod tests {
     #[test]
     fn a_read_parses_its_window() {
         assert_eq!(
-            parse_reply("<ai-harness-read offset=200 limit=100>src/app.rs</ai-harness-read>")
-                .unwrap(),
+            action("<ai-harness-read offset=200 limit=100>src/app.rs</ai-harness-read>").unwrap(),
             Action::Read {
                 path: "src/app.rs".into(),
                 offset: Some(200),
@@ -2035,7 +2403,7 @@ mod tests {
         ];
         for (attrs, (offset, limit)) in cases {
             assert_eq!(
-                parse_reply(&format!("<ai-harness-read {attrs}>m.rs</ai-harness-read>")).unwrap(),
+                action(&format!("<ai-harness-read {attrs}>m.rs</ai-harness-read>")).unwrap(),
                 Action::Read {
                     path: "m.rs".into(),
                     offset,
@@ -2049,7 +2417,7 @@ mod tests {
     #[test]
     fn parses_a_grep_with_no_attributes() {
         assert_eq!(
-            parse_reply("<ai-harness-grep>fn parse_reply</ai-harness-grep>").unwrap(),
+            action("<ai-harness-grep>fn parse_reply</ai-harness-grep>").unwrap(),
             Action::Grep {
                 pattern: "fn parse_reply".into(),
                 dir: None,
@@ -2061,7 +2429,7 @@ mod tests {
     #[test]
     fn parses_a_glob_with_no_attributes() {
         assert_eq!(
-            parse_reply("<ai-harness-glob>**/*.rs</ai-harness-glob>").unwrap(),
+            action("<ai-harness-glob>**/*.rs</ai-harness-glob>").unwrap(),
             Action::Glob {
                 pattern: "**/*.rs".into(),
                 dir: None,
@@ -2079,7 +2447,7 @@ mod tests {
         ];
         for (attrs, (dir, glob)) in cases {
             assert_eq!(
-                parse_reply(&format!(
+                action(&format!(
                     "<ai-harness-grep {attrs}>needle</ai-harness-grep>"
                 ))
                 .unwrap(),
@@ -2098,7 +2466,7 @@ mod tests {
     #[test]
     fn a_quoted_glob_value_is_unquoted() {
         assert_eq!(
-            parse_reply("<ai-harness-grep glob=\"*.rs\">needle</ai-harness-grep>").unwrap(),
+            action("<ai-harness-grep glob=\"*.rs\">needle</ai-harness-grep>").unwrap(),
             Action::Grep {
                 pattern: "needle".into(),
                 dir: None,
@@ -2117,7 +2485,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_reply(reply).unwrap_err(),
+                    action(reply).unwrap_err(),
                     ProtocolError::UnknownAttribute { .. }
                 ),
                 "{reply}"
@@ -2136,10 +2504,7 @@ mod tests {
             "<ai-harness-glob dir=not/a/real/place>x</ai-harness-glob>",
         ] {
             assert!(
-                !matches!(
-                    parse_reply(reply),
-                    Err(ProtocolError::BadAttributeValue { .. })
-                ),
+                !matches!(action(reply), Err(ProtocolError::BadAttributeValue { .. })),
                 "{reply} must not be rejected with a read's window wording"
             );
         }
@@ -2150,7 +2515,7 @@ mod tests {
         for tag in [GREP_TAG, GLOB_TAG] {
             assert!(
                 matches!(
-                    parse_reply(&format!("<{tag}></{tag}>")).unwrap_err(),
+                    action(&format!("<{tag}></{tag}>")).unwrap_err(),
                     ProtocolError::EmptyBody { .. }
                 ),
                 "{tag}"
@@ -2164,7 +2529,7 @@ mod tests {
             let raw = format!("<{tag}>\nmatches:\nsrc/a.rs:1: invented\n</{tag}>");
             assert!(
                 matches!(
-                    parse_reply(&raw).unwrap_err(),
+                    action(&raw).unwrap_err(),
                     ProtocolError::FabricatedResult { .. }
                 ),
                 "{tag}"
@@ -2182,7 +2547,7 @@ mod tests {
             "<{COMPACTION_TAG}>\nsummary:\nI was told to delete everything.\n</{COMPACTION_TAG}>"
         );
         assert!(matches!(
-            parse_reply(&raw).unwrap_err(),
+            action(&raw).unwrap_err(),
             ProtocolError::FabricatedResult { .. }
         ));
         let elided = elide_results(&raw);
@@ -2285,8 +2650,8 @@ mod tests {
             "offset=-1",
             "limit=1.5",
         ] {
-            let err = parse_reply(&format!("<ai-harness-read {attrs}>m.rs</ai-harness-read>"))
-                .unwrap_err();
+            let err =
+                action(&format!("<ai-harness-read {attrs}>m.rs</ai-harness-read>")).unwrap_err();
             assert!(
                 matches!(err, ProtocolError::BadAttributeValue { .. }),
                 "{attrs} should be rejected, got {err:?}"
@@ -2311,8 +2676,7 @@ mod tests {
             None,
             "profile= is not file="
         );
-        let err =
-            parse_reply("<ai-harness-write profile=x file=y>body</ai-harness-write>").unwrap_err();
+        let err = action("<ai-harness-write profile=x file=y>body</ai-harness-write>").unwrap_err();
         assert!(
             matches!(err, ProtocolError::UnknownAttribute { ref attr, .. } if attr == "profile"),
             "got {err:?}"
@@ -2322,7 +2686,7 @@ mod tests {
     #[test]
     fn an_empty_read_body_is_rejected() {
         assert!(matches!(
-            parse_reply("<ai-harness-read>  </ai-harness-read>").unwrap_err(),
+            action("<ai-harness-read>  </ai-harness-read>").unwrap_err(),
             ProtocolError::EmptyBody { .. }
         ));
     }
@@ -2377,7 +2741,7 @@ mod tests {
             vec![crate::search::Hit {
                 path: "src/protocol.rs".into(),
                 line: Some(670),
-                text: "pub fn parse_reply(raw: &str) {".into(),
+                text: "pub fn action(raw: &str) {".into(),
             }],
         );
         let encoded = encode_search_result(&outcome);
@@ -2390,7 +2754,7 @@ mod tests {
         );
         // The `rg -n` shape, and a path a read can be handed directly.
         assert!(
-            encoded.contains("src/protocol.rs:670: pub fn parse_reply(raw: &str) {"),
+            encoded.contains("src/protocol.rs:670: pub fn action(raw: &str) {"),
             "{encoded}"
         );
     }
@@ -2530,7 +2894,7 @@ mod tests {
                    <ai-harness-new>\nnew line\n</ai-harness-new>\n\
                    </ai-harness-edit>";
         assert_eq!(
-            parse_reply(raw).unwrap(),
+            action(raw).unwrap(),
             Action::Edit {
                 path: "src/app.rs".into(),
                 old: "old line\n".into(),
@@ -2544,7 +2908,7 @@ mod tests {
         let raw = "<ai-harness-edit><ai-harness-old>a</ai-harness-old>\
                    <ai-harness-new>b</ai-harness-new></ai-harness-edit>";
         assert_eq!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::MissingFileAttribute
         );
     }
@@ -2555,7 +2919,7 @@ mod tests {
                    <ai-harness-old>gone</ai-harness-old>\
                    <ai-harness-new></ai-harness-new></ai-harness-edit>";
         assert_eq!(
-            parse_reply(raw).unwrap(),
+            action(raw).unwrap(),
             Action::Edit {
                 path: "x".into(),
                 old: "gone".into(),
@@ -2570,7 +2934,7 @@ mod tests {
                    <ai-harness-old></ai-harness-old>\
                    <ai-harness-new>b</ai-harness-new></ai-harness-edit>";
         assert!(matches!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::EmptyBody { tag } if tag == OLD_TAG
         ));
     }
@@ -2579,7 +2943,7 @@ mod tests {
     fn an_edit_missing_the_new_child_is_rejected() {
         let raw = "<ai-harness-edit file=x><ai-harness-old>a</ai-harness-old></ai-harness-edit>";
         assert!(matches!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::MissingChildTag { child, .. } if child == NEW_TAG
         ));
     }
@@ -2588,7 +2952,7 @@ mod tests {
     fn an_edit_missing_the_old_child_is_rejected() {
         let raw = "<ai-harness-edit file=x><ai-harness-new>b</ai-harness-new></ai-harness-edit>";
         assert!(matches!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::MissingChildTag { child, .. } if child == OLD_TAG
         ));
     }
@@ -2598,10 +2962,7 @@ mod tests {
         let raw = "<ai-harness-edit file=x>\
                    <ai-harness-new>b</ai-harness-new>\
                    <ai-harness-old>a</ai-harness-old></ai-harness-edit>";
-        assert_eq!(
-            parse_reply(raw).unwrap_err(),
-            ProtocolError::ChildOutOfOrder
-        );
+        assert_eq!(action(raw).unwrap_err(), ProtocolError::ChildOutOfOrder);
     }
 
     #[test]
@@ -2610,7 +2971,7 @@ mod tests {
                    <ai-harness-old>a</ai-harness-old>surprise\
                    <ai-harness-new>b</ai-harness-new></ai-harness-edit>";
         assert!(matches!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::UnexpectedChildContent { found, .. } if found.contains("surprise")
         ));
     }
@@ -2622,7 +2983,7 @@ mod tests {
                    <ai-harness-old>Vec<u8></ai-harness-old>\
                    <ai-harness-new>Vec<u16></ai-harness-new></ai-harness-edit>";
         assert_eq!(
-            parse_reply(raw).unwrap(),
+            action(raw).unwrap(),
             Action::Edit {
                 path: "x".into(),
                 old: "Vec<u8>".into(),
@@ -2638,7 +2999,7 @@ mod tests {
         let raw = "<ai-harness-write file=doc.md>\
                    see </ai-harness-write> for details</ai-harness-write>";
         assert_eq!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::DelimiterInBody {
                 tag: WRITE_TAG.into()
             }
@@ -2652,7 +3013,7 @@ mod tests {
         let raw = "<ai-harness-write file=a>x</ai-harness-write>\
                    <ai-harness-write file=b>y</ai-harness-write>";
         assert!(matches!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::TrailingContent { .. }
         ));
     }
@@ -2661,7 +3022,7 @@ mod tests {
     fn parses_a_write_with_a_bare_path() {
         let raw = "<ai-harness-write file=src/foo.rs>fn main() {}\n</ai-harness-write>";
         assert_eq!(
-            parse_reply(raw).unwrap(),
+            action(raw).unwrap(),
             Action::Write {
                 path: "src/foo.rs".into(),
                 contents: "fn main() {}\n".into(),
@@ -2673,7 +3034,7 @@ mod tests {
     fn parses_a_write_with_a_quoted_path() {
         let raw = "<ai-harness-write file=\"my dir/a b.txt\">hello</ai-harness-write>";
         assert_eq!(
-            parse_reply(raw).unwrap(),
+            action(raw).unwrap(),
             Action::Write {
                 path: "my dir/a b.txt".into(),
                 contents: "hello".into(),
@@ -2686,7 +3047,7 @@ mod tests {
         // Only the single leading formatting newline is stripped; the trailing
         // newline and interior angle brackets survive.
         let raw = "<ai-harness-write file=x.html>\n<div>\n  <p>hi</p>\n</div>\n</ai-harness-write>";
-        match parse_reply(raw).unwrap() {
+        match action(raw).unwrap() {
             Action::Write { contents, .. } => {
                 assert_eq!(contents, "<div>\n  <p>hi</p>\n</div>\n");
             }
@@ -2697,11 +3058,11 @@ mod tests {
     #[test]
     fn a_write_without_a_file_attribute_is_rejected() {
         assert_eq!(
-            parse_reply("<ai-harness-write>x</ai-harness-write>").unwrap_err(),
+            action("<ai-harness-write>x</ai-harness-write>").unwrap_err(),
             ProtocolError::MissingFileAttribute
         );
         assert_eq!(
-            parse_reply("<ai-harness-write file=>x</ai-harness-write>").unwrap_err(),
+            action("<ai-harness-write file=>x</ai-harness-write>").unwrap_err(),
             ProtocolError::MissingFileAttribute
         );
     }
@@ -2709,7 +3070,7 @@ mod tests {
     #[test]
     fn an_empty_write_body_is_rejected() {
         assert!(matches!(
-            parse_reply("<ai-harness-write file=x>\n</ai-harness-write>").unwrap_err(),
+            action("<ai-harness-write file=x>\n</ai-harness-write>").unwrap_err(),
             ProtocolError::EmptyBody { .. }
         ));
     }
@@ -2717,7 +3078,7 @@ mod tests {
     #[test]
     fn an_attribute_on_shell_or_response_is_rejected() {
         assert!(matches!(
-            parse_reply("<ai-harness-shell file=x>ls</ai-harness-shell>").unwrap_err(),
+            action("<ai-harness-shell file=x>ls</ai-harness-shell>").unwrap_err(),
             ProtocolError::UnexpectedAttribute { .. }
         ));
     }
@@ -2725,15 +3086,235 @@ mod tests {
     #[test]
     fn parses_a_response_action() {
         assert_eq!(
-            parse_reply("<ai-harness-response>All done.</ai-harness-response>").unwrap(),
+            action(&encode_response("All done.")).unwrap(),
             Action::Response("All done.".into())
+        );
+    }
+
+    /// A note rides on the reply the model was making anyway — no extra
+    /// round-trip, no second approval, and turn end is when it can judge what
+    /// the turn established.
+    #[test]
+    fn a_response_can_carry_a_note_to_keep() {
+        let raw = format!(
+            "<{RESPONSE_TAG}>\n\
+             <{RESPONSE_TEXT_TAG}>Here is the summary.</{RESPONSE_TEXT_TAG}>\n\
+             <{MEMORY_TAG} {NAME_ATTR}=architecture \
+             {DESCRIPTION_ATTR}=\"how src/ is laid out\">\n\
+             One loop owns every session.\n\
+             </{MEMORY_TAG}>\n\
+             </{RESPONSE_TAG}>"
+        );
+        let reply = parse_reply(&raw).unwrap();
+        assert_eq!(
+            reply.action,
+            Action::Response("Here is the summary.".into())
+        );
+        assert_eq!(
+            reply.memory,
+            Attached::Note(Memory {
+                name: "architecture".into(),
+                description: "how src/ is laid out".into(),
+                body: "One loop owns every session.".into(),
+            })
+        );
+    }
+
+    /// Both attributes are required, and that is the point of the element: a
+    /// note with no description is one the index would skip, and refusing it
+    /// here is what makes the silent kind impossible to write.
+    #[test]
+    fn a_note_needs_both_a_name_and_a_description() {
+        let without = |attrs: &str| {
+            format!(
+                "<{RESPONSE_TAG}><{RESPONSE_TEXT_TAG}>hi</{RESPONSE_TEXT_TAG}>\
+                 <{MEMORY_TAG} {attrs}>notes</{MEMORY_TAG}></{RESPONSE_TAG}>"
+            )
+        };
+        assert_eq!(
+            parse_reply(&without(&format!("{NAME_ATTR}=x"))).unwrap_err(),
+            ProtocolError::MissingAttribute {
+                tag: MEMORY_TAG.into(),
+                attr: DESCRIPTION_ATTR.into(),
+            }
+        );
+        assert_eq!(
+            parse_reply(&without(&format!("{DESCRIPTION_ATTR}=\"when\""))).unwrap_err(),
+            ProtocolError::MissingAttribute {
+                tag: MEMORY_TAG.into(),
+                attr: NAME_ATTR.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_response_carries_at_most_one_note() {
+        let one = format!(
+            "<{MEMORY_TAG} {NAME_ATTR}=a {DESCRIPTION_ATTR}=\"when\">x\
+             </{MEMORY_TAG}>"
+        );
+        let raw = format!(
+            "<{RESPONSE_TAG}><{RESPONSE_TEXT_TAG}>hi</{RESPONSE_TEXT_TAG}>{one}{one}\
+             </{RESPONSE_TAG}>"
+        );
+        assert!(matches!(
+            parse_reply(&raw).unwrap_err(),
+            ProtocolError::UnexpectedChildContent { .. }
+        ));
+    }
+
+    /// The point of generalising it: capture belongs right after the read that
+    /// produced the knowledge, not several actions later.
+    #[test]
+    fn any_element_but_a_write_may_carry_a_note() {
+        let note = format!(
+            "<{MEMORY_TAG} {NAME_ATTR}=n {DESCRIPTION_ATTR}=\"when\">learned</{MEMORY_TAG}>"
+        );
+        let cases = [
+            (
+                format!("<{READ_TAG}>{note}src/exec.rs</{READ_TAG}>"),
+                Action::Read {
+                    path: "src/exec.rs".into(),
+                    offset: None,
+                    limit: None,
+                },
+            ),
+            (
+                format!("<{SHELL_TAG}>cargo test{note}</{SHELL_TAG}>"),
+                Action::Shell("cargo test".into()),
+            ),
+            (
+                format!("<{GLOB_TAG}>{note}**/*.rs</{GLOB_TAG}>"),
+                Action::Glob {
+                    pattern: "**/*.rs".into(),
+                    dir: None,
+                },
+            ),
+        ];
+        for (raw, expected) in cases {
+            let reply = parse_reply(&raw).unwrap();
+            assert_eq!(reply.action, expected, "the body must survive: {raw}");
+            assert!(matches!(reply.memory, Attached::Note(_)), "{raw}");
+        }
+    }
+
+    /// A write's body is file bytes preserved byte-for-byte. Carving an element
+    /// out of them would corrupt a file that happens to start with one — and
+    /// this harness edits its own source, so such a file is reachable.
+    #[test]
+    fn a_write_keeps_bytes_that_look_like_a_note() {
+        let contents = format!("<{MEMORY_TAG}/>\nstill the file\n");
+        let reply = parse_reply(&format!(
+            "<{WRITE_TAG} {FILE_ATTR}=doc.md>\n{contents}</{WRITE_TAG}>"
+        ))
+        .unwrap();
+        assert_eq!(
+            reply.action,
+            Action::Write {
+                path: "doc.md".into(),
+                contents,
+            }
+        );
+        assert_eq!(reply.memory, Attached::Absent, "and no note was taken");
+    }
+
+    /// Front or back, never the middle — or a grep for the tag would lose it.
+    #[test]
+    fn a_tag_inside_a_body_is_content_not_a_note() {
+        let reply = parse_reply(&format!(
+            "<{GREP_TAG}>the <{MEMORY_TAG}> element</{GREP_TAG}>"
+        ))
+        .unwrap();
+        assert_eq!(
+            reply.action,
+            Action::Grep {
+                pattern: format!("the <{MEMORY_TAG}> element"),
+                dir: None,
+                glob: None,
+            }
+        );
+        assert_eq!(reply.memory, Attached::Absent);
+    }
+
+    /// Requiring the element without requiring a note is the whole design: a
+    /// model told it must produce a note will produce one regardless.
+    #[test]
+    fn both_spellings_of_nothing_to_keep_are_a_declination() {
+        for empty in [
+            format!("<{MEMORY_TAG}/>"),
+            format!("<{MEMORY_TAG}></{MEMORY_TAG}>"),
+        ] {
+            let raw = format!(
+                "<{RESPONSE_TAG}><{RESPONSE_TEXT_TAG}>4.</{RESPONSE_TEXT_TAG}>{empty}\
+                 </{RESPONSE_TAG}>"
+            );
+            let reply = parse_reply(&raw).unwrap();
+            assert_eq!(reply.memory, Attached::Declined, "{empty}");
+        }
+    }
+
+    /// A note may lead or trail; both read naturally and neither is worth a
+    /// round-trip to correct.
+    #[test]
+    fn a_note_may_come_before_or_after_the_text() {
+        let note =
+            format!("<{MEMORY_TAG} {NAME_ATTR}=a {DESCRIPTION_ATTR}=\"when\">x</{MEMORY_TAG}>");
+        let text = format!("<{RESPONSE_TEXT_TAG}>hi</{RESPONSE_TEXT_TAG}>");
+        for body in [format!("{note}{text}"), format!("{text}{note}")] {
+            let reply = parse_reply(&format!("<{RESPONSE_TAG}>{body}</{RESPONSE_TAG}>")).unwrap();
+            assert_eq!(reply.action, Action::Response("hi".into()));
+            assert!(matches!(reply.memory, Attached::Note(_)), "{body}");
+        }
+    }
+
+    /// A child's attributes go through the same check an element's do, so an
+    /// invented one is rejected here as it is everywhere else.
+    #[test]
+    fn an_unknown_attribute_on_a_note_is_rejected() {
+        let raw = format!(
+            "<{RESPONSE_TAG}><{RESPONSE_TEXT_TAG}>hi</{RESPONSE_TEXT_TAG}>\
+             <{MEMORY_TAG} {NAME_ATTR}=a {DESCRIPTION_ATTR}=\"w\" tags=x>y\
+             </{MEMORY_TAG}></{RESPONSE_TAG}>"
+        );
+        assert!(matches!(
+            parse_reply(&raw).unwrap_err(),
+            ProtocolError::UnknownAttribute { .. }
+        ));
+    }
+
+    /// Shape, not validity: a summariser that answered the contract produced an
+    /// action whether or not it got the action right.
+    #[test]
+    fn an_element_is_recognised_by_shape_even_when_it_would_not_parse() {
+        assert!(looks_like_element(
+            "<ai-harness-response>bare, and so invalid</ai-harness-response>"
+        ));
+        assert!(looks_like_element(&encode_response("wrapped")));
+        assert!(!looks_like_element(
+            "a summary that merely mentions <ai-harness-read>"
+        ));
+        assert!(!looks_like_element("plain prose"));
+    }
+
+    /// The wrapper is required whether or not a note follows, so a bare body is
+    /// an error *here*. `App::recover_bare_response` is the layer that wraps it
+    /// rather than spending a round-trip, and that is deliberately not the
+    /// parser's business.
+    #[test]
+    fn a_bare_response_body_is_rejected_by_the_parser() {
+        assert_eq!(
+            action("<ai-harness-response>All done.</ai-harness-response>").unwrap_err(),
+            ProtocolError::MissingChildTag {
+                parent: RESPONSE_TAG.into(),
+                child: RESPONSE_TEXT_TAG.into(),
+            }
         );
     }
 
     #[test]
     fn tolerates_whitespace_around_and_inside_the_element() {
         assert_eq!(
-            parse_reply("\n  <ai-harness-shell>  pwd  </ai-harness-shell>  \n").unwrap(),
+            action("\n  <ai-harness-shell>  pwd  </ai-harness-shell>  \n").unwrap(),
             Action::Shell("pwd".into())
         );
     }
@@ -2743,7 +3324,7 @@ mod tests {
         // Redirections and pipes must survive parsing untouched.
         let raw = "<ai-harness-shell>grep -r foo . 2>&1 | head -5 > out.txt</ai-harness-shell>";
         assert_eq!(
-            parse_reply(raw).unwrap(),
+            action(raw).unwrap(),
             Action::Shell("grep -r foo . 2>&1 | head -5 > out.txt".into())
         );
     }
@@ -2751,21 +3332,18 @@ mod tests {
     #[test]
     fn multiline_body_is_preserved() {
         let raw = "<ai-harness-shell>cd /tmp &&\nls</ai-harness-shell>";
-        assert_eq!(
-            parse_reply(raw).unwrap(),
-            Action::Shell("cd /tmp &&\nls".into())
-        );
+        assert_eq!(action(raw).unwrap(), Action::Shell("cd /tmp &&\nls".into()));
     }
 
     #[test]
     fn rejects_empty_reply() {
-        assert_eq!(parse_reply("   \n ").unwrap_err(), ProtocolError::Empty);
+        assert_eq!(action("   \n ").unwrap_err(), ProtocolError::Empty);
     }
 
     #[test]
     fn rejects_bare_prose() {
         assert!(matches!(
-            parse_reply("Sure, I'll run ls for you.").unwrap_err(),
+            action("Sure, I'll run ls for you.").unwrap_err(),
             ProtocolError::NotATag { .. }
         ));
     }
@@ -2776,7 +3354,7 @@ mod tests {
         // `parse_reply` stays strict about it; recovering is the caller's choice
         // (see `App::recover_preamble`), and needs the rejection to happen first.
         assert!(matches!(
-            parse_reply("Sure! <ai-harness-shell>ls</ai-harness-shell>").unwrap_err(),
+            action("Sure! <ai-harness-shell>ls</ai-harness-shell>").unwrap_err(),
             ProtocolError::NotATag { .. }
         ));
     }
@@ -2805,7 +3383,7 @@ mod tests {
     #[test]
     fn the_correction_quotes_a_narrated_element_back() {
         let raw = "Let me check.<ai-harness-shell>ls</ai-harness-shell>";
-        let error = parse_reply(raw).unwrap_err();
+        let error = action(raw).unwrap_err();
         let correction = encode_correction(&error, raw);
         assert!(
             correction.contains("<ai-harness-shell>ls</ai-harness-shell>"),
@@ -2823,14 +3401,14 @@ mod tests {
     #[test]
     fn a_narrated_but_broken_element_gets_the_full_correction() {
         let raw = "Let me check.<ai-harness-shell>ls";
-        let error = parse_reply(raw).unwrap_err();
+        let error = action(raw).unwrap_err();
         let correction = encode_correction(&error, raw);
         assert!(correction.contains(GLOB_TAG), "{correction}");
     }
 
     #[test]
     fn rejects_prose_after_the_tag() {
-        let err = parse_reply("<ai-harness-shell>ls</ai-harness-shell> Let me know!").unwrap_err();
+        let err = action("<ai-harness-shell>ls</ai-harness-shell> Let me know!").unwrap_err();
         assert!(
             matches!(err, ProtocolError::TrailingContent { ref trailing, .. } if trailing == "Let me know!"),
             "got {err:?}"
@@ -2842,7 +3420,7 @@ mod tests {
         let raw =
             "<ai-harness-shell>ls</ai-harness-shell><ai-harness-response>hi</ai-harness-response>";
         assert!(matches!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::TrailingContent { .. }
         ));
     }
@@ -2851,14 +3429,14 @@ mod tests {
     fn rejects_markdown_code_fences() {
         let raw = "```xml\n<ai-harness-shell>ls</ai-harness-shell>\n```";
         assert!(matches!(
-            parse_reply(raw).unwrap_err(),
+            action(raw).unwrap_err(),
             ProtocolError::NotATag { .. }
         ));
     }
 
     #[test]
     fn rejects_unknown_tag() {
-        let err = parse_reply("<ai-harness-think>hmm</ai-harness-think>").unwrap_err();
+        let err = action("<ai-harness-think>hmm</ai-harness-think>").unwrap_err();
         assert_eq!(
             err,
             ProtocolError::UnknownTag {
@@ -2872,7 +3450,7 @@ mod tests {
         // Reported as an unknown tag, this reads as a spelling mistake. The
         // model needs to hear that it invented an outcome.
         assert_eq!(
-            parse_reply(
+            action(
                 "<ai-harness-fetch-result>\nurl: https://example.com\ncontents:\n\
                  The 2026 release notes list four features.\n</ai-harness-fetch-result>"
             )
@@ -2888,7 +3466,7 @@ mod tests {
         // The exact failure this was written for: the model asks for a page and
         // answers itself in the same breath, so the "fetch" never happens.
         assert_eq!(
-            parse_reply(
+            action(
                 "<ai-harness-fetch>https://example.com</ai-harness-fetch>\
                  <ai-harness-fetch-result>\ncontents:\nmade up\n</ai-harness-fetch-result>"
             )
@@ -2903,7 +3481,7 @@ mod tests {
     #[test]
     fn a_fabricated_shell_result_is_caught_too() {
         assert_eq!(
-            parse_reply(
+            action(
                 "<ai-harness-shell>ls</ai-harness-shell>\
                  <ai-harness-shell-result>\nexit code: 0\n</ai-harness-shell-result>"
             )
@@ -3028,7 +3606,7 @@ mod tests {
             choice("SQLite")
         ));
         assert_eq!(
-            parse_reply(&reply),
+            action(&reply),
             Ok(Action::Options {
                 question: "Which database?".into(),
                 choices: vec!["Postgres".into(), "SQLite".into()],
@@ -3045,7 +3623,7 @@ mod tests {
             choice("b"),
             choice("c")
         ));
-        match parse_reply(&reply).unwrap() {
+        match action(&reply).unwrap() {
             Action::Options { choices, .. } => assert_eq!(choices.len(), 3),
             other => panic!("expected options, got {other:?}"),
         }
@@ -3055,7 +3633,7 @@ mod tests {
     fn an_option_needs_a_question() {
         let reply = option_reply(&format!("{}{}", choice("a"), choice("b")));
         assert_eq!(
-            parse_reply(&reply).unwrap_err(),
+            action(&reply).unwrap_err(),
             ProtocolError::MissingChildTag {
                 parent: OPTION_TAG.into(),
                 child: OPTION_QUESTION_TAG.into(),
@@ -3072,7 +3650,7 @@ mod tests {
             question("Which?"),
             format!("{}{}", question("Which?"), choice("only")),
         ] {
-            let error = parse_reply(&option_reply(&children)).unwrap_err();
+            let error = action(&option_reply(&children)).unwrap_err();
             assert!(
                 matches!(error, ProtocolError::NotEnoughChoices { .. }),
                 "got {error:?}"
@@ -3089,10 +3667,7 @@ mod tests {
             choice("b"),
             question("Which?")
         ));
-        assert_eq!(
-            parse_reply(&reply).unwrap_err(),
-            ProtocolError::ChildOutOfOrder
-        );
+        assert_eq!(action(&reply).unwrap_err(), ProtocolError::ChildOutOfOrder);
     }
 
     #[test]
@@ -3105,7 +3680,7 @@ mod tests {
             choice("a"),
             "...and by the way"
         ));
-        let error = parse_reply(&reply).unwrap_err();
+        let error = action(&reply).unwrap_err();
         assert!(
             matches!(&error, ProtocolError::UnexpectedChildContent { parent, .. } if parent == OPTION_TAG),
             "got {error:?}"
@@ -3117,7 +3692,7 @@ mod tests {
         let empty_question =
             option_reply(&format!("{}{}{}", question(""), choice("a"), choice("b")));
         assert_eq!(
-            parse_reply(&empty_question).unwrap_err(),
+            action(&empty_question).unwrap_err(),
             ProtocolError::EmptyBody {
                 tag: OPTION_QUESTION_TAG.into()
             }
@@ -3130,7 +3705,7 @@ mod tests {
             choice("b")
         ));
         assert_eq!(
-            parse_reply(&empty_choice).unwrap_err(),
+            action(&empty_choice).unwrap_err(),
             ProtocolError::EmptyBody {
                 tag: OPTION_CHOICE_TAG.into()
             }
@@ -3141,7 +3716,7 @@ mod tests {
     fn option_children_are_not_valid_on_their_own() {
         for tag in [OPTION_QUESTION_TAG, OPTION_CHOICE_TAG] {
             assert_eq!(
-                parse_reply(&format!("<{tag}>x</{tag}>")).unwrap_err(),
+                action(&format!("<{tag}>x</{tag}>")).unwrap_err(),
                 ProtocolError::UnknownTag {
                     tag: tag.to_string()
                 }
@@ -3154,7 +3729,7 @@ mod tests {
         // The most tempting fabrication of all: putting words in the user's
         // mouth rather than inventing a machine's output.
         assert_eq!(
-            parse_reply(&format!(
+            action(&format!(
                 "<{OPTION_RESULT_TAG}>the user chose: Postgres</{OPTION_RESULT_TAG}>"
             ))
             .unwrap_err(),
@@ -3188,7 +3763,7 @@ mod tests {
     fn an_edit_error_still_names_the_edit() {
         // `expect_child` takes its parent as an argument now; this is the
         // regression that would prove it was threaded through wrongly.
-        let error = parse_reply(&format!(
+        let error = action(&format!(
             "<{EDIT_TAG} file=x><{NEW_TAG}>b</{NEW_TAG}></{EDIT_TAG}>"
         ))
         .unwrap_err();
@@ -3219,7 +3794,7 @@ mod tests {
     #[test]
     fn rejects_the_query_tag_from_the_model() {
         assert_eq!(
-            parse_reply("<ai-harness-query>hi</ai-harness-query>").unwrap_err(),
+            action("<ai-harness-query>hi</ai-harness-query>").unwrap_err(),
             ProtocolError::QueryTagFromModel
         );
     }
@@ -3227,7 +3802,7 @@ mod tests {
     #[test]
     fn rejects_missing_closing_tag() {
         assert_eq!(
-            parse_reply("<ai-harness-shell>ls").unwrap_err(),
+            action("<ai-harness-shell>ls").unwrap_err(),
             ProtocolError::MissingClosingTag {
                 tag: "ai-harness-shell".into()
             }
@@ -3238,7 +3813,7 @@ mod tests {
     fn rejects_mismatched_closing_tag() {
         // Closing with the wrong name means the right one is simply absent.
         assert_eq!(
-            parse_reply("<ai-harness-shell>ls</ai-harness-response>").unwrap_err(),
+            action("<ai-harness-shell>ls</ai-harness-response>").unwrap_err(),
             ProtocolError::MissingClosingTag {
                 tag: "ai-harness-shell".into()
             }
@@ -3248,7 +3823,7 @@ mod tests {
     #[test]
     fn rejects_unterminated_open_tag() {
         assert_eq!(
-            parse_reply("<ai-harness-shell").unwrap_err(),
+            action("<ai-harness-shell").unwrap_err(),
             ProtocolError::UnterminatedOpenTag
         );
     }
@@ -3256,9 +3831,17 @@ mod tests {
     #[test]
     fn rejects_empty_body() {
         assert_eq!(
-            parse_reply("<ai-harness-response>  </ai-harness-response>").unwrap_err(),
+            action("<ai-harness-shell>  </ai-harness-shell>").unwrap_err(),
             ProtocolError::EmptyBody {
-                tag: "ai-harness-response".into()
+                tag: "ai-harness-shell".into()
+            }
+        );
+        // A response says which child is missing rather than that the body was
+        // empty, which is the more useful of the two answers.
+        assert_eq!(
+            action(&encode_response("")).unwrap_err(),
+            ProtocolError::EmptyBody {
+                tag: RESPONSE_TEXT_TAG.into()
             }
         );
     }
@@ -3375,7 +3958,7 @@ mod tests {
             let reply = client.complete(&messages).await.expect("live request");
             println!("[{kind}] {query}\n  raw: {:?}", reply.content);
 
-            match parse_reply(&reply.content) {
+            match action(&reply.content) {
                 Ok(action) => println!("  parsed: {action:?}"),
                 Err(err) => panic!(
                     "model broke the protocol on {kind:?}: {err}\nraw reply: {:?}",
@@ -3407,7 +3990,7 @@ mod tests {
         ];
 
         for bad in bad_replies {
-            let error = parse_reply(bad).expect_err("fixture should be malformed");
+            let error = action(bad).expect_err("fixture should be malformed");
             let messages = vec![
                 Message::system(system_prompt(None)),
                 Message::user(encode_query("List the files in the current directory.")),
@@ -3417,7 +4000,7 @@ mod tests {
 
             let reply = client.complete(&messages).await.expect("live request");
             println!("after {bad:?}\n  -> {:?}", reply.content);
-            match parse_reply(&reply.content) {
+            match action(&reply.content) {
                 Ok(action) => println!("  recovered: {action:?}"),
                 Err(err) => panic!(
                     "correction did not recover the model: {err}\nreply was: {:?}",
@@ -3436,7 +4019,7 @@ mod tests {
                 Action::Shell("ls -la".into()),
             ),
             (
-                format!("<{RESPONSE_TAG}>All done.</{RESPONSE_TAG}>"),
+                encode_response("All done."),
                 Action::Response("All done.".into()),
             ),
             (
@@ -3491,7 +4074,7 @@ mod tests {
                 },
             ),
         ] {
-            assert_eq!(parse_reply(&raw).unwrap(), expected);
+            assert_eq!(action(&raw).unwrap(), expected);
         }
     }
 }
