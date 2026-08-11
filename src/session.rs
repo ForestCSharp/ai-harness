@@ -692,6 +692,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `Action::ShellBackground` was added as a **new variant** rather than a
+    /// field on `Action::Shell` precisely so this keeps working: a session
+    /// written before jobs existed still loads, at the same `VERSION`, because
+    /// nothing about the shapes it already contains changed.
+    ///
+    /// Written as raw JSON rather than by serialising a `Session`, since the
+    /// point is a file this build did not produce.
+    #[test]
+    fn a_session_saved_before_jobs_existed_still_loads() {
+        let dir = temp_dir("pre-jobs");
+        let folder = dir.join("old");
+        std::fs::create_dir_all(&folder).unwrap();
+        let json = format!(
+            r#"{{
+              "version": {VERSION},
+              "saved_at": 1786215915,
+              "model": "m",
+              "history": [{{"role": "user", "content": "hi"}}],
+              "transcript": [
+                {{"User": "run the tests"}},
+                {{"Action": {{"action": {{"Shell": "cargo test"}}, "usage": null}}}}
+              ],
+              "prompt_history": ["run the tests"]
+            }}"#
+        );
+        std::fs::write(folder.join(FILE), json).unwrap();
+
+        let loaded = load(&dir, "old").expect("a pre-jobs session must still load");
+        assert_eq!(loaded.transcript.len(), 2);
+        match &loaded.transcript[1] {
+            Entry::Action { action, .. } => {
+                assert_eq!(*action, Action::Shell("cargo test".into()));
+            }
+            other => panic!("expected an action, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// It lives among the session folders, so the thing that enumerates those
     /// must not see it.
     #[test]
@@ -983,6 +1021,22 @@ mod tests {
             },
             Entry::Error("boom".into()),
             Entry::Notice("hi".into()),
+            // Appended rather than grouped with their kin above, because the
+            // checks below index into this list by position.
+            Entry::Action {
+                action: Action::ShellBackground("cargo test".into()),
+                usage: None,
+                diff: None,
+            },
+            Entry::CheckResult(Box::new(CommandOutput {
+                command: "cargo check".into(),
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "error".into(),
+                truncated: false,
+                timed_out: false,
+                cancelled: false,
+            })),
         ];
         let session = Session::new(
             "m".into(),

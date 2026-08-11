@@ -14,6 +14,7 @@
 //! text is still capped; forwarding is a second consumer of the same reads, not
 //! a second buffer.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -461,8 +462,12 @@ async fn run_program(
 }
 
 /// Kill the child's whole process group.
+///
+/// `pub(crate)` for [`crate::jobs::kill`], which kills by the pid a job recorded
+/// rather than by a handle it holds — the harness that stops a job is not always
+/// the task that started it.
 #[cfg(unix)]
-fn kill_group(pid: Option<u32>) {
+pub(crate) fn kill_group(pid: Option<u32>) {
     if let Some(pid) = pid {
         // Negative pid targets the process group created via `process_group(0)`.
         unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
@@ -470,7 +475,205 @@ fn kill_group(pid: Option<u32>) {
 }
 
 #[cfg(not(unix))]
-fn kill_group(_pid: Option<u32>) {}
+pub(crate) fn kill_group(_pid: Option<u32>) {}
+
+/// Start a job: run `script`, appending its output to the files in `handle`, and
+/// return once the child is spawned.
+///
+/// The differences from [`run_streaming`] are the whole point of a job, and there
+/// are only two.
+///
+/// **No idle bound.** A foreground command is killed after `timeout` producing
+/// nothing, which is right for work someone is waiting on and wrong for a dev
+/// server — the thing you most want to leave running is the thing that prints
+/// nothing for an hour. `ceiling` is wall-clock and bounds the whole run instead.
+///
+/// **Output goes to files, not a channel.** There is no live window to feed and
+/// no turn to feed it into; the log *is* the record, and the model reads it with
+/// `<ai-harness-read>` like any other file. Each stream is still capped at
+/// [`MAX_STREAM_BYTES`], so a runaway job cannot fill the disk — past the cap the
+/// bytes are read and dropped, exactly as [`record`] does, so the child never
+/// blocks on a full pipe.
+///
+/// Everything else is shared with a foreground command deliberately: `/dev/null`
+/// on stdin, its own process group, `kill_on_drop`, and [`kill_group`] on both
+/// exits. Those are the parts that keep a runaway from surviving the harness.
+///
+/// Returns as soon as the child exists, handing back its pid and the future that
+/// watches it. **Synchronous, and the arguments are owned**, both deliberately:
+/// the pid can be recorded before anything else happens, and the returned future
+/// borrows nothing, so the caller can `tokio::spawn` it and forget it. A future
+/// that borrowed its sandbox would have to be awaited by someone still holding
+/// one, which is exactly what a job is not.
+pub fn start_background(
+    sandbox: Sandbox,
+    script: String,
+    handle: crate::jobs::Handle,
+    ceiling: Duration,
+    cancel: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(
+    u32,
+    impl std::future::Future<Output = crate::jobs::State> + Send,
+)> {
+    let mut command = sandbox.command(&script);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawning background command: {script}"))?;
+    // A child with no pid cannot be killed by anything — not the ceiling, not
+    // `/jobs kill`, not the sweep on quit — so it is not something to run
+    // unattended. Reaped here rather than left to leak; `start_kill` rather than
+    // `kill().await` so this function has no reason to be async.
+    let Some(pid) = child.id() else {
+        let _ = child.start_kill();
+        anyhow::bail!("the spawned job reported no pid");
+    };
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let mut out = Log::open(handle.stdout_path());
+    let mut err = Log::open(handle.stderr_path());
+
+    let run = async move {
+        let (mut out_done, mut err_done) = (false, false);
+        let mut out_buf = [0u8; 8192];
+        let mut err_buf = [0u8; 8192];
+        let deadline = tokio::time::Instant::now() + ceiling;
+        tokio::pin!(cancel);
+
+        let finished = loop {
+            tokio::select! {
+                // Checked first, so a job that floods its pipes cannot starve
+                // the two ways it has of being stopped.
+                biased;
+
+                _ = &mut cancel => {
+                    kill_group(Some(pid));
+                    return crate::jobs::State::Killed;
+                }
+
+                _ = tokio::time::sleep_until(deadline) => {
+                    kill_group(Some(pid));
+                    err.append(
+                        format!(
+                            "\n[harness] job ran past the {}s ceiling and was killed\n",
+                            ceiling.as_secs()
+                        )
+                        .as_bytes(),
+                    );
+                    return crate::jobs::State::TimedOut;
+                }
+
+                read = stdout_pipe.read(&mut out_buf), if !out_done => {
+                    match read {
+                        Ok(0) | Err(_) => out_done = true,
+                        Ok(n) => out.append(&out_buf[..n]),
+                    }
+                }
+
+                read = stderr_pipe.read(&mut err_buf), if !err_done => {
+                    match read {
+                        Ok(0) | Err(_) => err_done = true,
+                        Ok(n) => err.append(&err_buf[..n]),
+                    }
+                }
+
+                status = child.wait() => break status,
+            }
+        };
+
+        // The child is gone, but its pipes may still hold buffered output —
+        // the same drain a foreground command does, and for the same reason.
+        if !out_done {
+            drain_into(&mut stdout_pipe, &mut out).await;
+        }
+        if !err_done {
+            drain_into(&mut stderr_pipe, &mut err).await;
+        }
+
+        match finished {
+            Ok(status) => match status.code() {
+                Some(code) => crate::jobs::State::Exited(code),
+                None => crate::jobs::State::Killed,
+            },
+            Err(_) => crate::jobs::State::Killed,
+        }
+    };
+
+    Ok((pid, run))
+}
+
+/// A job's log file, capped.
+///
+/// Holds the handle open for the life of the job rather than reopening per
+/// write: a chatty job produces thousands of chunks, and an open-append-close
+/// each time is the difference between a log and a bottleneck.
+struct Log {
+    file: Option<std::fs::File>,
+    written: usize,
+    /// Set once the cap is hit, so the marker is written exactly once.
+    capped: bool,
+}
+
+impl Log {
+    fn open(path: PathBuf) -> Self {
+        Self {
+            file: std::fs::OpenOptions::new().append(true).open(path).ok(),
+            written: 0,
+            capped: false,
+        }
+    }
+
+    /// Append what fits. Past the cap the bytes are dropped, not buffered — the
+    /// caller keeps reading either way, so the child never blocks on a full pipe.
+    fn append(&mut self, bytes: &[u8]) {
+        use std::io::Write;
+
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if self.written >= MAX_STREAM_BYTES {
+            if !self.capped {
+                self.capped = true;
+                let _ = file
+                    .write_all(b"\n[harness] output past the size limit is not being recorded\n");
+                let _ = file.flush();
+            }
+            return;
+        }
+        let room = MAX_STREAM_BYTES - self.written;
+        let take = room.min(bytes.len());
+        if file.write_all(&bytes[..take]).is_ok() {
+            self.written += take;
+            // Flushed per chunk: the point of a job log is that it can be read
+            // while the job runs, and a buffered write is invisible until it is
+            // too late to be useful.
+            let _ = file.flush();
+        }
+    }
+}
+
+/// Read a pipe to EOF into a log, after the child has exited.
+async fn drain_into<R>(reader: &mut R, log: &mut Log)
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut buffer = [0u8; 8192];
+    while let Ok(n) = reader.read(&mut buffer).await {
+        if n == 0 {
+            return;
+        }
+        log.append(&buffer[..n]);
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
@@ -929,6 +1132,236 @@ mod tests {
             "the idle bound must not have fired first"
         );
         assert!(started.elapsed() < secs(30), "took {:?}", started.elapsed());
+    }
+
+    /// A job directory of this test's own, under a sandbox root.
+    fn job_in(name: &str, command: &str) -> (Sandbox, std::path::PathBuf, crate::jobs::Handle) {
+        let (sandbox, dir) = sandbox_in(name);
+        let handle = crate::jobs::create(&dir, command).unwrap();
+        (sandbox, dir, handle)
+    }
+
+    /// The whole point: `start_background` returns while the child is still
+    /// running, and the log is readable before it finishes. A job you can only
+    /// read once it is over is a foreground command with extra steps.
+    #[tokio::test]
+    async fn a_job_starts_and_its_log_is_readable_while_it_runs() {
+        let script = "echo first; sleep 5; echo last";
+        let (sandbox, dir, handle) = job_in("job-live", script);
+
+        let (pid, run) = start_background(
+            sandbox,
+            script.to_string(),
+            handle.clone(),
+            secs(30),
+            std::future::pending(),
+        )
+        .unwrap();
+        assert!(pid > 0);
+
+        let task = tokio::spawn(run);
+        // Long before the command could have finished.
+        let mut log = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            log = std::fs::read_to_string(handle.stdout_path()).unwrap();
+            if log.contains("first") {
+                break;
+            }
+        }
+        assert!(log.contains("first"), "log was {log:?}");
+        assert!(!log.contains("last"), "the job should still be running");
+        assert!(!task.is_finished());
+
+        let state = task.await.unwrap();
+        assert_eq!(state, crate::jobs::State::Exited(0));
+        let log = std::fs::read_to_string(handle.stdout_path()).unwrap();
+        assert!(log.contains("last"), "the tail must be drained: {log:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_job_records_both_streams_and_its_exit_code() {
+        let script = "echo out; echo err >&2; exit 3";
+        let (sandbox, dir, handle) = job_in("job-streams", script);
+
+        let (_, run) = start_background(
+            sandbox,
+            script.to_string(),
+            handle.clone(),
+            secs(30),
+            std::future::pending(),
+        )
+        .unwrap();
+        assert_eq!(run.await, crate::jobs::State::Exited(3));
+
+        assert_eq!(
+            std::fs::read_to_string(handle.stdout_path())
+                .unwrap()
+                .trim(),
+            "out"
+        );
+        assert_eq!(
+            std::fs::read_to_string(handle.stderr_path())
+                .unwrap()
+                .trim(),
+            "err"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job has no idle bound — that is the difference from a foreground
+    /// command, and the reason a dev server can be one. The same script would be
+    /// killed by `run`'s timeout well before it finished.
+    #[tokio::test]
+    async fn a_silent_job_is_not_killed_for_being_quiet() {
+        let script = "sleep 2; echo done";
+        let (sandbox, dir, handle) = job_in("job-quiet", script);
+
+        let (_, run) = start_background(
+            sandbox,
+            script.to_string(),
+            handle.clone(),
+            // A ceiling far past the sleep, and no idle bound at all.
+            secs(60),
+            std::future::pending(),
+        )
+        .unwrap();
+        assert_eq!(run.await, crate::jobs::State::Exited(0));
+        assert!(
+            std::fs::read_to_string(handle.stdout_path())
+                .unwrap()
+                .contains("done")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceiling is the only thing bounding a job, so it has to take the
+    /// whole process group with it — the same guarantee the foreground timeout
+    /// carries, checked the same way.
+    #[tokio::test]
+    async fn the_ceiling_kills_the_job_and_its_grandchildren() {
+        let marker = "ai-harness-job-ceiling-marker";
+        let script = format!("sh -c 'sleep 30 # {marker}' & sleep 30");
+        let (sandbox, dir, handle) = job_in("job-ceiling", &script);
+
+        let (_, run) = start_background(
+            sandbox,
+            script.clone(),
+            handle.clone(),
+            Duration::from_millis(600),
+            std::future::pending(),
+        )
+        .unwrap();
+        assert_eq!(run.await, crate::jobs::State::TimedOut);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let survivors = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(marker)
+            .output()
+            .unwrap();
+        assert!(
+            survivors.stdout.is_empty(),
+            "grandchild survived the ceiling: {}",
+            String::from_utf8_lossy(&survivors.stdout)
+        );
+        // And the reason is in the log, where someone reading it will look.
+        assert!(
+            std::fs::read_to_string(handle.stderr_path())
+                .unwrap()
+                .contains("ceiling")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_job_kills_it_and_reports_killed() {
+        let marker = "ai-harness-job-cancel-marker";
+        let script = format!("sh -c 'sleep 30 # {marker}' & sleep 30");
+        let (sandbox, dir, handle) = job_in("job-cancel", &script);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let (_, run) = start_background(
+            sandbox,
+            script.clone(),
+            handle.clone(),
+            secs(60),
+            async move {
+                let _ = cancel_rx.await;
+            },
+        )
+        .unwrap();
+        let task = tokio::spawn(run);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = cancel_tx.send(());
+
+        assert_eq!(task.await.unwrap(), crate::jobs::State::Killed);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let survivors = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(marker)
+            .output()
+            .unwrap();
+        assert!(
+            survivors.stdout.is_empty(),
+            "grandchild survived the cancel: {}",
+            String::from_utf8_lossy(&survivors.stdout)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that floods its log is capped like a foreground command, and says
+    /// so in the file rather than just stopping — a truncated log that looks
+    /// complete is worse than one that admits it is not.
+    #[tokio::test]
+    async fn a_jobs_log_is_capped_and_says_so() {
+        let script = "yes ABCDEFGH | head -c 5000000";
+        let (sandbox, dir, handle) = job_in("job-cap", script);
+
+        let (_, run) = start_background(
+            sandbox,
+            script.to_string(),
+            handle.clone(),
+            secs(60),
+            std::future::pending(),
+        )
+        .unwrap();
+        run.await;
+
+        let log = std::fs::read_to_string(handle.stdout_path()).unwrap();
+        assert!(
+            log.len() <= MAX_STREAM_BYTES + 200,
+            "log was {} bytes, cap is {MAX_STREAM_BYTES}",
+            log.len()
+        );
+        assert!(
+            log.contains("past the size limit"),
+            "the cap must be stated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job is confined exactly as a foreground command is: the sandbox is the
+    /// same object, and nothing about running unattended loosens it.
+    #[tokio::test]
+    async fn a_job_cannot_write_outside_the_sandbox() {
+        let target = std::env::temp_dir().join("ai-harness-JOB-ESCAPE.txt");
+        let _ = std::fs::remove_file(&target);
+        let script = format!("echo pwned > {}", target.display());
+        let (sandbox, dir, handle) = job_in("job-escape", &script);
+
+        let (_, run) = start_background(
+            sandbox,
+            script.clone(),
+            handle.clone(),
+            secs(30),
+            std::future::pending(),
+        )
+        .unwrap();
+        assert_ne!(run.await, crate::jobs::State::Exited(0));
+        assert!(!target.exists(), "the job escaped the sandbox");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

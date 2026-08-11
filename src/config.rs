@@ -35,6 +35,38 @@ pub struct Args {
     #[arg(long, default_value_t = 30, env = "AI_HARNESS_COMMAND_TIMEOUT")]
     pub command_timeout: u64,
 
+    /// A command run after any turn that changed a file, whose failure goes back
+    /// to the model.
+    ///
+    /// This is the harness's only way of asking whether a change *worked*.
+    /// Without it a turn ends on the model's word; with it, `cargo check` or a
+    /// lint gets the last say, and a failure becomes a result the model has to
+    /// answer rather than a surprise you find later.
+    ///
+    /// Prefer something **fast**. It is paid on every turn that writes, and a
+    /// full test suite turns a one-edit turn into a two-minute one. A type
+    /// check, a lint, or one focused test target is the shape that pays for
+    /// itself.
+    ///
+    /// One thing it does not cover: the trigger is a *write* or an *edit*, so a
+    /// turn that changes files by running a shell command — `sed -i`,
+    /// `cargo fix`, a codegen script — does not fire it. Including shell
+    /// commands would fire it after `ls` and after most turns that change
+    /// nothing at all.
+    #[arg(long, env = "AI_HARNESS_CHECK")]
+    pub check: Option<String>,
+
+    /// Seconds before a background job is killed, whatever it is doing.
+    ///
+    /// Not `--command-timeout`, which is an *idle* bound: a foreground command
+    /// is killed after that long producing nothing, and the whole point of a job
+    /// may be to sit quiet — a dev server that logs on startup and then waits is
+    /// exactly the thing that bound would kill. So a job gets no idle bound at
+    /// all and this wall-clock ceiling instead, well past any build worth
+    /// waiting on and short of running until the machine is rebooted.
+    #[arg(long, default_value_t = 3600, env = "AI_HARNESS_JOB_CEILING")]
+    pub job_ceiling: u64,
+
     /// Maximum model round-trips per prompt, bounding the agentic loop.
     ///
     /// Reads consume a round-trip like any other action, so this has to leave
@@ -185,6 +217,11 @@ pub struct Args {
 impl Args {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.command_timeout.max(1))
+    }
+
+    /// Wall-clock ceiling on a background job. See [`Args::job_ceiling`].
+    pub fn job_ceiling(&self) -> Duration {
+        Duration::from_secs(self.job_ceiling.max(1))
     }
 
     /// Sandbox root, defaulting to the current directory.

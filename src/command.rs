@@ -21,6 +21,8 @@ pub enum Command {
     Sessions,
     /// List the project's memory notes and what the index made of them.
     Memory,
+    /// List background jobs; `Some("kill <id>")` stops one.
+    Jobs(Option<String>),
     /// Open the page of what this session has done.
     Stats,
     /// List checkpoints; `Some` sets how many turns to keep.
@@ -77,6 +79,10 @@ impl Command {
             Command::Sessions => true,
             // Reads the memory directory and reports. Touches no conversation.
             Command::Memory => true,
+            // Jobs are not part of a turn — that is what makes them jobs — so
+            // neither listing nor killing one touches the conversation, and the
+            // turn most worth killing a job during is one that is still running.
+            Command::Jobs(_) => true,
             // A page of numbers derived from what already happened.
             Command::Stats => true,
             // The in-flight request already carries its model, so this lands on
@@ -119,6 +125,7 @@ impl Command {
             Command::Rewind => "rewind",
             Command::Sessions => "sessions",
             Command::Memory => "memory",
+            Command::Jobs(_) => "jobs",
             Command::Stats => "stats",
             Command::Checkpoints(_) => "checkpoints",
             Command::Plan(_) => "plan",
@@ -173,6 +180,7 @@ pub fn parse(input: &str) -> Input {
         "rewind" => Command::Rewind,
         "sessions" => Command::Sessions,
         "memory" | "memories" => Command::Memory,
+        "jobs" | "job" => Command::Jobs(arg),
         "stats" => Command::Stats,
         "checkpoints" | "checkpoint" => Command::Checkpoints(arg),
         "plan" => Command::Plan(arg),
@@ -246,6 +254,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "memory",
         description: "list the notes in .ai_harness/memory and how they index",
+    },
+    Spec {
+        name: "jobs",
+        description: "list background jobs, or stop one (/jobs kill <id>)",
     },
     Spec {
         name: "stats",

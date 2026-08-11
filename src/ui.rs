@@ -1683,6 +1683,10 @@ fn render_entry(
             // protocol: the user should see which branch the model chose.
             let (label, colour) = match action {
                 Action::Shell(_) => ("shell", Color::Magenta),
+                // Its own label rather than "shell": the two are approved the
+                // same way and differ entirely in what happens after, which is
+                // exactly the kind of thing the user should not have to infer.
+                Action::ShellBackground(_) => ("job", Color::Magenta),
                 Action::Read { .. } => ("read", Color::Blue),
                 Action::Grep { .. } => ("grep", Color::Blue),
                 Action::Glob { .. } => ("glob", Color::Blue),
@@ -1717,7 +1721,7 @@ fn render_entry(
 
             match action {
                 // Shell commands read as commands, not prose.
-                Action::Shell(cmd) => {
+                Action::Shell(cmd) | Action::ShellBackground(cmd) => {
                     lines.extend(body_lines(cmd, Style::default().fg(Color::Magenta), width))
                 }
                 // The path is the whole action; the contents arrive as a result.
@@ -1798,11 +1802,18 @@ fn render_entry(
             ]));
             lines.extend(body_lines(raw, Style::default().fg(Color::DarkGray), width));
         }
-        Entry::CommandResult(output) => {
+        // One rendering for both: a check is a command result, and the only
+        // thing the reader needs told apart is who asked for it — the model, or
+        // the project's `--check`.
+        Entry::CommandResult(output) | Entry::CheckResult(output) => {
             let ok = output.succeeded();
+            let label = match entry {
+                Entry::CheckResult(_) => "check",
+                _ => "result",
+            };
             lines.push(Line::from(vec![
                 Span::styled(
-                    "result",
+                    label,
                     Style::default()
                         .fg(if ok { Color::Blue } else { Color::Red })
                         .add_modifier(Modifier::BOLD),
@@ -2635,6 +2646,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize
     // worth seeing but not a warning.
     if app.planning() {
         spans.push(Span::styled("  plan", Style::default().fg(Color::Cyan)));
+    }
+    // Blue like `running`, because that is what it is — work going on that the
+    // prompt is not waiting for. Shown whenever there is any: a job you have
+    // forgotten about is exactly the one worth a reminder.
+    if app.live_jobs() > 0 {
+        spans.push(Span::styled(
+            format!("  {} job(s)", app.live_jobs()),
+            Style::default().fg(Color::Blue),
+        ));
     }
     if !app.follow {
         spans.push(Span::styled(

@@ -95,6 +95,9 @@ pub const LIMIT_ATTR: &str = "limit";
 pub const DIR_ATTR: &str = "dir";
 /// A filename filter on a grep, e.g. `glob="*.rs"`. Optional.
 pub const GLOB_ATTR: &str = "glob";
+/// Turns a shell command into a job that outlives the turn. Optional, and
+/// `true` is its only value — see [`crate::jobs`].
+pub const BACKGROUND_ATTR: &str = "background";
 
 /// Harness → model only. Carries the outcome of a shell action; never parsed.
 pub const RESULT_TAG: &str = "ai-harness-shell-result";
@@ -182,6 +185,16 @@ pub fn collapsible_result(content: &str) -> Option<(&'static str, &str)> {
 pub enum Action {
     /// A shell command the model wants run. Not executed yet.
     Shell(String),
+    /// A shell command the model wants left running past this turn. Not started
+    /// yet — approved exactly as [`Action::Shell`] is.
+    ///
+    /// A **separate variant** rather than a flag on `Shell`, which is the shape
+    /// this wants to be. `Action` is serialised into every `session.json`, so
+    /// giving the tuple variant a second field would stop saved sessions
+    /// loading, and bumping `crate::session::VERSION` would orphan the ones
+    /// already on disk. A new variant costs old files nothing: they never
+    /// contain it.
+    ShellBackground(String),
     /// A file the model wants to see. Runs without approval; see [`crate::files`].
     ///
     /// The window is optional and 1-based. `serde(default)` and no
@@ -241,7 +254,7 @@ impl Action {
     /// URL, the file contents, or — for an edit — the span being replaced).
     pub fn body(&self) -> &str {
         match self {
-            Self::Shell(s) | Self::Response(s) => s,
+            Self::Shell(s) | Self::ShellBackground(s) | Self::Response(s) => s,
             Self::Read { path, .. } => path,
             Self::Grep { pattern, .. } | Self::Glob { pattern, .. } => pattern,
             Self::Fetch { url } => url,
@@ -428,7 +441,8 @@ pub enum ProtocolError {
         attr: String,
     },
     /// An attribute the tag does take, with a value it cannot use — a read's
-    /// `offset=`/`limit=` that is not a whole number of 1 or more.
+    /// `offset=`/`limit=` that is not a whole number of 1 or more, or a shell's
+    /// `background=` that is not `true`.
     BadAttributeValue {
         attr: String,
         value: String,
@@ -528,6 +542,16 @@ impl fmt::Display for ProtocolError {
             Self::UnterminatedAttribute { tag, attr } => write!(
                 f,
                 "<{tag}> opened a quoted value for {attr}= that was never closed with '\"'"
+            ),
+            // Branched on the attribute rather than worded generically: the two
+            // fallible attributes are wrong in different ways, and "not usable"
+            // alone does not tell a model which value to write instead.
+            Self::BadAttributeValue { attr, value } if attr == BACKGROUND_ATTR => write!(
+                f,
+                "{attr}={} is not usable; the only value it takes is \
+                 {BACKGROUND_ATTR}=true. Leave the attribute off entirely to run \
+                 the command in the foreground and wait for it",
+                snippet(value)
             ),
             Self::BadAttributeValue { attr, value } => write!(
                 f,
@@ -639,6 +663,84 @@ pub fn encode_shell_result(output: &CommandOutput) -> String {
     body.push_str(&section("stderr", &output.stderr));
 
     format!("<{RESULT_TAG}>\n{body}</{RESULT_TAG}>")
+}
+
+/// Tell the model its job started, and where to look.
+///
+/// An ordinary `<{RESULT_TAG}>`, not a result tag of its own. A job is a shell
+/// command that answered quickly; inventing a tag for it would mean adding one
+/// to [`RESULT_TAGS`] and [`ELIDE_TAGS`], teaching the fabrication check about
+/// it, and giving compaction a new body to stub — all to say something the
+/// existing shape says. The `status:` line is what a foreground command's result
+/// leads with, so nothing downstream has to learn a second format.
+///
+/// The paths are spelled out because they are the whole interface: there is no
+/// tag for reading a job, and there does not need to be.
+pub fn encode_job_started(id: &str, dir: &str) -> String {
+    format!(
+        "<{RESULT_TAG}>\n\
+         status: started in the background as job {id}\n\
+         note: the command is still running. Its output is being written to \
+         {dir}/stdout and {dir}/stderr, and {dir}/status holds one line — \
+         'running' until it finishes, then 'exit N', 'killed', or 'timed out'. \
+         Read those files with <{READ_TAG}> when you want to know how it is \
+         going; do not assume it succeeded. Every prompt from now on lists the \
+         job and its status, so you do not need to keep checking.\n\
+         </{RESULT_TAG}>"
+    )
+}
+
+/// Report the project's check command back to the model.
+///
+/// An ordinary `<{RESULT_TAG}>`, for the reason [`encode_job_started`] is one:
+/// a new result tag would mean teaching `RESULT_TAGS`, `ELIDE_TAGS`, the
+/// fabrication check and compaction about it, to say something the existing
+/// shape already says.
+///
+/// The wording carries the **escape hatch**. A failing check feeds the loop for
+/// as long as the model keeps changing files, which is right when the model
+/// caused the failure and wrong when it walked into one. Saying outright that a
+/// response ends the turn is what makes "this was already broken" an available
+/// move rather than something the model has to discover by failing repeatedly.
+pub fn encode_check_result(command: &str, output: &CommandOutput) -> String {
+    let mut body = format!("status: the project check failed — `{command}`\n");
+    if output.timed_out {
+        body.push_str("note: it produced nothing for too long and was killed\n");
+    } else if let Some(code) = output.exit_code {
+        body.push_str(&format!("exit code: {code}\n"));
+    } else {
+        body.push_str("note: it was killed by a signal\n");
+    }
+    if output.truncated {
+        body.push_str("note: output was truncated because it exceeded the size limit\n");
+    }
+    body.push_str(&section("stdout", &output.stdout));
+    body.push_str(&section("stderr", &output.stderr));
+    body.push_str(
+        "\nThis ran because your changes landed, not because you asked for it. \
+         If the failure is something you caused, fix it and the check will run \
+         again. If it looks unrelated to what you changed — already failing \
+         before this turn, an environment problem, a flaky or missing \
+         dependency — do NOT keep trying: say so in a response and stop. A \
+         response with no further changes ends the turn.\n",
+    );
+    format!("<{RESULT_TAG}>\n{body}</{RESULT_TAG}>")
+}
+
+/// Tell the model a job could not be started because too many are running.
+///
+/// A result rather than an error for the reason a denied write is one: the model
+/// can act on it — wait, or stop one — and a turn that ends here would leave the
+/// user holding a failure that was really a scheduling decision.
+pub fn encode_job_refused(running: usize, max: usize) -> String {
+    format!(
+        "<{RESULT_TAG}>\n\
+         status: not started — {running} background jobs are already running and \
+         the limit is {max}\n\
+         note: wait for one to finish, or run this command in the foreground by \
+         leaving the {BACKGROUND_ATTR}= attribute off.\n\
+         </{RESULT_TAG}>"
+    )
 }
 
 /// Report a completed (or failed) file write back to the model.
@@ -1035,7 +1137,9 @@ pub fn encode_correction(error: &ProtocolError, raw: &str) -> String {
          <{GREP_TAG}>regex</{GREP_TAG}> to search file contents, \
          <{GLOB_TAG}>**/*.rs</{GLOB_TAG}> to find files by name, \
          <{FETCH_TAG}>https://…</{FETCH_TAG}> to read a web page, \
-         <{SHELL_TAG}>…</{SHELL_TAG}> to run a command, \
+         <{SHELL_TAG}>…</{SHELL_TAG}> to run a command (or \
+         <{SHELL_TAG} {BACKGROUND_ATTR}=true>…</{SHELL_TAG}> to leave it \
+         running), \
          <{WRITE_TAG} file=path>…</{WRITE_TAG}> to write a whole file, \
          <{EDIT_TAG} file=path><{OLD_TAG}>…</{OLD_TAG}><{NEW_TAG}>…</{NEW_TAG}></{EDIT_TAG}> \
          to change part of one, \
@@ -1206,8 +1310,8 @@ pub fn parse_reply(raw: &str) -> Result<Reply, ProtocolError> {
     // A search's scope, read the same way. Infallible, unlike a read's window:
     // there is no `dir=` value that is *syntactically* wrong, and where it
     // points is `files::resolve`'s business rather than the parser's. Keeping
-    // it infallible is what lets `BadAttributeValue`'s message stay about
-    // `offset=`, which it names outright.
+    // it infallible also keeps `BadAttributeValue` down to the two attributes it
+    // has a specific message for.
     let scope = parse_search_scope(tag, &pairs);
 
     // The body runs to the first matching closing tag.
@@ -1320,6 +1424,7 @@ pub fn parse_reply(raw: &str) -> Result<Reply, ProtocolError> {
     }
 
     let action = match tag {
+        SHELL_TAG if parse_background(&pairs)? => Action::ShellBackground(body.to_string()),
         SHELL_TAG => Action::Shell(body.to_string()),
         READ_TAG => {
             let (offset, limit) = read_window;
@@ -1367,6 +1472,7 @@ fn allowed_attrs(tag: &str) -> &'static [&'static str] {
         GLOB_TAG => &[DIR_ATTR],
         WRITE_TAG | EDIT_TAG => &[FILE_ATTR],
         MEMORY_TAG => &[NAME_ATTR, DESCRIPTION_ATTR],
+        SHELL_TAG => &[BACKGROUND_ATTR],
         _ => &[],
     }
 }
@@ -1468,6 +1574,27 @@ fn parse_read_window(
         }
     }
     Ok((window[0], window[1]))
+}
+
+/// Whether a shell command asked to be a job.
+///
+/// Fallible, and strictly so: `true` is the only accepted value. `background=1`
+/// and `background=yes` are the shapes a model reaches for, and either would
+/// otherwise be a *silent* no-op — the command would run in the foreground, hold
+/// the turn open, and the model would be told nothing. A read's `offset=` is
+/// strict for the same reason, and this is worse, because the wrong answer here
+/// still looks like it worked.
+fn parse_background(pairs: &[(String, String)]) -> Result<bool, ProtocolError> {
+    let Some(raw) = attribute(pairs, BACKGROUND_ATTR) else {
+        return Ok(false);
+    };
+    if raw.trim() == "true" {
+        return Ok(true);
+    }
+    Err(ProtocolError::BadAttributeValue {
+        attr: BACKGROUND_ATTR.to_string(),
+        value: raw.to_string(),
+    })
 }
 
 /// Parse a search's `dir=` and, for a grep, `glob=`.
@@ -1828,6 +1955,11 @@ rather than raw HTML, and needs no approval:
 
 <{SHELL_TAG}>the command to run</{SHELL_TAG}>
 
+5b. Start a long-running command as a background job. The turn continues \
+immediately instead of waiting for it, and the job keeps running across turns:
+
+<{SHELL_TAG} {BACKGROUND_ATTR}=true>cargo test</{SHELL_TAG}>
+
 6. Write a whole file. Use this only for a new file or a full rewrite:
 
 <{WRITE_TAG} file=path/to/file>
@@ -2028,6 +2160,13 @@ to the harness.
 - The element must be non-empty.
 - Put exactly one shell command in <{SHELL_TAG}>. Chain steps with '&&' or ';' if \
 you need several. Prefer non-interactive commands that terminate on their own.
+- <{SHELL_TAG}> may carry {BACKGROUND_ATTR}=true, and 'true' is the only value it \
+takes. Use it for work worth starting and coming back to — a test run, a build, \
+a watch process, a server — and especially for anything that would otherwise be \
+killed for running quietly too long. You get a job id at once rather than an exit \
+code, so do not use it for a command whose output you need in order to write the \
+next element: that is what the plain <{SHELL_TAG}> is for, and waiting is cheaper \
+than starting a job and polling it.
 - A <{READ_TAG}> contains one file path and nothing else. One file per element. \
 It may carry {OFFSET_ATTR}= and {LIMIT_ATTR}=, each a whole number of 1 or more.
 - A <{GREP_TAG}> contains one regular expression and nothing else. It may carry \
@@ -2041,8 +2180,8 @@ element.
 - A <{WRITE_TAG}> must have a file=… path and contains the complete new file \
 contents (not a diff). <{WRITE_TAG}> and <{EDIT_TAG}> take the file= attribute; \
 <{READ_TAG}> takes {OFFSET_ATTR}= and {LIMIT_ATTR}=; <{GREP_TAG}> takes \
-{DIR_ATTR}= and {GLOB_ATTR}=; <{GLOB_TAG}> takes {DIR_ATTR}=; no other tag \
-takes any.
+{DIR_ATTR}= and {GLOB_ATTR}=; <{GLOB_TAG}> takes {DIR_ATTR}=; <{SHELL_TAG}> \
+takes {BACKGROUND_ATTR}=; no other tag takes any.
 - An <{EDIT_TAG}> must have a file=… path and contain a <{OLD_TAG}> then a \
 <{NEW_TAG}>, in that order and nothing else. The <{OLD_TAG}> text must appear \
 EXACTLY ONCE in the file, copied character-for-character — whitespace included — \
@@ -2111,6 +2250,43 @@ it ready. That reply ends the planning turn: the harness then asks the user \
 whether to execute the plan, and if they accept, this mode is switched off and \
 the work begins. Keep it to a short summary of what the plan does — the plan \
 itself is in the file, and repeating it here wastes the user's money."
+    )
+}
+
+/// The jobs this project has going, for the contract.
+///
+/// One line each, and only the ones worth a line: everything still running, plus
+/// anything that finished since — a job whose whole point was to be checked on
+/// later is useless if the model is never told it landed.
+///
+/// The cost is paid on **every round-trip** of an agentic turn, like the memory
+/// index beside it, which is why the list is capped and says when it was cut
+/// rather than growing with the project's history. Finished jobs age out of it;
+/// the directory keeps them, and `<{GLOB_TAG}>` finds them.
+pub fn jobs_section(lines: &[String], dir: &str, dropped: usize) -> String {
+    let mut listing = String::new();
+    for line in lines {
+        listing.push_str(&format!("  {line}\n"));
+    }
+    if dropped > 0 {
+        listing.push_str(&format!(
+            "  (and {dropped} more, not listed here for space)\n"
+        ));
+    }
+    format!(
+        "Background jobs, in {dir}:\n\n\
+         {listing}\n\
+         Each job is a directory holding stdout, stderr, and a one-line status. \
+         Open them with <{READ_TAG}>, e.g. <{READ_TAG}>{dir}/<id>/stderr\
+         </{READ_TAG}> — a failed build's error is in its stderr, not in this \
+         list, and each log is capped well inside what one read returns, so you \
+         never need more than one. <{GREP_TAG}> and <{GLOB_TAG}> do **not** \
+         reach this directory; reading a named path is the only way in.\n\n\
+         This list is rebuilt from disk every time you are prompted, so it is \
+         current; a job missing from it finished a while ago and is still on \
+         disk. Do not start a job that duplicates one already running, and do \
+         not report a job's result to the user without reading its status \
+         first — 'running' is not 'succeeded'."
     )
 }
 
@@ -3075,12 +3251,67 @@ mod tests {
         ));
     }
 
+    /// Both refusals, and the difference between them: a tag that takes no
+    /// attributes at all says so, and one that takes some says which. `shell`
+    /// moved from the first group to the second when `background=` was added,
+    /// and the message it gives should have moved with it.
     #[test]
     fn an_attribute_on_shell_or_response_is_rejected() {
+        // A response takes none, so it says none.
         assert!(matches!(
-            action("<ai-harness-shell file=x>ls</ai-harness-shell>").unwrap_err(),
+            action("<ai-harness-response file=x>hi</ai-harness-response>").unwrap_err(),
             ProtocolError::UnexpectedAttribute { .. }
         ));
+        // A shell takes `background=`, so a wrong attribute is named rather than
+        // the tag being called attribute-free.
+        assert!(matches!(
+            action("<ai-harness-shell file=x>ls</ai-harness-shell>").unwrap_err(),
+            ProtocolError::UnknownAttribute { .. }
+        ));
+    }
+
+    #[test]
+    fn a_background_shell_is_its_own_action() {
+        assert_eq!(
+            action("<ai-harness-shell background=true>cargo test</ai-harness-shell>").unwrap(),
+            Action::ShellBackground("cargo test".into())
+        );
+        // Absent means foreground, which is the shape every existing reply has.
+        assert_eq!(
+            action("<ai-harness-shell>cargo test</ai-harness-shell>").unwrap(),
+            Action::Shell("cargo test".into())
+        );
+    }
+
+    /// The failure this strictness exists to prevent is silent: `background=yes`
+    /// would otherwise parse as a foreground command, hold the turn open, and
+    /// tell the model nothing about why.
+    #[test]
+    fn only_true_turns_a_shell_into_a_job() {
+        for value in ["yes", "1", "on", "false", "True", ""] {
+            let raw = format!("<ai-harness-shell background={value}>ls</ai-harness-shell>");
+            match action(&raw) {
+                Err(ProtocolError::BadAttributeValue { attr, .. }) => {
+                    assert_eq!(attr, BACKGROUND_ATTR);
+                }
+                // An empty value reads as absent, which is a foreground command
+                // — wrong-looking, but not a *silent* background failure.
+                Ok(Action::Shell(_)) if value.is_empty() => {}
+                other => panic!("background={value:?} should not be accepted: {other:?}"),
+            }
+        }
+    }
+
+    /// The correction has to name the value that works, or the model has no
+    /// move but to try another guess.
+    #[test]
+    fn the_background_correction_names_the_only_valid_value() {
+        let error = action("<ai-harness-shell background=yes>ls</ai-harness-shell>").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("background=true"), "{text}");
+        // And it says what to do instead, since "not usable" alone leaves the
+        // model choosing between two things it cannot distinguish.
+        assert!(text.contains("foreground"), "{text}");
     }
 
     #[test]

@@ -416,6 +416,119 @@ from typing at a running process.
 `<ai-harness-shell-result>`, feeds it back into history, and **re-sends to the
 model** (step 2 again).
 
+### The project check: a response that has to earn its ending
+
+`<ai-harness-response>` is described above as the one terminal exit. With
+`--check` set, it has a condition on it.
+
+A new arm in `push_response` sits **ahead of both `Response` arms**, because
+either would otherwise end the turn first. It fires when `App::should_check` is
+true — a command is configured, a write has landed since the last check, and
+plan mode is off — and parks the command in `pending_check` for the event loop
+to spawn, exactly as a fetch or a search is parked.
+
+`spawn_check` is `spawn_shell` with a different `Update`; both go through
+`spawn_watched`, which owns the sandbox, the timeout, cancellation, the chunk
+relay and the generation tag. That sharing is the point: a check *is* a
+foreground command the turn is waiting on, so it takes the `InFlight` slot,
+streams into the same live window, and `Esc` cancels it like anything else.
+
+**No approval modal**, and this is the one command in the system that skips it.
+Everything else reaching `exec` was proposed by the model, which is what the
+modal exists to catch. This one was typed by the user into their own
+configuration — setting the flag *is* the approval, and asking again every turn
+would be noise that trains people to press Allow. It still runs under the
+ordinary sandbox.
+
+`App::finish_check` decides what happens next:
+
+- **Passed** → `Idle`. The turn ends as it always did.
+- **Failed, budget remaining** → `protocol::encode_check_result` goes back as an
+  ordinary `<ai-harness-shell-result>` and the loop continues.
+- **Failed, budget spent** → the user is told and the turn ends. The check still
+  *ran*: knowing whether the tree builds is worth one command on the way out,
+  even when there is no room left to ask the model about it. The budget gates
+  the resend, not the run.
+
+Retries are bounded only by `iterations`, so the thing that stops a model with
+no ideas left is not a counter but `wrote_since_check`: **the check re-runs only
+if something has been written since the last one.** A response that changes
+nothing ends the turn. That is also what makes "this failure is not mine" an
+available move, and `encode_check_result` says so outright — fix it, or say so
+in a response and stop.
+
+The response the model already gave is not withdrawn. It sits in the transcript
+above the check that contradicted it, which is a truer record than rewriting
+history to hide an answer the user has already read.
+
+One thing it does not cover, deliberately: the trigger is a `WriteResult`, so a
+turn that changes files *through a shell command* — `sed -i`, `cargo fix` — does
+not fire it. Including `Action::Shell` would fire it after `ls` and after every
+other read-only command, which is most turns.
+
+### A background job: approved the same way, but the turn does not wait
+
+`<ai-harness-shell background=true>` is the one approved action whose result is
+not its outcome. It reaches the modal exactly as a plain `<ai-harness-shell>`
+does — it is still a shell command, and nothing about running unattended skips
+the approval — but `allow` sends it to `spawn_job`
+([src/main.rs](../src/main.rs)) instead of `spawn_shell`, and three things differ
+after that.
+
+**It never touches `inflight`.** That slot holds the one piece of work a turn is
+waiting on, and the turn is about to use it for the round-trip carrying the job
+id. A job that occupied it would deadlock the loop it exists to free.
+
+**The model is answered immediately**, with an ordinary
+`<ai-harness-shell-result>` naming the job id and its directory rather than an
+exit code. The turn continues; the job does not belong to it.
+
+**Its output goes to files.** `exec::start_background` appends to
+`.ai_harness/jobs/<id>/stdout` and `stderr` rather than relaying chunks, so there
+is no live window and nothing to feed one. That is the point rather than a
+simplification: the model opens a job's log with the `<ai-harness-read>` it
+already has, and no tag had to be invented to inspect one. The directory is the
+state — [src/jobs.rs](../src/jobs.rs) caches nothing, and the only thing the
+harness keeps in memory is the handle needed to kill a job.
+
+One asymmetry there is worth knowing. A **read** reaches `.ai_harness/`; a
+**grep or glob does not**, because `config::HARNESS_DIR` is in
+`search::SKIP_DIRS` — a session file holds a whole prior conversation, and a
+search for any term the user has typed would otherwise match the transcript of
+them typing it. Jobs inherit that. It costs nothing (each log is capped at
+`exec::MAX_STREAM_BYTES`, well inside `files::MAX_READ_BYTES`, so a whole log
+fits in one read) but `protocol::jobs_section` has to say so outright, or the
+model greps a build log, finds nothing, and reports the build clean.
+
+Two bounds differ from a foreground command's, both following from a job being
+something nobody is watching. There is **no idle timeout** — the thing most
+worth leaving running is the thing that prints nothing for an hour — and a
+wall-clock `--job-ceiling` (an hour by default) bounds it instead. Each log is
+still capped at `MAX_STREAM_BYTES`, and says in the file when it was cut.
+
+The completion arrives as `Update::Job`, and it is **exempt from the generation
+check** in `route_update`. A job outlives the turn that started it, so the
+generation it was born under says nothing about whether its result matters, and
+every `Esc` in between bumped that counter — checking it would silently discard
+the completion of a job that ran perfectly. It posts a notice and stops there:
+pushing a result would restart a turn the user already watched end.
+
+Three consequences worth holding onto:
+
+- **The model is told by the contract, not by an interrupt.**
+  `App::jobs_state` adds a line per job to `history[0]` on the same per-prompt
+  rebuild that carries `AGENTS.md` and the memory index, so a job cannot be
+  forgotten and nothing has to invalidate a cache.
+- **`/undo` and `/rewind` refuse while a job runs.** A checkpoint is taken
+  before an action runs and a job keeps writing after that, so a restore would
+  leave neither the old tree nor the new one. This is the one existing guarantee
+  the feature weakens, and it is refused rather than warned about because the
+  damage would be silent.
+- **A job does not survive the process.** The quit path kills every registered
+  job by handle, and `jobs::sweep` runs at startup to write off anything a
+  previous harness left marked `running` — otherwise the contract would claim a
+  process that is gone.
+
 ### Under `--auto-approve`, the modal step is skipped
 
 The dispatch above is unchanged: `push_response` still parks a `Pending` and still
@@ -492,7 +605,8 @@ which case nothing stops and the whole chain runs on the `iterations` cap alone.
 
 The shape worth holding onto: **`push_response` is the hub.** Streaming, retries,
 the approval modal, and command results are all just different edges feeding back
-into it, and it has exactly one terminal exit — `<ai-harness-response>` → `Idle`.
+into it, and it has exactly one terminal exit — `<ai-harness-response>` → `Idle`,
+which under `--check` a turn that wrote files has to pass the check to reach.
 
 ```
                        ┌─────────────────────────────────────────────┐
@@ -623,6 +737,8 @@ cannot be run.
 | `src/fetch.rs` | URL policy, guarded DNS, and HTML-to-text for `<ai-harness-fetch>` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `open.json`) |
 | `src/memory.rs` | The `.ai_harness/memory/` index: descriptions in the contract, bodies on demand |
+| `src/jobs.rs` | The `.ai_harness/jobs/` directories behind `background=true`: status, logs, and the startup sweep |
+| `src/stats.rs` | What a session did, counted from its transcript — and what deliberately is not counted, like the project check |
 | `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/ui.rs` | Rendering the transcript, live stream, and approval modal |

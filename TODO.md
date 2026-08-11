@@ -9,26 +9,11 @@ index in `src/memory.rs` is a more careful design than "put things in files".
 The other two are where the gaps are. Nothing here is ordered against the queue
 below.
 
+Two are **done**: background jobs (`<ai-harness-shell background=true>`,
+`src/jobs.rs`) and the verification step (`--check`, `App::should_check`). Both
+have a section under step 4 of `docs/request-lifecycle.md`.
+
 [post]: https://lilianweng.github.io/posts/2026-07-04-harness/
-
--   **Background jobs.** `exec::run_streaming` holds the turn open for the
-    command's lifetime, so there is no way to start a test run or a dev server
-    and keep working. A `background` attribute on `<ai-harness-shell>` that
-    returns a job id immediately and writes `cmd`/`stdout`/`stderr`/`status`
-    under `.ai_harness/jobs/<id>/`. The file part is the point rather than the
-    parallelism: `.ai_harness/` is not in `search::SKIP_DIRS`, so a job log is
-    already reachable by `<ai-harness-read>` and `<ai-harness-grep>` without
-    inventing a tag to inspect one. Fits the parked-then-spawned shape
-    `pending_fetch` already uses — park in `App`, spawn from `handle_update`,
-    generation-tag the updates.
-
--   **A verification step, to close the loop.** Plan mode is plan → execute, and
-    `<ai-harness-response>` ends the turn; nothing ever asks whether the change
-    worked. `src/stats.rs` counts what happened but no outcome feeds back. A
-    project-declared check command — from `AGENTS.md` or config — run after any
-    turn that produced a `WriteResult`, with failure coming back as a result
-    rather than ending the turn. Reuses the sandboxed exec path whole. Opt-in per
-    project, since it costs a round-trip on every writing turn.
 
 -   **Read-only subagents.** `src/sessions.rs` already holds a `Slot` per running
     conversation sharing one channel, which is most of the plumbing. The argument
@@ -44,8 +29,10 @@ below.
     past trajectories as things that belong on disk. `compaction-NNN.json` and
     the checkpoints are both recovery artifacts for the user — they sit under the
     root and are readable, but nothing says so. One line in the contract pointing
-    at the session folder makes prior-turn history greppable for near-zero
-    standing cost.
+    at the session folder would make prior-turn history reachable for near-zero
+    standing cost. Note that it would have to name paths: `.ai_harness/` is in
+    `search::SKIP_DIRS`, so a read gets in and a grep does not — the same
+    asymmetry the jobs section had to spell out.
 
 -   **Notes are write-only.** Eviction in `memory::within` is least-recently-
     modified first, and nothing ever revises or merges a note, so a long project

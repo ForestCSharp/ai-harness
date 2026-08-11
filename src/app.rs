@@ -48,6 +48,13 @@ pub enum Entry {
     },
     /// The outcome of a command the user allowed.
     CommandResult(Box<CommandOutput>),
+    /// The outcome of the project's `--check` command.
+    ///
+    /// Its own variant rather than a `CommandResult`, because [`crate::stats`]
+    /// counts results to say what the *model* did and this is something the
+    /// harness did on its own initiative. Folding them together would inflate
+    /// the shell count with commands nobody proposed and no one approved.
+    CheckResult(Box<CommandOutput>),
     /// The outcome of a file read. Unlike the others, no approval preceded it.
     ReadResult(ReadOutcome),
     /// The outcome of a grep or a glob. Like a read, no approval preceded it.
@@ -293,6 +300,9 @@ fn first_line(text: &str) -> &str {
 pub fn action_label(action: &Action) -> String {
     match action {
         Action::Shell(command) => command.clone(),
+        // Named as a job wherever an action has to be named, since the
+        // difference from the line above is entirely in what happens next.
+        Action::ShellBackground(command) => format!("{command}  (background)"),
         Action::Read {
             path,
             offset,
@@ -650,6 +660,39 @@ pub struct App {
     /// 64 KB of a single file, where a walk has no such bound. Running one
     /// inline would stall the redraw and `Esc` for as long as it took.
     pending_search: Option<crate::search::Request>,
+    /// A job `/jobs kill` asked to stop, parked for the event loop. Killing
+    /// needs the registry of task handles, which lives on `Ctx` — a session
+    /// cannot stop work any more than it can start it.
+    pending_job_kill: Option<String>,
+    /// The project's check command, from `--check`. `None` disables the whole
+    /// verification step, which is the default.
+    pub check_command: Option<String>,
+    /// Whether a file has been written since the check last ran.
+    ///
+    /// The loop guard, and the reason the check needs no retry counter of its
+    /// own. A failing check feeds back and the turn continues — but only while
+    /// the model is still *changing* things. A response that writes nothing
+    /// leaves this false and ends the turn, so "this was already broken, I am
+    /// not touching it" is a move the model can make, and a model that has run
+    /// out of ideas stops instead of looping to the iteration cap.
+    ///
+    /// Set by [`App::push_write_result`], cleared when a check starts and by
+    /// every new prompt.
+    wrote_since_check: bool,
+    /// The check parked for the event loop to spawn, like `pending_fetch`.
+    pending_check: Option<String>,
+    /// Jobs this session has going, for the status bar.
+    ///
+    /// The one job fact held in memory that is not a task handle, and it is a
+    /// **display hint, not an authority**: the cap in `jobs_are_full` and the
+    /// list in `jobs_state` both read the directory, because those decide
+    /// things. This only draws a number in the corner, so the worst a drift
+    /// costs is a wrong number there — which buys not doing a directory walk on
+    /// every keystroke, since the status bar is redrawn per frame.
+    ///
+    /// Starts at zero because `jobs::sweep` has just written off anything a
+    /// previous process left behind.
+    live_jobs: usize,
     /// A compaction worked out but whose summary `main` still has to fetch.
     ///
     /// Parked rather than run here for the reason a fetch is — it needs a
@@ -786,6 +829,11 @@ impl App {
             auto_approve: false,
             pending_fetch: None,
             pending_search: None,
+            pending_job_kill: None,
+            check_command: None,
+            wrote_since_check: false,
+            pending_check: None,
+            live_jobs: 0,
             pending_compaction: None,
             overflow_compacted: false,
             ledger: Ledger::default(),
@@ -960,6 +1008,14 @@ impl App {
         // is all that is needed; a spawned one is stopped by its cancel signal.
         self.pending_fetch = None;
         self.pending_search = None;
+        // A parked check belongs to the turn being abandoned, so it goes with
+        // it. `wrote_since_check` was already cleared when it was parked, so a
+        // cancelled check does not re-arm on the next response either — the
+        // turn simply ends unverified, which is what cancelling asked for.
+        self.pending_check = None;
+        // `pending_job_kill` is deliberately *not* cleared. Esc interrupts the
+        // turn; a job is not part of one, and a user who typed `/jobs kill`
+        // and then cancelled a request meant to stop the job either way.
         // A parked compaction has not touched `history`, so dropping it leaves
         // the conversation byte-identical — there is nothing to undo.
         self.pending_compaction = None;
@@ -1097,6 +1153,7 @@ impl App {
             // fetch or search.
             Command::Sessions => self.sessions_requested = true,
             Command::Memory => self.memory_report(),
+            Command::Jobs(arg) => self.jobs_command(arg),
             Command::Stats => self.stats = true,
             Command::Checkpoints(arg) => self.checkpoints_command(arg),
             Command::Reasoning => {
@@ -1328,6 +1385,10 @@ impl App {
             contract.push_str("\n\n");
             contract.push_str(&protocol::memory_section(&dir, index.as_deref()));
         }
+        if let Some((dir, lines, dropped)) = self.jobs_state() {
+            contract.push_str("\n\n");
+            contract.push_str(&protocol::jobs_section(&lines, &dir, dropped));
+        }
         if self.planning
             && let Some(path) = self.plan_path()
         {
@@ -1519,6 +1580,87 @@ impl App {
         self.push_notice(lines.join("\n"));
     }
 
+    /// `/jobs` — list them, or park a kill for the event loop.
+    ///
+    /// Listing is done here because it is a directory read. Killing is *not*:
+    /// stopping a job cleanly means signalling the task that holds it, and the
+    /// registry of those lives on `Ctx`. So the id is parked and the loop takes
+    /// it, exactly as a fetch, a search, and the sessions view are parked — a
+    /// session cannot start or stop work of its own.
+    fn jobs_command(&mut self, arg: Option<String>) {
+        let Some(root) = self.sandbox.as_ref().map(|s| s.root().to_path_buf()) else {
+            return self.push_notice("No jobs without a sandbox root.");
+        };
+
+        if let Some(arg) = arg {
+            let id = arg.trim().strip_prefix("kill").map(str::trim);
+            let Some(id) = id.filter(|id| !id.is_empty()) else {
+                return self.push_notice("Usage: /jobs, or /jobs kill <id>.");
+            };
+            // Checked here so a typo'd id is answered at once rather than
+            // parked, taken, and found missing a frame later.
+            if !crate::jobs::list(&root).iter().any(|job| job.id == id) {
+                return self.push_notice(format!("No job {id}. /jobs lists them."));
+            }
+            self.pending_job_kill = Some(id.to_string());
+            return;
+        }
+
+        let jobs = crate::jobs::list(&root);
+        if jobs.is_empty() {
+            return self.push_notice(format!(
+                "No background jobs. They live in {}, one directory each; start \
+                 one with a background=true shell command.",
+                crate::jobs::dir(&root).display()
+            ));
+        }
+        let running = jobs.iter().filter(|job| job.state.is_running()).count();
+        let mut lines = vec![format!(
+            "{} job(s) in {}, {running} running:",
+            jobs.len(),
+            crate::jobs::dir(&root).display()
+        )];
+        for job in &jobs {
+            // Marked rather than only stated, so a glance finds the live ones in
+            // a list that keeps its history.
+            let mark = if job.state.is_running() { "▸ " } else { "  " };
+            lines.push(format!(
+                "{mark}{}  {}  {}s  {}",
+                job.id,
+                job.state.as_line(),
+                job.elapsed_secs(),
+                job.summary()
+            ));
+        }
+        self.push_notice(lines.join("\n"));
+    }
+
+    /// How many jobs this session has going, for the status bar. See
+    /// [`App::live_jobs`] for why this is counted rather than read.
+    pub fn live_jobs(&self) -> usize {
+        self.live_jobs
+    }
+
+    /// A job started in this session.
+    pub fn note_job_started(&mut self) {
+        self.live_jobs += 1;
+    }
+
+    /// A job of this session's ended. Saturating, so a stray update — a job
+    /// reported twice, a session that adopted a conversation mid-flight — costs
+    /// a wrong number rather than a panic.
+    pub fn note_job_ended(&mut self) {
+        self.live_jobs = self.live_jobs.saturating_sub(1);
+    }
+
+    /// Take the job kill `/jobs kill` parked, if there is one.
+    ///
+    /// Taking it clears it, so a job is killed exactly once — the rule
+    /// [`App::take_pending_fetch`] follows.
+    pub fn take_pending_job_kill(&mut self) -> Option<String> {
+        self.pending_job_kill.take()
+    }
+
     /// The memory directory and its index, whenever there is a project to have
     /// memory about.
     ///
@@ -1542,6 +1684,70 @@ impl App {
             .to_string_lossy()
             .to_string();
         Some((shown, index))
+    }
+
+    /// The jobs worth a line in the contract, and how many were left out.
+    ///
+    /// `None` when there is nothing to say, so an absent section beats one
+    /// announcing its own emptiness — the rule [`crate::memory::index`] follows.
+    ///
+    /// **Which jobs.** Everything running, plus anything that finished recently.
+    /// A finished job has to appear at least once or the model never learns its
+    /// build landed; keeping it forever would mean paying for a project's whole
+    /// history on every round-trip. [`FINISHED_JOB_WINDOW`] is where that trade
+    /// is made.
+    fn jobs_state(&self) -> Option<(String, Vec<String>, usize)> {
+        /// How long a finished job keeps its line. Long enough that a turn which
+        /// started one and then did something else still hears the answer.
+        const FINISHED_JOB_WINDOW: u64 = 30 * 60;
+        /// Lines the section will carry. Past this the oldest go, since a job
+        /// nobody has collected in that long is not what this turn is about.
+        const MAX_LINES: usize = 12;
+
+        let root = self.sandbox.as_ref()?.root();
+        let now = crate::session::now_secs();
+        let worth_listing: Vec<crate::jobs::Job> = crate::jobs::list(root)
+            .into_iter()
+            .filter(|job| {
+                job.state.is_running()
+                    || job
+                        .ended
+                        .is_some_and(|at| now.saturating_sub(at) < FINISHED_JOB_WINDOW)
+            })
+            .collect();
+        if worth_listing.is_empty() {
+            return None;
+        }
+
+        // Newest first out of the boat, then back into id order for reading —
+        // the same two-step `memory::within` does, for the same reason.
+        let dropped = worth_listing.len().saturating_sub(MAX_LINES);
+        let mut kept: Vec<&crate::jobs::Job> = worth_listing.iter().collect();
+        kept.sort_by(|a, b| b.id.cmp(&a.id));
+        kept.truncate(MAX_LINES);
+        kept.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let lines = kept
+            .into_iter()
+            .map(|job| {
+                format!(
+                    "{} — {} — {} ({}s)",
+                    job.id,
+                    job.state.as_line(),
+                    job.summary(),
+                    job.elapsed_secs()
+                )
+            })
+            .collect();
+        let dir = crate::jobs::dir(root);
+        // Relative to the root, like every other path the model is handed, and
+        // what it has to pass back to a read.
+        let shown = dir
+            .strip_prefix(root)
+            .unwrap_or(&dir)
+            .to_string_lossy()
+            .to_string();
+        Some((shown, lines, dropped))
     }
 
     /// Snapshot the current session for persistence. Pure.
@@ -2339,6 +2545,10 @@ impl App {
         // A new prompt re-arms the overflow retry. Nothing within a turn does,
         // which is what keeps a compact-and-resend from becoming a loop.
         self.overflow_compacted = false;
+        // And re-arms the check, which is scoped to a turn for the same reason:
+        // whatever the last turn wrote has already been checked, and a new
+        // prompt that writes nothing should not inherit a run it did not earn.
+        self.wrote_since_check = false;
         self.turn_start_bytes = self.history_bytes();
         // The turn this prompt opens. Counts prompts, not checkpoints, so a
         // checkpoint's number is the ordinal of the thing that was typed — which
@@ -2421,6 +2631,22 @@ impl App {
         }
 
         match action {
+            // The turn wrote something and this project has a check. Run it
+            // before the answer is allowed to stand — this is the whole
+            // verification step, and it sits ahead of both `Response` arms
+            // because either of them would otherwise end the turn first.
+            Action::Response(_) if self.should_check() => {
+                let command = self.check_command.clone().expect("should_check checked");
+                // Cleared here rather than when the result lands, so a check
+                // that is cancelled or fails to start does not leave the turn
+                // armed to run it again on the next response.
+                self.wrote_since_check = false;
+                self.pending_check = Some(command);
+                // The live window is the spawner's to open, exactly as it is
+                // for an approved command; `App` parks and sets its own status.
+                self.status = Status::Running;
+                self.follow = true;
+            }
             // In plan mode a final answer means the plan is ready, so the turn
             // ends on the question that follows from it rather than on nothing.
             // Only when a plan was actually written: a model that answers
@@ -2545,6 +2771,17 @@ impl App {
                     timed_out: false,
                     cancelled: false,
                 }));
+            }
+            // Too many jobs already. Refused here for the same reason plan mode
+            // refuses a write above: the user is never asked to approve
+            // something that was not going to run, and the model gets a reason
+            // it can act on rather than a command that silently never started.
+            Action::ShellBackground(_) if self.jobs_are_full() => {
+                let refusal = protocol::encode_job_refused(
+                    self.running_jobs().len(),
+                    crate::jobs::MAX_CONCURRENT,
+                );
+                return Some(self.push_raw_result(refusal));
             }
             // An edit is resolved against the file *before* the modal, so a
             // hopeless one (no match, ambiguous) never bothers the user — it goes
@@ -2966,6 +3203,9 @@ impl App {
     /// No busy guard of its own: `/undo` is the only way here, and
     /// [`App::submit`] refuses it while a turn is in flight — one place decides.
     fn begin_undo(&mut self) {
+        if let Some(reason) = self.restore_blocked_by_jobs() {
+            return self.push_notice(reason);
+        }
         let Some(folder) = self.checkpoint_folder() else {
             return self.push_notice("Nothing to undo.");
         };
@@ -2988,6 +3228,33 @@ impl App {
             }),
         };
         self.follow = true;
+    }
+
+    /// Why a restore cannot go ahead right now, or `None`.
+    ///
+    /// A checkpoint is taken *before* an action runs, and a job keeps writing
+    /// after that — so restoring one while a job is going would put the
+    /// workspace back to a moment the job has already moved past, and then let
+    /// the job keep writing into it. The result is neither the old tree nor the
+    /// new one.
+    ///
+    /// Refused rather than warned about, because the failure is silent: the
+    /// files would look restored and go wrong later. This is the one place the
+    /// feature makes an existing guarantee weaker, and it is worth saying out
+    /// loud rather than papering over.
+    fn restore_blocked_by_jobs(&self) -> Option<String> {
+        let running = self.running_jobs();
+        if running.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = running.iter().map(|job| job.id.clone()).collect();
+        Some(format!(
+            "Cannot restore while {} background job(s) are running ({}) — \
+             they would keep writing into the restored files. Stop them with \
+             /jobs kill <id>, or wait for them to finish.",
+            running.len(),
+            names.join(", ")
+        ))
     }
 
     /// The checkpoint `/undo` is offering to restore, if the modal is up.
@@ -3151,6 +3418,9 @@ impl App {
     ///
     /// Refused mid-turn by [`App::submit`], as `/undo` is.
     fn open_rewind(&mut self) {
+        if let Some(reason) = self.restore_blocked_by_jobs() {
+            return self.push_notice(reason);
+        }
         let rows = self.rewind_rows();
         if rows.is_empty() {
             return self.push_notice("Nothing to rewind — this conversation has no prompts yet.");
@@ -3481,6 +3751,124 @@ impl App {
         self.history.clone()
     }
 
+    /// Whether this response should be checked before it is allowed to end the
+    /// turn.
+    ///
+    /// Three conditions, and each rules out a case that would otherwise cost a
+    /// command run for nothing:
+    ///
+    /// - a command is configured at all,
+    /// - a write has landed since the last check — the loop guard documented on
+    ///   [`App::wrote_since_check`],
+    /// - plan mode is off. A plan is written through the ordinary write path and
+    ///   produces a `WriteResult` like any other, but a plan is prose and there
+    ///   is nothing to compile. Without this the check would run on every
+    ///   planning turn.
+    ///
+    /// Deliberately **not** a condition: the `iterations` budget. A spent budget
+    /// stops the loop continuing, not the check running — see
+    /// [`App::finish_check`], which reports to the user instead of resending.
+    fn should_check(&self) -> bool {
+        self.check_command.is_some() && self.wrote_since_check && !self.planning
+    }
+
+    /// Take the check the dispatch parked, if there is one.
+    ///
+    /// Taking it clears it, so a check is spawned exactly once — the rule
+    /// [`App::take_pending_fetch`] follows.
+    pub fn take_pending_check(&mut self) -> Option<String> {
+        self.pending_check.take()
+    }
+
+    /// Fold in the check's outcome, and say whether the turn continues.
+    ///
+    /// `Some(messages)` means the check failed and the model is being asked to
+    /// answer for it; `None` means the turn is over, whether it passed or
+    /// whether there was no room left to react.
+    ///
+    /// The response the model already gave is **not** withdrawn. It is in the
+    /// transcript above this result, and rewriting history to hide an answer the
+    /// user has already read would be a worse lie than showing it followed by
+    /// the check that contradicted it.
+    pub fn finish_check(&mut self, command: &str, output: CommandOutput) -> Option<Vec<Message>> {
+        self.running = None;
+        let passed = output.succeeded();
+        let summary = output.summary();
+        self.transcript.push(Entry::CheckResult(Box::new(output)));
+
+        if passed {
+            self.status = Status::Idle;
+            return None;
+        }
+
+        // Out of budget: the check still ran — knowing whether the tree builds
+        // is worth one command on the way out — but there is no room to ask the
+        // model about it, so the user gets the last word instead of a silent
+        // stop.
+        if self.iterations >= self.max_iterations {
+            self.push_notice(format!(
+                "The project check is still failing ({summary}) and this turn is \
+                 out of round-trips. Send another prompt to keep going."
+            ));
+            self.status = Status::Idle;
+            return None;
+        }
+
+        let Entry::CheckResult(output) = self.transcript.last().expect("just pushed") else {
+            unreachable!("just pushed a check result")
+        };
+        let encoded = protocol::encode_check_result(command, output);
+        Some(self.push_raw_result(encoded))
+    }
+
+    /// The check could not be started at all — the binary is missing, the shell
+    /// failed to spawn. Reported to the user and stepped over.
+    ///
+    /// Not sent to the model: a check that never ran says nothing about the
+    /// change, and handing over a spawn error would have it debugging the
+    /// user's configuration instead of its own work.
+    pub fn check_failed_to_start(&mut self, message: String) {
+        self.running = None;
+        self.push_notice(format!(
+            "The project check could not be run ({message}); this turn was not \
+             verified. Check --check."
+        ));
+        self.status = Status::Idle;
+    }
+
+    /// Feed the model a result the harness composed itself, and resend.
+    ///
+    /// The tail of [`App::push_command_result`] without a `CommandOutput` to
+    /// hang it on: a job that started, or one refused for want of a slot, is an
+    /// outcome with no command output behind it. No transcript `Entry` — the
+    /// `Entry::Action` for the job is already there and says everything a second
+    /// row would, and the notice a started job posts says the rest.
+    pub fn push_raw_result(&mut self, encoded: String) -> Vec<Message> {
+        self.frame(Direction::Sent, encoded.clone());
+        self.history.push(Message::user(encoded));
+        self.status = Status::Waiting;
+        self.follow = true;
+        self.history.clone()
+    }
+
+    /// The jobs this project has running, or an empty list when there is no
+    /// sandbox to look under.
+    ///
+    /// Read from disk on each call rather than cached, the rule `plan_path` and
+    /// `memory_state` follow: jobs finish on their own schedule, and a cached
+    /// count would be wrong within seconds of being taken.
+    pub fn running_jobs(&self) -> Vec<crate::jobs::Job> {
+        match &self.sandbox {
+            Some(sandbox) => crate::jobs::running(sandbox.root()),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether another job would exceed the cap.
+    fn jobs_are_full(&self) -> bool {
+        self.running_jobs().len() >= crate::jobs::MAX_CONCURRENT
+    }
+
     /// Take the `/sessions` request, if one was parked. Taking it clears it, so
     /// the view opens once.
     pub fn take_sessions_request(&mut self) -> bool {
@@ -3748,6 +4136,10 @@ impl App {
     /// Record a finished write and hand the result back to the model.
     pub fn push_write_result(&mut self, outcome: WriteOutcome) -> Vec<Message> {
         let encoded = protocol::encode_write_result(&outcome.path, outcome.as_result());
+        // Only a write that *landed* arms the check. A refusal — plan mode, an
+        // unindexable note, a sandbox denial — changed nothing, so there is
+        // nothing to verify and running the command would be pure cost.
+        self.wrote_since_check |= outcome.succeeded();
         self.transcript.push(Entry::WriteResult(outcome));
         self.frame(Direction::Sent, encoded.clone());
         self.history.push(Message::user(encoded));
@@ -9681,5 +10073,598 @@ mod memory_tests {
         app.refresh_contract();
         assert!(!contract(&app).contains("Project conventions"));
         assert!(!contract(&app).contains("Project memory"));
+    }
+}
+
+/// Background jobs, from the app's side: what the contract says about them,
+/// what the cap does, and what they stop you doing while they run. All need a
+/// real sandbox, since a job is keyed on the project root.
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn app_in_temp() -> (App, std::path::PathBuf) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let unique = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ai-harness-jobs-app-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
+        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.refresh_contract();
+        (app, dir)
+    }
+
+    fn contract(app: &App) -> &str {
+        &app.history[0].content
+    }
+
+    /// Send a prompt, so there is a turn for a reply to land in.
+    fn start_turn(app: &mut App) {
+        app.input.insert_str("do the thing");
+        app.submit().unwrap();
+    }
+
+    #[test]
+    fn a_project_with_no_jobs_has_no_jobs_section() {
+        let (app, dir) = app_in_temp();
+        assert!(
+            !contract(&app).contains("Background jobs"),
+            "an absent section beats one announcing its own emptiness"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_running_job_is_named_in_the_contract() {
+        let (mut app, dir) = app_in_temp();
+        crate::jobs::create(&dir, "cargo test --all").unwrap();
+        app.refresh_contract();
+
+        let contract = contract(&app);
+        assert!(contract.contains("Background jobs"), "{contract}");
+        assert!(contract.contains("cargo test --all"), "{contract}");
+        assert!(contract.contains("running"), "{contract}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.ai_harness/` is in `search::SKIP_DIRS`, so a grep or glob aimed at a
+    /// job log matches nothing — and a model that greps a failed build's stderr,
+    /// finds nothing, and reports it clean has failed silently. The contract has
+    /// to say which tool works, and this is the guard on that.
+    #[test]
+    fn the_contract_says_reads_reach_jobs_and_searches_do_not() {
+        let (mut app, dir) = app_in_temp();
+        crate::jobs::create(&dir, "cargo build").unwrap();
+        app.refresh_contract();
+        let contract = contract(&app);
+
+        let section = contract
+            .split("Background jobs")
+            .nth(1)
+            .expect("the section is there");
+        assert!(
+            section.contains(crate::protocol::READ_TAG),
+            "it must name the tag that works: {section}"
+        );
+        assert!(
+            section.contains("do **not** reach"),
+            "and say outright that searches do not: {section}"
+        );
+
+        // The premise, checked against the real list rather than restated: if
+        // the skip is ever lifted, this test should fail and the wording change.
+        assert!(
+            crate::search::SKIP_DIRS.contains(&crate::config::HARNESS_DIR),
+            "the jobs section's wording depends on this skip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that finished has to be reported at least once, or a model that
+    /// started a build never learns it landed. It ages out later; the point
+    /// here is that finishing does not silently remove it.
+    #[test]
+    fn a_job_that_just_finished_is_still_listed() {
+        let (mut app, dir) = app_in_temp();
+        let handle = crate::jobs::create(&dir, "make release").unwrap();
+        handle.finish(crate::jobs::State::Exited(0));
+        app.refresh_contract();
+
+        let contract = contract(&app);
+        assert!(contract.contains("make release"), "{contract}");
+        assert!(contract.contains("exit 0"), "{contract}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The contract is rebuilt from disk per prompt, like the memory index —
+    /// so a job that ends mid-session is current by the next prompt without
+    /// anything having to invalidate a cache.
+    #[test]
+    fn the_section_follows_the_directory_rather_than_a_cache() {
+        let (mut app, dir) = app_in_temp();
+        let handle = crate::jobs::create(&dir, "sleep 100").unwrap();
+        app.refresh_contract();
+        assert!(contract(&app).contains("running"));
+
+        handle.finish(crate::jobs::State::Exited(1));
+        app.refresh_contract();
+        let contract = contract(&app);
+        assert!(contract.contains("exit 1"), "{contract}");
+        assert!(
+            !contract.contains("— running —"),
+            "the stale state must be gone: {contract}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the cap the model is answered rather than the user asked: a
+    /// refusal it can act on beats a modal for something that will not run.
+    #[test]
+    fn past_the_cap_a_job_is_refused_as_a_result_not_a_modal() {
+        let (mut app, dir) = app_in_temp();
+        for i in 0..crate::jobs::MAX_CONCURRENT {
+            crate::jobs::create(&dir, &format!("job {i}")).unwrap();
+        }
+        start_turn(&mut app);
+
+        let messages = app.push_response(
+            "<ai-harness-shell background=true>one too many</ai-harness-shell>".into(),
+            None,
+        );
+        assert!(
+            messages.is_some(),
+            "the refusal should go straight back to the model"
+        );
+        assert!(
+            app.pending().is_none(),
+            "the user must not be asked about a job that cannot start"
+        );
+        let last = &app.history.last().unwrap().content;
+        assert!(last.contains("not started"), "{last}");
+        assert!(last.contains("limit"), "{last}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under the cap it is an ordinary approvable action — a job is still a
+    /// shell command, and nothing about running unattended skips the modal.
+    #[test]
+    fn under_the_cap_a_job_still_asks() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+
+        let messages = app.push_response(
+            "<ai-harness-shell background=true>cargo test</ai-harness-shell>".into(),
+            None,
+        );
+        assert!(messages.is_none(), "it waits for the user");
+        assert_eq!(
+            app.pending().map(|p| p.action.clone()),
+            Some(Action::ShellBackground("cargo test".into()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpoint is taken before an action runs and a job keeps writing
+    /// after that, so restoring one mid-job would leave neither the old tree
+    /// nor the new one. Refused rather than warned about: the damage is silent.
+    #[test]
+    fn undo_and_rewind_refuse_while_a_job_runs() {
+        let (mut app, dir) = app_in_temp();
+        let handle = crate::jobs::create(&dir, "cargo build").unwrap();
+
+        for command in [Command::Undo, Command::Rewind] {
+            app.run_command(command);
+            let last = app.transcript.last().expect("a notice");
+            match last {
+                Entry::Notice(text) => {
+                    assert!(text.contains("Cannot restore"), "{text}");
+                    assert!(text.contains(&handle.id), "it should name the job: {text}");
+                }
+                other => panic!("expected a notice, got {other:?}"),
+            }
+            assert!(app.pending_undo().is_none(), "no modal should be up");
+            assert!(app.rewind().is_none(), "no list should be open");
+        }
+
+        // And once it is done, the guard lifts.
+        handle.finish(crate::jobs::State::Exited(0));
+        app.run_command(Command::Undo);
+        match app.transcript.last().expect("a notice") {
+            Entry::Notice(text) => assert!(
+                !text.contains("Cannot restore"),
+                "the guard should have lifted: {text}"
+            ),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jobs_lists_them_and_marks_the_running_ones() {
+        let (mut app, dir) = app_in_temp();
+        crate::jobs::create(&dir, "sleep 100").unwrap();
+        crate::jobs::create(&dir, "true")
+            .unwrap()
+            .finish(crate::jobs::State::Exited(0));
+
+        app.run_command(Command::Jobs(None));
+        match app.transcript.last().expect("a notice") {
+            Entry::Notice(text) => {
+                assert!(text.contains("2 job(s)"), "{text}");
+                assert!(text.contains("1 running"), "{text}");
+                assert!(text.contains("sleep 100"), "{text}");
+                assert!(text.contains("exit 0"), "{text}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kill is parked for the event loop rather than done here, since
+    /// stopping a job means reaching the registry of task handles.
+    #[test]
+    fn jobs_kill_parks_the_id() {
+        let (mut app, dir) = app_in_temp();
+        let handle = crate::jobs::create(&dir, "sleep 100").unwrap();
+
+        app.run_command(Command::Jobs(Some(format!("kill {}", handle.id))));
+        assert_eq!(
+            app.take_pending_job_kill().as_deref(),
+            Some(handle.id.as_str())
+        );
+        assert!(
+            app.take_pending_job_kill().is_none(),
+            "taking it clears it, so a job is killed once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answered here rather than parked, taken, and found missing a frame
+    /// later — a typo should not travel.
+    #[test]
+    fn killing_a_job_that_does_not_exist_says_so_at_once() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Jobs(Some("kill 1-999".into())));
+
+        assert!(app.take_pending_job_kill().is_none());
+        match app.transcript.last().expect("a notice") {
+            Entry::Notice(text) => assert!(text.contains("No job 1-999"), "{text}"),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Esc interrupts a turn; a job is not part of one. A kill typed and then
+    /// cancelled was still meant.
+    #[test]
+    fn cancelling_a_turn_does_not_cancel_a_parked_kill() {
+        let (mut app, dir) = app_in_temp();
+        let handle = crate::jobs::create(&dir, "sleep 100").unwrap();
+        start_turn(&mut app);
+        app.run_command(Command::Jobs(Some(format!("kill {}", handle.id))));
+
+        app.cancel();
+        assert_eq!(
+            app.take_pending_job_kill().as_deref(),
+            Some(handle.id.as_str()),
+            "a job kill outlives the turn, exactly as the job does"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The verification step: whether a turn that changed files gets to end on the
+/// model's word, or has to answer to `--check` first.
+#[cfg(test)]
+mod check_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn app_in_temp() -> (App, std::path::PathBuf) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let unique = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ai-harness-check-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
+        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.check_command = Some("cargo check".into());
+        app.refresh_contract();
+        (app, dir)
+    }
+
+    fn start_turn(app: &mut App) {
+        app.input.insert_str("change something");
+        app.submit().unwrap();
+    }
+
+    /// Put the app in the state a landed write leaves it in, without going
+    /// through approval and execution.
+    fn wrote(app: &mut App) {
+        app.push_write_result(WriteOutcome {
+            path: "src/x.rs".into(),
+            bytes: 10,
+            error: None,
+            timed_out: false,
+            cancelled: false,
+        });
+    }
+
+    fn respond(app: &mut App) -> Option<Vec<Message>> {
+        app.push_response(
+            "<ai-harness-response><ai-harness-response-text>done\
+             </ai-harness-response-text><ai-harness-memory/></ai-harness-response>"
+                .into(),
+            None,
+        )
+    }
+
+    fn passing() -> CommandOutput {
+        CommandOutput {
+            command: "cargo check".into(),
+            exit_code: Some(0),
+            stdout: "ok".into(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+            cancelled: false,
+        }
+    }
+
+    fn failing() -> CommandOutput {
+        CommandOutput {
+            exit_code: Some(1),
+            stderr: "error[E0308]: mismatched types".into(),
+            ..passing()
+        }
+    }
+
+    #[test]
+    fn a_turn_that_wrote_runs_the_check_instead_of_ending() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+
+        assert_eq!(app.take_pending_check().as_deref(), Some("cargo check"));
+        assert_eq!(app.status, Status::Running, "the turn has not ended");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_turn_that_wrote_nothing_ends_as_it_always_did() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        respond(&mut app);
+
+        assert!(app.take_pending_check().is_none());
+        assert_eq!(app.status, Status::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_configured_command_nothing_changes() {
+        let (mut app, dir) = app_in_temp();
+        app.check_command = None;
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+
+        assert!(app.take_pending_check().is_none());
+        assert_eq!(app.status, Status::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plan is written through the ordinary write path, so it produces a
+    /// `WriteResult` like any other — but a plan is prose, and there is nothing
+    /// to compile. Without this the check would run on every planning turn.
+    #[test]
+    fn plan_mode_does_not_run_the_check() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Plan(None));
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+
+        assert!(app.take_pending_check().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refused write changed nothing, so there is nothing to verify and the
+    /// command would be pure cost.
+    #[test]
+    fn a_write_that_failed_does_not_arm_the_check() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        app.push_write_result(WriteOutcome {
+            path: "src/x.rs".into(),
+            bytes: 0,
+            error: Some("denied by the sandbox".into()),
+            timed_out: false,
+            cancelled: false,
+        });
+        respond(&mut app);
+
+        assert!(app.take_pending_check().is_none());
+        assert_eq!(app.status, Status::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_passing_check_ends_the_turn() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+        app.take_pending_check();
+
+        assert!(
+            app.finish_check("cargo check", passing()).is_none(),
+            "nothing to say to the model"
+        );
+        assert_eq!(app.status, Status::Idle);
+        assert!(matches!(app.transcript.last(), Some(Entry::CheckResult(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_check_goes_back_to_the_model() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+        app.take_pending_check();
+
+        let messages = app
+            .finish_check("cargo check", failing())
+            .expect("the loop continues");
+        assert_eq!(app.status, Status::Waiting);
+        let last = &messages.last().unwrap().content;
+        assert!(last.contains("the project check failed"), "{last}");
+        assert!(last.contains("E0308"), "the error must reach it: {last}");
+        // And the way out, without which an unbounded loop has no floor.
+        assert!(last.contains("ends the turn"), "{last}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The loop guard.** Retries are bounded only by the iteration budget, so
+    /// what stops a model that has run out of ideas is that answering again
+    /// without changing anything ends the turn. Without this the harness would
+    /// re-run the check on every response and burn the whole budget on a failure
+    /// nobody is fixing.
+    #[test]
+    fn responding_again_without_writing_ends_the_turn() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+        app.take_pending_check();
+        app.finish_check("cargo check", failing())
+            .expect("first failure feeds back");
+
+        // The model answers again, having changed nothing.
+        respond(&mut app);
+        assert!(
+            app.take_pending_check().is_none(),
+            "no write since the last check, so no second run"
+        );
+        assert_eq!(app.status, Status::Idle, "the turn ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the other half of the guard: a model that *is* still working gets
+    /// checked again, for as long as it keeps changing files.
+    #[test]
+    fn writing_again_re_arms_the_check() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+        app.take_pending_check();
+        app.finish_check("cargo check", failing());
+
+        wrote(&mut app);
+        respond(&mut app);
+        assert_eq!(
+            app.take_pending_check().as_deref(),
+            Some("cargo check"),
+            "a fresh write earns a fresh check"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The budget gates the *resend*, not the run: knowing whether the tree
+    /// builds is worth one command on the way out, but there is no room left to
+    /// ask the model about it.
+    #[test]
+    fn out_of_budget_the_check_runs_but_does_not_resend() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+        app.take_pending_check();
+        app.iterations = app.max_iterations;
+
+        assert!(
+            app.finish_check("cargo check", failing()).is_none(),
+            "no room to continue the loop"
+        );
+        assert_eq!(app.status, Status::Idle);
+        let notice = app
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Notice(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the user is told");
+        assert!(notice.contains("still failing"), "{notice}");
+        assert!(notice.contains("out of round-trips"), "{notice}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A check that never ran says nothing about the change, so the model is
+    /// not handed the user's configuration problem to debug.
+    #[test]
+    fn a_check_that_cannot_start_is_reported_and_stepped_over() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+        app.take_pending_check();
+
+        app.check_failed_to_start("no such file".into());
+        assert_eq!(app.status, Status::Idle);
+        match app.transcript.last().expect("a notice") {
+            Entry::Notice(text) => {
+                assert!(text.contains("could not be run"), "{text}");
+                assert!(text.contains("--check"), "it should name the flag: {text}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling drops the parked check with the turn. It must not re-arm
+    /// afterwards, or Esc would be followed by a check nobody is waiting on.
+    #[test]
+    fn cancelling_the_turn_drops_the_check() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+        respond(&mut app);
+
+        app.cancel();
+        assert!(app.take_pending_check().is_none());
+
+        // And a later response does not resurrect it: the write that armed it
+        // was already accounted for.
+        respond(&mut app);
+        assert!(app.take_pending_check().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/stats` reports what the model did. A check is the harness's own doing,
+    /// and counting it would inflate the shell count with commands nobody
+    /// proposed.
+    #[test]
+    fn a_check_is_not_counted_as_a_shell_the_model_ran() {
+        let transcript = vec![
+            Entry::CommandResult(Box::new(passing())),
+            Entry::CheckResult(Box::new(passing())),
+        ];
+        let counts = crate::stats::actions(&transcript);
+        assert_eq!(counts.shells, 1, "only the model's command counts");
     }
 }

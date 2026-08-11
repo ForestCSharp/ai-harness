@@ -52,6 +52,12 @@ pub fn actions(transcript: &[Entry]) -> Actions {
             Entry::SearchResult(_) => counts.searches += 1,
             Entry::FetchResult(_) => counts.fetches += 1,
             Entry::CommandResult(_) => counts.shells += 1,
+            // Named rather than left to the catch-all, because leaving it there
+            // would read as an oversight. A check is a command the *harness*
+            // ran on its own initiative; this page is what the model did, and
+            // counting it would inflate the shell count with commands nobody
+            // proposed and nobody approved.
+            Entry::CheckResult(_) => {}
             // A write that failed — refused by the sandbox, timed out — is not a
             // write. It is visible in the transcript as its own error.
             Entry::WriteResult(outcome) if outcome.succeeded() => counts.writes += 1,

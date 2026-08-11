@@ -9,6 +9,7 @@ mod fetch;
 mod files;
 mod highlight;
 mod input;
+mod jobs;
 mod ledger;
 mod markdown;
 mod memory;
@@ -23,8 +24,9 @@ mod tui;
 mod ui;
 mod wrap;
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -61,6 +63,10 @@ enum Update {
     CommandChunk(exec::Chunk),
     /// A sandboxed command finished, or failed to start.
     Command(Result<CommandOutput, String>),
+    /// The project's check command finished, or failed to start. The command
+    /// rides along because the result the model is shown names it, and by the
+    /// time this lands `App` has already cleared what it was running.
+    Check(String, Result<CommandOutput, String>),
     /// A sandboxed file write finished, or failed to start.
     Write(Result<WriteOutcome, String>),
     /// A URL fetch finished. Refusals and HTTP errors arrive as a `FetchOutcome`
@@ -73,6 +79,9 @@ enum Update {
     /// along because the app handed it out to be spawned and needs it back to
     /// apply — which is also what keeps `history` untouched until this lands.
     Summary(Box<(compact::Job, Result<Completion, String>)>),
+    /// A background job finished. Like the catalog, this belongs to no turn —
+    /// see the generation note in [`route_update`].
+    Job { id: String, state: jobs::State },
     /// The model catalog arrived, or the reason it did not. Unlike every other
     /// update this belongs to no turn — see [`handle_update`].
     Models(Result<Vec<openrouter::ModelInfo>, String>),
@@ -90,6 +99,20 @@ struct Tagged {
     update: Update,
 }
 
+/// The handles needed to stop running jobs, by job id.
+///
+/// The *only* thing about a job the harness keeps in memory — everything else
+/// (command, status, output, timing) is read from the job's directory when it is
+/// wanted. That split is the point of the feature rather than an implementation
+/// detail: a fact kept in two places goes stale in one of them, and the
+/// filesystem is the copy that survives a reload, a second session, and a
+/// restart.
+///
+/// Process-scoped rather than per-`App`: a job outlives the turn that started it
+/// and the session it started in, and the quit path has to be able to reach every
+/// one of them from a single place.
+type JobRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
+
 /// Shared context the event handlers need to start new background work.
 struct Ctx {
     client: Client,
@@ -99,6 +122,11 @@ struct Ctx {
     /// the API-key-bearing client is never pointed at a model-chosen URL.
     fetcher: Fetcher,
     timeout: Duration,
+    /// Wall-clock ceiling on a background job. Not `timeout`, which is an *idle*
+    /// bound on a foreground command: the two answer different questions, and a
+    /// job's whole point may be to sit quiet.
+    job_ceiling: Duration,
+    jobs: JobRegistry,
     tx: mpsc::Sender<Tagged>,
 }
 
@@ -147,6 +175,7 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         args.max_turn_bytes
     };
     app.compact_at = args.compact_at;
+    app.check_command = args.check.clone();
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
@@ -165,6 +194,17 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         );
     }
 
+    // Anything a previous harness left running is written off before the first
+    // contract is built. The child died with that process; a `running` left on
+    // disk is a claim about something that is not there, and it would both
+    // mislead the model and count against the concurrency cap.
+    let abandoned = jobs::sweep(&sandbox_root);
+    if abandoned > 0 {
+        app.push_notice(format!(
+            "{abandoned} background job(s) from a previous run were marked abandoned."
+        ));
+    }
+
     let mut events = EventStream::new();
     let (tx, mut rx) = mpsc::channel::<Tagged>(8);
     let ctx = Ctx {
@@ -174,6 +214,8 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         // loosened one is `#[cfg(test)]` and does not exist in this binary.
         fetcher: Fetcher::new(fetch::Policy::strict(args.timeout()))?,
         timeout: args.timeout(),
+        job_ceiling: args.job_ceiling(),
+        jobs: JobRegistry::default(),
         tx,
     };
     spawn_catalog_fetch(&ctx);
@@ -245,6 +287,19 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                 if let Some(name) = sessions.app_mut().take_requested_open() {
                     sessions.reveal(name);
                 }
+                // `/jobs kill` parks an id, since stopping a job means reaching
+                // the registry of task handles and that belongs to the harness.
+                if let Some(job) = sessions.app_mut().take_pending_job_kill() {
+                    let stopped = kill_job(&ctx, &job);
+                    sessions.app_mut().push_notice(if stopped {
+                        format!("Killed job {job}.")
+                    } else {
+                        // Not an error: the job finished between the command
+                        // being typed and this line running, which is a race the
+                        // user cannot lose anything to.
+                        format!("Job {job} was not running.")
+                    });
+                }
                 dirty = true;
             }
 
@@ -294,6 +349,15 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         sessions.sync_open_set();
 
         if sessions.app().should_quit {
+            // Jobs go first, and they go by handle rather than by pid: the task
+            // holding one kills the whole process group, which is what reaps
+            // grandchildren. `kill_on_drop` would catch most of this anyway, but
+            // "most" leaves a build running after the terminal is gone.
+            if let Ok(mut registry) = ctx.jobs.lock() {
+                for (_, cancel) in registry.drain() {
+                    let _ = cancel.send(());
+                }
+            }
             // Leaving takes every session with it, so nothing in flight is left
             // running and nothing unsaved is left behind.
             for slot in sessions.iter_mut() {
@@ -326,7 +390,13 @@ fn route_update(tagged: Tagged, sessions: &mut Sessions, ctx: &Ctx) {
     let Some(slot) = sessions.route(tagged.session) else {
         return;
     };
-    if tagged.generation != slot.app.generation() {
+    // A job outlives the turn that started it, so the generation it was born
+    // under says nothing about whether its result still matters — and every
+    // `Esc` between then and now bumped that counter. Checking it here would
+    // discard the completion of a job that ran perfectly, silently, which is
+    // the one outcome worse than not having jobs at all.
+    let outlives_its_turn = matches!(tagged.update, Update::Job { .. });
+    if !outlives_its_turn && tagged.generation != slot.app.generation() {
         return;
     }
     let id = slot.id;
@@ -344,6 +414,14 @@ fn handle_update(
     match tagged.update {
         // Routed away above; the arm exists to keep the match exhaustive.
         Update::Models(_) => {}
+        // A job ended. Said in the transcript and nowhere else: the model is
+        // told by the contract on its next prompt, and pushing a result here
+        // would restart a turn the user has already watched end — possibly
+        // while they are halfway through typing something unrelated.
+        Update::Job { id, state } => {
+            app.note_job_ended();
+            app.push_notice(format!("Job {id} finished: {}.", state.as_line()));
+        }
         // Live tokens accumulate in the display-only streaming buffer.
         Update::Delta(delta) => app.push_delta(&delta),
         Update::Reasoning(delta) => app.push_reasoning(&delta),
@@ -363,6 +441,11 @@ fn handle_update(
                         spawn_fetch(id, app, ctx, inflight, url);
                     } else if let Some(request) = app.take_pending_search() {
                         spawn_search(id, app, ctx, inflight, request);
+                    // A response that wrote something parks the project check
+                    // instead of ending the turn. Same reason as the two above:
+                    // the app layer cannot start work of its own.
+                    } else if let Some(command) = app.take_pending_check() {
+                        spawn_check(id, app, ctx, inflight, command);
                     // Under `--auto-approve` the modal is skipped: the app still
                     // parked a `Pending` exactly as it always does, and the
                     // decision to act on it is made here. `else if` rather than a
@@ -398,6 +481,21 @@ fn handle_update(
         Update::Command(Err(message)) => {
             *inflight = None;
             app.push_error(format!("could not run command: {message}"));
+        }
+        // The project check. Passing ends the turn; failing feeds the model and
+        // the loop carries on, which is the whole verification step.
+        Update::Check(command, Ok(output)) => {
+            *inflight = None;
+            if let Some(messages) = app.finish_check(&command, output) {
+                spawn_request(id, app, ctx, inflight, messages);
+            }
+        }
+        // A check that never started says nothing about the change, so it is
+        // reported to the user and the turn ends rather than handing the model
+        // the user's configuration problem to debug.
+        Update::Check(_, Err(message)) => {
+            *inflight = None;
+            app.check_failed_to_start(message);
         }
         // A finished write does the same — its result feeds the loop.
         Update::Write(Ok(outcome)) => {
@@ -830,6 +928,15 @@ fn allow(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
         return;
     }
 
+    // A job is the one approved action that does not end with the model waiting
+    // on it: it is started, and the turn carries straight on with the id.
+    if let Action::ShellBackground(command) = action {
+        if let Some(messages) = spawn_job(id, app, ctx, command) {
+            spawn_request(id, app, ctx, inflight, messages);
+        }
+        return;
+    }
+
     let generation = app.next_generation();
     let sandbox = action_sandbox(app, ctx);
     let timeout = ctx.timeout;
@@ -853,6 +960,7 @@ fn allow(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
             // and an Edit is converted to a Write by `approve`, so none are
             // reachable.
             Action::Shell(_)
+            | Action::ShellBackground(_)
             | Action::Read { .. }
             | Action::Grep { .. }
             | Action::Glob { .. }
@@ -872,18 +980,54 @@ fn allow(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     *inflight = Some(InFlight::new(cancel_tx));
 }
 
-/// Run a shell command, forwarding its output as it arrives.
-///
-/// One channel beyond the usual cancel, carrying output chunks back for the live
-/// window. The forwarder relays them onto the single `Tagged` channel the event
-/// loop drains, so live output is generation-tagged and dropped on cancel exactly
-/// like every other update.
+/// Run a command the model proposed and the user allowed.
 fn spawn_shell(
     id: u64,
     app: &mut App,
     ctx: &Ctx,
     inflight: &mut Option<InFlight>,
     command: String,
+) {
+    spawn_watched(id, app, ctx, inflight, command, |_, result| {
+        Update::Command(result)
+    });
+}
+
+/// Run the project's `--check` command.
+///
+/// The same machinery as an approved command, and that is the point: a check is
+/// a foreground command the turn is waiting on, so it takes the `InFlight` slot,
+/// streams into the same live window, and is cancelled by the same `Esc`. The
+/// only differences are that nobody approved it — the user did, once, by
+/// configuring it — and that its result is routed somewhere else.
+fn spawn_check(
+    id: u64,
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    command: String,
+) {
+    spawn_watched(id, app, ctx, inflight, command, Update::Check);
+}
+
+/// Run a command, forwarding its output as it arrives.
+///
+/// One channel beyond the usual cancel, carrying output chunks back for the live
+/// window. The forwarder relays them onto the single `Tagged` channel the event
+/// loop drains, so live output is generation-tagged and dropped on cancel exactly
+/// like every other update.
+///
+/// `finish` decides which `Update` the outcome becomes, and is the entire
+/// difference between an approved command and a project check — everything that
+/// matters (the sandbox, the timeout, cancellation, the generation tag, the
+/// live window) is shared rather than reimplemented alongside.
+fn spawn_watched(
+    id: u64,
+    app: &mut App,
+    ctx: &Ctx,
+    inflight: &mut Option<InFlight>,
+    command: String,
+    finish: impl FnOnce(String, Result<CommandOutput, String>) -> Update + Send + 'static,
 ) {
     let generation = app.next_generation();
     app.start_running(command.clone());
@@ -921,11 +1065,124 @@ fn spawn_shell(
             .send(Tagged {
                 session: id,
                 generation,
-                update: Update::Command(result.map_err(|e| format!("{e:#}"))),
+                update: finish(command, result.map_err(|e| format!("{e:#}"))),
             })
             .await;
     });
     *inflight = Some(InFlight::new(cancel_tx));
+}
+
+/// Start a background job, and hand back the result that says so.
+///
+/// Three things distinguish this from [`spawn_shell`], and all three are the
+/// feature rather than incidental:
+///
+/// - **It does not touch `inflight`.** That slot holds the one piece of work a
+///   turn is waiting on, and the turn is about to use it for the model
+///   round-trip that carries the job id. A job that occupied it would deadlock
+///   the loop it was supposed to free.
+/// - **The model is answered immediately**, with the id rather than an exit
+///   code. The turn continues; the job does not belong to it.
+/// - **Its output goes to disk**, so there is no chunk relay and no live window.
+///
+/// `None` means the job could not be started and the user has been told; there
+/// is nothing to send the model, because from its point of view nothing changed.
+fn spawn_job(id: u64, app: &mut App, ctx: &Ctx, command: String) -> Option<Vec<Message>> {
+    let root = ctx.sandbox.root().to_path_buf();
+    let handle = match jobs::create(&root, &command) {
+        Ok(handle) => handle,
+        Err(message) => {
+            app.push_error(format!("could not start the job: {message}"));
+            return None;
+        }
+    };
+
+    let sandbox = action_sandbox(app, ctx);
+    let ceiling = ctx.job_ceiling;
+    let tx = ctx.tx.clone();
+    let registry = Arc::clone(&ctx.jobs);
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let task_handle = handle.clone();
+    // Kept for the notice below; the task takes the original.
+    let headline = command.lines().next().unwrap_or("").trim().to_string();
+
+    // Started before the task is spawned, so the pid is on disk by the time this
+    // function returns — a `/jobs kill` on the very next keystroke finds it.
+    let cancel = async {
+        let _ = cancel_rx.await;
+    };
+    let run = match exec::start_background(sandbox, command, task_handle.clone(), ceiling, cancel) {
+        Ok((pid, run)) => {
+            task_handle.record_pid(pid);
+            run
+        }
+        Err(message) => {
+            // The job never started. Recorded as killed rather than left
+            // `running`, which would be a claim about a process that does not
+            // exist — the same lie `jobs::sweep` exists to clean up.
+            task_handle.finish(jobs::State::Killed);
+            app.push_error(format!("could not start the job: {message:#}"));
+            return None;
+        }
+    };
+
+    tokio::spawn(async move {
+        let state = run.await;
+        task_handle.finish(state);
+        // Dropped from the registry before the update, so a `/jobs kill` racing
+        // the exit finds nothing rather than signalling a dead channel.
+        if let Ok(mut registry) = registry.lock() {
+            registry.remove(&task_handle.id);
+        }
+        let _ = tx
+            .send(Tagged {
+                session: id,
+                // Exempt from the staleness check; see `route_update`.
+                generation: 0,
+                update: Update::Job {
+                    id: task_handle.id.clone(),
+                    state,
+                },
+            })
+            .await;
+    });
+
+    if let Ok(mut registry) = ctx.jobs.lock() {
+        registry.insert(handle.id.clone(), cancel_tx);
+    }
+
+    app.note_job_started();
+    let shown = jobs::dir(&root);
+    let shown = shown
+        .strip_prefix(&root)
+        .unwrap_or(&shown)
+        .to_string_lossy();
+    app.push_notice(format!(
+        "Started job {} — {headline}. Output in {shown}/{}/.",
+        handle.id, handle.id
+    ));
+    Some(app.push_raw_result(protocol::encode_job_started(
+        &handle.id,
+        &format!("{shown}/{}", handle.id),
+    )))
+}
+
+/// Stop a job by id, whether or not this process started it.
+///
+/// The registry first, since a handle stops the task cleanly and takes the
+/// process group with it. Falling back to the recorded pid covers the job this
+/// harness did not start — after a restart the directory is all there is.
+fn kill_job(ctx: &Ctx, id: &str) -> bool {
+    let handle = ctx
+        .jobs
+        .lock()
+        .ok()
+        .and_then(|mut registry| registry.remove(id));
+    if let Some(cancel) = handle {
+        let _ = cancel.send(());
+        return true;
+    }
+    jobs::kill(ctx.sandbox.root(), id)
 }
 
 /// Refuse the pending command and let the model know.

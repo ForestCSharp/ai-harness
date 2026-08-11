@@ -18,6 +18,10 @@ The model must reply with exactly one of nine elements, and nothing else:
 ```
 
 ```xml
+<ai-harness-shell background=true>cargo test</ai-harness-shell>
+```
+
+```xml
 <ai-harness-read>src/app.rs</ai-harness-read>
 ```
 
@@ -287,6 +291,7 @@ Commands are handled locally and never sent to the model.
 | `/rewind` | Choose how far back to undo, from a list of the conversation |
 | `/sessions` | Switch between running sessions, or start one (also `Ctrl+Space`) |
 | `/memory` | List the project's notes and what the index made of them (see [Project memory](#project-memory)) |
+| `/jobs [kill <id>]` | List background jobs, or stop one (see [Background jobs](#background-jobs)) |
 | `/stats` | A page of what this session has done, including how memory was used |
 | `/checkpoints [n]` | List what can be undone; with a number, keep only the last `n` turns |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
@@ -574,6 +579,123 @@ Three things worth knowing:
 - **Memory is an injection surface.** Something the model read from a fetched
   page can end up in a file loaded into every later session. The approval modal
   is the check on that.
+
+## The project check
+
+Without this, a turn ends on the model's word. It says "fixed", the turn ends,
+and you find out later. `--check` gives something else the last say:
+
+```bash
+cargo run -- --check "cargo check --all-targets"
+```
+
+Any turn that **wrote a file** now runs that command before it is allowed to
+end. You watch it in the same live window an approved command uses. If it
+passes, the turn ends as normal. If it fails, the output goes back to the model
+as a result and it keeps working:
+
+```
+write  src/parser.rs
+response  "Fixed the offset handling."
+check  exit 1
+       error[E0308]: mismatched types
+edit   src/parser.rs
+response  "That was a type error on my side — fixed."
+check  exit 0
+```
+
+**It is not approved.** Every other command the harness runs was proposed by the
+model, which is what the modal is for. This one you typed into your own
+configuration — setting the flag is the approval. It still runs in the sandbox.
+
+**Prefer something fast.** It is paid on every writing turn, so a type check, a
+lint, or one focused test target pays for itself where a full suite turns a
+one-line edit into a two-minute wait.
+
+Four things worth knowing:
+
+- **There is no retry cap.** A failing check feeds the loop for as long as the
+  model keeps changing files — the existing `--max-iterations` budget is the only
+  bound. What stops a model with no ideas left is that **a response which writes
+  nothing ends the turn**, so it can look at a failure, decide it is not its
+  doing, say so, and stop. The result it is shown says exactly that.
+- **If the budget runs out with the check still failing**, the check still runs
+  and you are told. The budget gates whether the model gets asked about it, not
+  whether you find out.
+- **Shell-driven edits do not trigger it.** The trigger is a write or an edit, so
+  a turn that changes files by running `sed -i` or `cargo fix` slips past.
+  Including shell commands would fire the check after `ls` and after most turns
+  that change nothing.
+- **Plan mode does not trigger it.** Writing `plan.md` is a write like any other,
+  but a plan is prose and there is nothing to compile.
+
+The check is not counted in `/stats` — that page is what the model did, and this
+is something the harness did on its own.
+
+## Background jobs
+
+A plain `<ai-harness-shell>` holds the turn open until the command exits. That is
+right for `ls` and wrong for `cargo test`, a build, or a dev server. Adding
+`background=true` starts the command and lets the turn carry on:
+
+```xml
+<ai-harness-shell background=true>cargo test --all</ai-harness-shell>
+```
+
+It is approved through the ordinary modal — a job is still a shell command, and
+running unattended does not skip the question. What comes back is a job id rather
+than an exit code:
+
+```
+<ai-harness-shell-result>
+status: started in the background as job 1786215831-000
+note: the command is still running. Its output is being written to …
+</ai-harness-shell-result>
+```
+
+Each job is a directory under `.ai_harness/jobs/`:
+
+```
+.ai_harness/jobs/1786215831-000/
+    command   cargo test --all
+    pid       48231
+    stdout    appended as it runs, capped at 32 KB
+    stderr
+    status    running | exit 0 | killed | timed out | abandoned
+    started   unix seconds
+    ended
+```
+
+**The directory is the state.** Nothing about a job is cached in memory except
+the handle needed to kill it, so a reloaded session, a second session, and a
+restarted harness all read the same files and reach the same answer.
+
+The model finds out two ways. Every prompt's contract carries a line per job —
+rebuilt from disk like the memory index, so it cannot go stale and cannot be
+forgotten — and it opens the logs with `<ai-harness-read>` when it wants detail.
+Note that **a read reaches these files and a grep does not**: `.ai_harness/` is
+skipped by search, because a session file holds a whole prior conversation and a
+grep for anything you have typed would match the transcript of you typing it.
+Each log is capped well inside what one read returns, so nothing is lost.
+
+`/jobs` lists them, `/jobs kill <id>` stops one. Both work mid-turn, since a job
+is not part of a turn.
+
+Four things worth knowing:
+
+- **A job has no idle timeout.** `--command-timeout` kills a foreground command
+  that goes quiet, which is exactly wrong for a server that logs on startup and
+  then waits. A job gets a wall-clock `--job-ceiling` instead — an hour by
+  default.
+- **Four at once**, and past that the model is told so and can wait or run the
+  command in the foreground. The cap is about legibility more than resources: the
+  contract carries a line per job on every round-trip.
+- **`/undo` and `/rewind` refuse while a job is running.** A checkpoint is taken
+  before an action runs and a job keeps writing after that, so restoring would
+  leave neither the old tree nor the new one.
+- **Jobs do not survive the harness.** Quitting kills them, and anything a
+  previous run left marked `running` is written off as `abandoned` at startup —
+  otherwise the contract would claim a process that is gone.
 
 ## Sessions
 
@@ -1163,7 +1285,7 @@ reading while you choose which conversation to be in.
 | `src/protocol.rs` | Query encoding, the system prompt, and strict reply parsing |
 | `src/command.rs` | Slash-command parsing, the command table, and completion |
 | `src/sandbox.rs` | Seatbelt profile generation and the sandboxed command |
-| `src/exec.rs` | Running commands: streamed output, idle timeout, output caps |
+| `src/exec.rs` | Running commands: streamed output, idle timeout, output caps, and background jobs |
 | `src/files.rs` | Resolving and reading files for `<ai-harness-read>` |
 | `src/search.rs` | The confined tree walk behind `<ai-harness-grep>` and `<ai-harness-glob>` |
 | `src/compact.rs` | Shortening a conversation that no longer fits |
@@ -1175,6 +1297,7 @@ reading while you choose which conversation to be in.
 | `src/stats.rs` | What a session did, counted from its transcript for `/stats` |
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`, `open.json`) |
 | `src/memory.rs` | The `.ai_harness/memory/` index: descriptions in the contract, bodies on demand |
+| `src/jobs.rs` | The `.ai_harness/jobs/` directories: job status, logs, and the startup sweep |
 | `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
