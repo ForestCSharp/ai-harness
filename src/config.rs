@@ -53,8 +53,22 @@ pub struct Args {
     /// `cargo fix`, a codegen script — does not fire it. Including shell
     /// commands would fire it after `ls` and after most turns that change
     /// nothing at all.
+    /// Overrides what the project would otherwise be checked with. Unset, the
+    /// harness infers one — see [`crate::check::detect`] — so a Cargo project is
+    /// type-checked whether or not anyone remembered a flag.
     #[arg(long, env = "AI_HARNESS_CHECK")]
     pub check: Option<String>,
+
+    /// Do not check anything, whatever the project looks like.
+    ///
+    /// The opt-out for the inference above. Worth reaching for when the project's
+    /// check is too slow to sit through per turn, when it needs an environment
+    /// this machine does not have, or when you are working somewhere the check
+    /// is meaningless — a scratch directory, a prose repository. The turn then
+    /// ends on the model's word, which is what the whole feature exists to stop,
+    /// so it is a choice rather than a default.
+    #[arg(long, env = "AI_HARNESS_NO_CHECK")]
+    pub no_check: bool,
 
     /// Seconds before a background job is killed, whatever it is doing.
     ///

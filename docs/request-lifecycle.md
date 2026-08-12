@@ -418,8 +418,26 @@ model** (step 2 again).
 
 ### The project check: a response that has to earn its ending
 
-`<ai-harness-response>` is described above as the one terminal exit. With
-`--check` set, it has a condition on it.
+`<ai-harness-response>` is described above as the one terminal exit. Wherever
+there is a check to run, it has a condition on it.
+
+**Where the check comes from** is settled once at startup by `check::resolve`
+([src/check.rs](../src/check.rs)): `--no-check` beats `--check`, which beats what
+`check::detect` infers from the project, which beats nothing. Inference is
+deliberately short — a `Cargo.toml`, a `go.mod`, a couple of `package.json`
+scripts — because a default that guesses wrong fails confidently about code that
+is fine, which is worse than not guessing. Either way the resolved state is
+announced at startup, on the same argument the auto-approve notice is: an
+unverified turn is indistinguishable from a verified one afterwards, so the only
+useful moment to say which is before the first one.
+
+There is a second half to this that is not machinery at all. `system_prompt`
+carries a section asking the model to verify its own work — find the project's
+check, prefer the cheapest one that would catch the mistake, and say so plainly
+when it did not check. The two are not redundant so much as differently scoped:
+the prompt is what makes a model check *during* the work and choose a check
+suited to what it changed, and the arm below is what makes verification *happen*
+at all when it does not.
 
 A new arm in `push_response` sits **ahead of both `Response` arms**, because
 either would otherwise end the turn first. It fires when `App::should_check` is

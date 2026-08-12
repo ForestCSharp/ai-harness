@@ -1,4 +1,5 @@
 mod app;
+mod check;
 mod checkpoint;
 mod command;
 mod compact;
@@ -175,7 +176,9 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         args.max_turn_bytes
     };
     app.compact_at = args.compact_at;
-    app.check_command = args.check.clone();
+    // Resolved from the project as well as the flags, so a recognised project is
+    // checked whether or not anyone remembered to ask.
+    app.check_command = check::resolve(&sandbox_root, args.check.as_deref(), args.no_check);
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
@@ -184,6 +187,11 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         "Sandbox root: {}   Type /help for commands.",
         sandbox.root().display()
     ));
+    // How turns will end, said in both cases. An unverified turn looks exactly
+    // like a verified one afterwards, so the only moment this can usefully be
+    // said is before the first one — the same argument the auto-approve notice
+    // below is made on.
+    app.push_notice(check::startup_notice(app.check_command.as_deref()));
     // Said at startup rather than left to the status-bar marker: whether the
     // harness will act without asking should be known before the first action,
     // not inferred from the corner of the screen afterwards.

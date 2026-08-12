@@ -583,16 +583,49 @@ Three things worth knowing:
 ## The project check
 
 Without this, a turn ends on the model's word. It says "fixed", the turn ends,
-and you find out later. `--check` gives something else the last say:
+and you find out later. The check gives something else the last say.
 
-```bash
-cargo run -- --check "cargo check --all-targets"
+**It is on by default** wherever the project's check can be inferred. In a Cargo
+repository the harness runs `cargo check --all-targets` without being asked, and
+says so at startup:
+
+```
+Project check: `cargo check --all-targets` — it runs after any turn that writes
+a file, and a failure goes back to the model.
 ```
 
-Any turn that **wrote a file** now runs that command before it is allowed to
-end. You watch it in the same live window an approved command uses. If it
-passes, the turn ends as normal. If it fails, the output goes back to the model
-as a result and it keeps working:
+What gets inferred, first match winning:
+
+| At the working directory | Check |
+| --- | --- |
+| `Cargo.toml` | `cargo check --all-targets` |
+| `go.mod` | `go build ./...` |
+| `package.json` with a `typecheck` script | `npm run typecheck` |
+| `package.json` with a `check` script | `npm run check` |
+| anything else | none |
+
+Deliberately short. A default that guesses wrong is worse than none — it fails
+confidently about code that is fine — so an unrecognised project simply gets no
+check, and says *that* at startup instead. `build` and `test` scripts are left
+out for the same reason: too slow, and `build` leaves artifacts. Both are fine
+things to choose yourself.
+
+To choose or disable:
+
+```bash
+cargo run -- --check "just lint"
+```
+
+```bash
+cargo run -- --no-check
+```
+
+`--no-check` wins over `--check`, which wins over what was inferred.
+
+Any turn that **wrote a file** runs that command before it is allowed to end.
+You watch it in the same live window an approved command uses. If it passes, the
+turn ends as normal. If it fails, the output goes back to the model as a result
+and it keeps working:
 
 ```
 write  src/parser.rs
@@ -631,6 +664,26 @@ Four things worth knowing:
 
 The check is not counted in `/stats` — that page is what the model did, and this
 is something the harness did on its own.
+
+### The model is also asked to check
+
+The machinery above is the floor, not the whole story. It can only run one
+configured command, and only after a write — it will not make a model check its
+work *during* exploration, or pick a better check than the configured one.
+
+So the system prompt asks for it directly: a change is not finished until it has
+been checked, find the project's own check rather than guessing a command, prefer
+the cheapest one that would catch the mistake, and — the sentence doing the real
+work — **if you did not check, say so**. Never report success you have not
+observed. A turn where checking was not worth it is fine; a turn that claims
+success it never saw is not, because nobody reading the transcript can tell the
+difference.
+
+The two overlap: a model that follows the prompt runs `cargo check`, then the
+harness runs it again after the response. That is cheap — a warm re-check of a
+Bevy project measured 0.43s — and they are doing different jobs. The model's run
+catches mistakes while they are still cheap to fix; the harness's run is the gate
+that catches what the model skipped.
 
 ## Background jobs
 
@@ -1298,6 +1351,7 @@ reading while you choose which conversation to be in.
 | `src/session.rs` | Session folders under `.ai_harness/` (`/save`, `/load`, `plan.md`, `open.json`) |
 | `src/memory.rs` | The `.ai_harness/memory/` index: descriptions in the contract, bodies on demand |
 | `src/jobs.rs` | The `.ai_harness/jobs/` directories: job status, logs, and the startup sweep |
+| `src/check.rs` | Inferring the project's check command, and what to say about it at startup |
 | `src/sessions.rs` | Several sessions at once, and the `Ctrl+Space` view |
 | `src/checkpoint.rs` | Per-turn file snapshots and the `/undo` restore |
 | `src/tui.rs` | Terminal setup/teardown (raw mode, alt screen, mouse, paste) |
