@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let api_key = Args::api_key()?;
-    let client = Client::new(api_key, args.model.clone())?;
+    let client = Client::new(api_key, args.model.clone())?.caching(args.cache_breakpoints);
     // Built before the terminal is taken over, so a sandbox failure prints
     // normally instead of being swallowed by the alternate screen.
     let sandbox = Sandbox::new(args.root()?)?;

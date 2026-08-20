@@ -1727,17 +1727,19 @@ impl App {
         kept.truncate(MAX_LINES);
         kept.sort_by(|a, b| a.id.cmp(&b.id));
 
+        // **Byte-stable on purpose.** This line goes into `history[0]`, which is
+        // the prefix of every message sent, so anything here that changes on its
+        // own invalidates the prompt cache for the entire conversation on every
+        // prompt — see `openrouter::breakpoints`. An elapsed-seconds counter did
+        // exactly that: a session with one running job would have cached
+        // nothing, ever. What is left changes only when a job's state does.
+        //
+        // The timing is not lost, it is just not *here*: `/jobs` shows it to the
+        // user, and the job's own `started` and `ended` files are readable by
+        // the model, which the section below already points it at.
         let lines = kept
             .into_iter()
-            .map(|job| {
-                format!(
-                    "{} — {} — {} ({}s)",
-                    job.id,
-                    job.state.as_line(),
-                    job.summary(),
-                    job.elapsed_secs()
-                )
-            })
+            .map(|job| format!("{} — {} — {}", job.id, job.state.as_line(), job.summary()))
             .collect();
         let dir = crate::jobs::dir(root);
         // Relative to the root, like every other path the model is handed, and
@@ -10131,6 +10133,53 @@ mod job_tests {
         assert!(contract.contains("Background jobs"), "{contract}");
         assert!(contract.contains("cargo test --all"), "{contract}");
         assert!(contract.contains("running"), "{contract}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The invariant prompt caching rests on.** `history[0]` is the prefix of
+    /// every message sent, so anything in it that changes on its own busts the
+    /// cache for the whole conversation on every prompt. An elapsed-seconds
+    /// counter in the jobs line did exactly that, and it was invisible until
+    /// someone went looking — a session with one running job would simply never
+    /// have cached anything.
+    ///
+    /// Written against a *running* job because that is the volatile case: a
+    /// finished one has a fixed end time, where a running one is the thing
+    /// tempting a line to report how long it has been going.
+    #[test]
+    fn the_contract_is_byte_stable_while_a_job_runs() {
+        let (mut app, dir) = app_in_temp();
+        crate::jobs::create(&dir, "cargo build --release").unwrap();
+
+        app.refresh_contract();
+        let first = contract(&app).to_string();
+        assert!(first.contains("Background jobs"), "the section is there");
+
+        // Time passes; nothing on disk changes.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        app.refresh_contract();
+
+        assert_eq!(
+            contract(&app),
+            first,
+            "the contract must not change on its own — see openrouter::breakpoints"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: it must still change when something real does, or
+    /// stability would just mean the section had stopped saying anything.
+    #[test]
+    fn but_it_does_change_when_a_job_does() {
+        let (mut app, dir) = app_in_temp();
+        let handle = crate::jobs::create(&dir, "cargo build").unwrap();
+        app.refresh_contract();
+        let running = contract(&app).to_string();
+
+        handle.finish(crate::jobs::State::Exited(1));
+        app.refresh_contract();
+        assert_ne!(contract(&app), running, "a state change must show");
+        assert!(contract(&app).contains("exit 1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

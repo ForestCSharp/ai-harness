@@ -65,11 +65,6 @@ stay a deliberate choice.
 
 -   more organized context management. Don't just keep appending, but store in a structured manner.
 
--   Prompt cache breakpoints. The client sends no cache directives of its own, so
-    for models where caching is opt-in via `cache_control` the 0% in `/cost` is the
-    expected result rather than a provider quirk. Put a breakpoint after the system
-    prompt and one at the last stable turn boundary.
-
 -   Batched non-mutating actions: one top-level batch element whose children are
     read/fetch/grep only. Five reads is currently five round-trips, each re-sending
     the entire conversation. Keeps the invariant that matters — one mutating action,

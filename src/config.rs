@@ -53,11 +53,29 @@ pub struct Args {
     /// `cargo fix`, a codegen script — does not fire it. Including shell
     /// commands would fire it after `ls` and after most turns that change
     /// nothing at all.
-    /// Overrides what the project would otherwise be checked with. Unset, the
-    /// harness infers one — see [`crate::check::detect`] — so a Cargo project is
-    /// type-checked whether or not anyone remembered a flag.
+    ///
+    /// Unset, the harness infers one — see [`crate::check::detect`] — so a Cargo
+    /// project is type-checked whether or not anyone remembered a flag. This
+    /// overrides that inference.
     #[arg(long, env = "AI_HARNESS_CHECK")]
     pub check: Option<String>,
+
+    /// Whether to send explicit prompt-cache breakpoints.
+    ///
+    /// The whole conversation is re-sent on every round-trip of an agentic turn,
+    /// which is the shape prefix caching exists for. Providers differ on how to
+    /// ask: most cache a repeated prefix on their own, Anthropic caches only
+    /// what is marked. `auto` marks for the ones known to need it.
+    ///
+    /// `on` forces it for a provider that adopted the field after this was
+    /// written; `off` is the way out if a model rejects it.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        env = "AI_HARNESS_CACHE_BREAKPOINTS"
+    )]
+    pub cache_breakpoints: crate::openrouter::CachePolicy,
 
     /// Do not check anything, whatever the project looks like.
     ///

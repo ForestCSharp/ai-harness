@@ -70,11 +70,43 @@ pub enum Role {
     Assistant,
 }
 
+/// Whether to send explicit cache breakpoints.
+///
+/// Not every provider needs them. DeepSeek and OpenAI cache a repeated prefix on
+/// their own initiative — measured at 68% on a real session here — and get the
+/// bytes they already got. Anthropic caches only what is marked, so without this
+/// the longest, most repeated prefix in the whole system goes uncached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum CachePolicy {
+    /// Mark breakpoints for models known to need them.
+    #[default]
+    Auto,
+    /// Always mark, for a provider that adopted the field after this was written.
+    On,
+    /// Never mark.
+    Off,
+}
+
+impl CachePolicy {
+    fn applies_to(self, model: &str) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            // A prefix match rather than a list of ids, so a model released
+            // tomorrow is covered without a code change. `on` is the escape
+            // hatch for a provider this does not name.
+            Self::Auto => model.starts_with("anthropic/"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
     api_key: String,
     model: String,
+    cache: CachePolicy,
     endpoints: Endpoints,
 }
 
@@ -154,10 +186,16 @@ pub struct Usage {
     /// Cache accounting, when the provider reports any.
     ///
     /// This harness resends the whole conversation every turn and appends to it
-    /// rather than rewriting it, which is the shape prefix caching is for. It
-    /// sends no cache directives of its own, so anything here comes from the
-    /// provider caching on its own initiative — which is worth knowing before
-    /// deciding whether asking for it explicitly is worth the work.
+    /// rather than rewriting it, which is the shape prefix caching is for. Two
+    /// things can put a number here: a provider caching a repeated prefix on its
+    /// own initiative, and the breakpoints this client marks for the providers
+    /// that cache only what they are asked to — see [`CachePolicy`].
+    ///
+    /// A number that stays at zero on a long session is worth chasing rather
+    /// than shrugging at. The likeliest cause is not the provider but a system
+    /// prompt that is not byte-stable between prompts: it is the prefix of
+    /// everything, so anything in it that changes on its own costs the whole
+    /// conversation.
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
@@ -203,6 +241,7 @@ impl Client {
             http,
             api_key,
             model,
+            cache: CachePolicy::default(),
             endpoints: Endpoints::default(),
         })
     }
@@ -218,6 +257,13 @@ impl Client {
     /// model the app currently has rather than the one the client was made with.
     /// Cloning is cheap: `reqwest::Client` is a handle to a shared connection
     /// pool, not a new one.
+    /// Set the cache-breakpoint policy. Consuming, since it is set once at
+    /// startup, unlike [`Client::with_model`] which copies per request.
+    pub fn caching(mut self, policy: CachePolicy) -> Self {
+        self.cache = policy;
+        self
+    }
+
     pub fn with_model(&self, model: &str) -> Self {
         Self {
             model: model.to_string(),
@@ -286,7 +332,10 @@ impl Client {
     ) -> Result<impl Stream<Item = Result<StreamEvent>>> {
         let body = ChatRequest {
             model: &self.model,
-            messages,
+            // Resolved per request, not per client: `with_model` hands out a
+            // copy pointed at a different model, and whether that model wants
+            // breakpoints is a question about the model.
+            messages: wire_messages(messages, self.cache.applies_to(&self.model)),
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -503,9 +552,129 @@ fn parse_sse_event(block: &str) -> Option<Result<StreamEvent>> {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: &'a [Message],
+    messages: Vec<WireMessage<'a>>,
     stream: bool,
     stream_options: StreamOptions,
+}
+
+/// A message as the API sees it, which is not quite how one is stored.
+///
+/// [`Message`] is what the conversation is made of and what `session.json`
+/// holds; this is what goes over the wire for one request. Keeping them separate
+/// is what lets a cache breakpoint exist at all without touching the saved
+/// format — a breakpoint is a property of the *request*, not of the
+/// conversation, and the same `Message` is marked on one request and not on the
+/// next.
+#[derive(Serialize)]
+struct WireMessage<'a> {
+    role: Role,
+    content: WireContent<'a>,
+}
+
+/// Either shape the `content` field may take.
+///
+/// **Unmarked messages keep the bare string they have always sent.** That is the
+/// load-bearing half of this type: providers that cache on their own initiative
+/// are matching a prefix byte-for-byte, and rewriting every message as a block
+/// array would miss on every existing conversation to buy nothing. Only the one
+/// or two positions carrying a breakpoint change shape.
+///
+/// `untagged` so both serialise as the field's natural JSON — a string, or a
+/// one-element array — rather than as a tagged enum.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireContent<'a> {
+    Text(&'a str),
+    Blocks([TextBlock<'a>; 1]),
+}
+
+/// A text block carrying a cache breakpoint.
+///
+/// `cache_control` is Anthropic's field, which OpenRouter passes through to
+/// providers that understand it. It marks the **end of a cacheable prefix**, so
+/// where the marks go is the whole design — see [`breakpoints`].
+#[derive(Serialize)]
+struct TextBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    cache_control: CacheControl,
+}
+
+#[derive(Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl<'a> WireMessage<'a> {
+    /// The ordinary shape: content as a bare string, exactly as before.
+    fn plain(message: &'a Message) -> Self {
+        Self {
+            role: message.role,
+            content: WireContent::Text(&message.content),
+        }
+    }
+
+    /// The same message, marked as the end of a cacheable prefix.
+    fn cached(message: &'a Message) -> Self {
+        Self {
+            role: message.role,
+            content: WireContent::Blocks([TextBlock {
+                kind: "text",
+                text: &message.content,
+                cache_control: CacheControl { kind: "ephemeral" },
+            }]),
+        }
+    }
+}
+
+/// Which messages to mark as the end of a cacheable prefix.
+///
+/// Two, which is well inside the four a provider allows:
+///
+/// - **The system message**, when there is one. It is the contract — the
+///   protocol rules, `AGENTS.md`, the memory index, the jobs section — and it is
+///   re-sent identically on every round-trip of an agentic turn. It is also the
+///   prefix of everything else, so it has to be stable for the second mark to be
+///   worth anything: see the byte-stability note on
+///   [`crate::app::App::jobs_state`].
+/// - **The last message**, when that is not the same one. Every round-trip
+///   appends, so marking the tail means each request reads the cache the
+///   previous one wrote and writes a new one covering what it added.
+///
+/// A prefix shorter than the provider's minimum is not cached, but neither is it
+/// an error, so there is no length guard here — its absence is a decision rather
+/// than an oversight.
+fn breakpoints(messages: &[Message]) -> [Option<usize>; 2] {
+    let system = matches!(messages.first(), Some(m) if m.role == Role::System).then_some(0);
+    let last = match messages.len() {
+        // Nothing to mark, or the only message is already marked above.
+        0 => None,
+        1 if system.is_some() => None,
+        n => Some(n - 1),
+    };
+    [system, last]
+}
+
+/// Build the messages for one request, marking breakpoints when `cache` is on.
+fn wire_messages(messages: &[Message], cache: bool) -> Vec<WireMessage<'_>> {
+    let marks = if cache {
+        breakpoints(messages)
+    } else {
+        [None, None]
+    };
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| {
+            if marks.contains(&Some(i)) {
+                WireMessage::cached(message)
+            } else {
+                WireMessage::plain(message)
+            }
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -1118,6 +1287,142 @@ mod tests {
         assert_eq!(&b"data: x\r\n\r\nrest"[..b.content], b"data: x");
 
         assert!(find_boundary(b"data: incomplete").is_none());
+    }
+
+    /// Send a conversation and hand back the JSON body the server actually saw.
+    ///
+    /// Asserting on the wire rather than on a serializer in isolation, because
+    /// the claim being made is about what a provider receives.
+    async fn sent_body(
+        model: &str,
+        policy: CachePolicy,
+        messages: &[Message],
+    ) -> serde_json::Value {
+        let (client, server) = serve_sse(vec![delta("hi")]);
+        client
+            .caching(policy)
+            .with_model(model)
+            .complete(messages)
+            .await
+            .expect("request should succeed");
+        let captured = server.join().unwrap();
+        serde_json::from_str(&captured.body).expect("valid JSON body")
+    }
+
+    fn conversation() -> Vec<Message> {
+        vec![
+            Message::system("the contract"),
+            Message::user("first"),
+            Message::assistant("reply"),
+            Message::user("second"),
+        ]
+    }
+
+    /// Whether a serialized message carries a breakpoint, and that its text
+    /// survived the change of shape.
+    fn marked(message: &serde_json::Value, text: &str) -> bool {
+        let Some(blocks) = message["content"].as_array() else {
+            return false;
+        };
+        assert_eq!(blocks.len(), 1, "one block per marked message");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], text, "the text must survive intact");
+        blocks[0]["cache_control"]["type"] == "ephemeral"
+    }
+
+    /// The contract and the growing tail are the two prefixes worth caching:
+    /// the first is re-sent identically every round-trip, the second is what
+    /// the next round-trip will be built on.
+    #[tokio::test]
+    async fn breakpoints_land_on_the_system_message_and_the_last_one() {
+        let sent = sent_body(
+            "anthropic/claude-sonnet-4.5",
+            CachePolicy::Auto,
+            &conversation(),
+        )
+        .await;
+        let messages = sent["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 4);
+
+        assert!(marked(&messages[0], "the contract"), "{:?}", messages[0]);
+        assert!(marked(&messages[3], "second"), "{:?}", messages[3]);
+        // And nowhere else: a breakpoint per message would spend the provider's
+        // budget of them on prefixes nothing will ever match again.
+        assert_eq!(messages[1]["content"], "first");
+        assert_eq!(messages[2]["content"], "reply");
+    }
+
+    /// The regression that would cost more than the feature gains. Providers
+    /// that cache on their own match a prefix byte-for-byte, and this harness
+    /// already gets 68% from one of them — rewriting unmarked messages into
+    /// block arrays would miss on every conversation in flight to buy nothing.
+    #[tokio::test]
+    async fn a_model_that_caches_on_its_own_sees_exactly_what_it_saw_before() {
+        let sent = sent_body(
+            "deepseek/deepseek-v4-pro",
+            CachePolicy::Auto,
+            &conversation(),
+        )
+        .await;
+        let messages = sent["messages"].as_array().expect("messages array");
+        for (i, expected) in ["the contract", "first", "reply", "second"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                messages[i]["content"], *expected,
+                "message {i} should still be a bare string"
+            );
+        }
+        assert!(
+            !captured_has_cache_control(&sent),
+            "no cache_control anywhere: {sent}"
+        );
+    }
+
+    fn captured_has_cache_control(sent: &serde_json::Value) -> bool {
+        sent.to_string().contains("cache_control")
+    }
+
+    #[tokio::test]
+    async fn the_flag_overrides_the_model_heuristic_both_ways() {
+        // Off, on a model the heuristic would have marked.
+        let off = sent_body(
+            "anthropic/claude-sonnet-4.5",
+            CachePolicy::Off,
+            &conversation(),
+        )
+        .await;
+        assert!(!captured_has_cache_control(&off), "{off}");
+
+        // On, for a provider this was written before.
+        let on = sent_body("deepseek/deepseek-v4-pro", CachePolicy::On, &conversation()).await;
+        assert!(captured_has_cache_control(&on), "{on}");
+    }
+
+    /// One message is one prefix, so marking it twice would be asking the
+    /// provider to cache the same thing under two entries.
+    #[test]
+    fn a_lone_system_message_is_marked_once() {
+        assert_eq!(
+            breakpoints(&[Message::system("only")]),
+            [Some(0), None],
+            "the system message is both first and last"
+        );
+        // Without a system message the tail is still worth marking.
+        assert_eq!(breakpoints(&[Message::user("only")]), [None, Some(0)]);
+        assert_eq!(breakpoints(&[]), [None, None]);
+    }
+
+    #[test]
+    fn the_heuristic_covers_the_provider_that_needs_it() {
+        assert!(CachePolicy::Auto.applies_to("anthropic/claude-sonnet-4.5"));
+        assert!(CachePolicy::Auto.applies_to("anthropic/claude-opus-4.1"));
+        // The ones that cache without being asked are left alone.
+        assert!(!CachePolicy::Auto.applies_to("deepseek/deepseek-v4-pro"));
+        assert!(!CachePolicy::Auto.applies_to("openai/gpt-4o"));
+        // A model whose *name* merely mentions it is not the provider.
+        assert!(!CachePolicy::Auto.applies_to("someone/anthropic-clone"));
     }
 
     #[test]
