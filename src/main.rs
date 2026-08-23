@@ -8,6 +8,7 @@ mod diff;
 mod exec;
 mod fetch;
 mod files;
+mod headless;
 mod highlight;
 mod input;
 mod jobs;
@@ -26,11 +27,12 @@ mod ui;
 mod wrap;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -39,7 +41,7 @@ use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use app::{App, Choice};
-use config::Args;
+use config::{Args, SandboxMode};
 use exec::{CommandOutput, WriteOutcome};
 use fetch::{FetchOutcome, Fetcher};
 use openrouter::{Client, Completion, Message};
@@ -137,11 +139,38 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let args = Args::parse();
+    // Before anything is built, so an impossible combination of flags is a
+    // message rather than a surprise three steps later.
+    args.validate()?;
     let api_key = Args::api_key()?;
     let client = Client::new(api_key, args.model.clone())?.caching(args.cache_breakpoints);
     // Built before the terminal is taken over, so a sandbox failure prints
     // normally instead of being swallowed by the alternate screen.
-    let sandbox = Sandbox::new(args.root()?)?;
+    let sandbox = match args.sandbox {
+        SandboxMode::Auto => Sandbox::new(args.root()?)?,
+        // Only reachable with `--headless`; `Args::validate` is what holds that.
+        SandboxMode::None => Sandbox::unconfined(args.root()?)?,
+    };
+
+    if args.headless {
+        // `validate` has already refused a headless run with no prompt, so the
+        // default here is unreachable rather than a silent empty turn.
+        let prompt = args.prompt_text()?.unwrap_or_default();
+        let output = args.headless_output.clone();
+        let record = run_headless(client, sandbox, args, prompt).await?;
+        let json = record.to_json();
+        match output {
+            Some(path) => std::fs::write(&path, &json)
+                .with_context(|| format!("writing the run record to {}", path.display()))?,
+            None => println!("{json}"),
+        }
+        // Zero whenever a record was produced, including a run that timed out or
+        // hit its budget. Those are outcomes of the run, and the record says so;
+        // a non-zero status here would be indistinguishable from the binary
+        // having failed to start, which is what a benchmark runner actually
+        // needs to tell apart.
+        return Ok(());
+    }
 
     let terminal = tui::init()?;
     let result = run(terminal, client, sandbox, args).await;
@@ -149,16 +178,18 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Args) -> Result<()> {
-    // Kept by value: the sandbox moves into `Ctx` below, and both the open-set
-    // record and its restore are keyed on which project this is.
+/// The conversation both modes run, built from the flags both modes share.
+///
+/// Extracted so that `--headless` cannot drift from the interactive path: a flag
+/// honoured in one and forgotten in the other would mean a benchmark measuring a
+/// harness nobody actually uses.
+fn build_app(client: &Client, sandbox: &Sandbox, args: &Args, sessions_dir: PathBuf) -> App {
     let sandbox_root = sandbox.root().to_path_buf();
-    let sessions_dir = args.sessions_dir(&sandbox_root);
     let mut app = App::new(
         client.model().to_string(),
         args.system.clone(),
         args.max_iterations.max(1),
-        sessions_dir.clone(),
+        sessions_dir,
     );
     app.debug = args.debug || cfg!(debug_assertions);
     app.max_retries = args.max_retries;
@@ -183,6 +214,15 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
     app.price_out = args.price_out;
+    app
+}
+
+async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Args) -> Result<()> {
+    // Kept by value: the sandbox moves into `Ctx` below, and both the open-set
+    // record and its restore are keyed on which project this is.
+    let sandbox_root = sandbox.root().to_path_buf();
+    let sessions_dir = args.sessions_dir(&sandbox_root);
+    let mut app = build_app(&client, &sandbox, &args, sessions_dir.clone());
     app.push_notice(format!(
         "Sandbox root: {}   Type /help for commands.",
         sandbox.root().display()
@@ -378,6 +418,187 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             return Ok(());
         }
     }
+}
+
+/// Run one prompt with no terminal, and report what happened.
+///
+/// Deliberately the *same* loop as [`run`] with the screen and the keyboard
+/// taken out: it routes updates through `route_update`, so every arm of
+/// `handle_update` — the retry path, the check that gates the end of a turn, the
+/// compaction trigger, background jobs — behaves exactly as it does
+/// interactively. Forking that logic to get a headless mode would mean
+/// benchmarking a harness nobody runs.
+///
+/// Two things it must do that the interactive loop gets from a person:
+///
+/// - **Approve.** `--auto-approve` is forced on, and a parked `Pending` that
+///   somehow survives a round of updates is approved here rather than waited on.
+/// - **Answer.** `<ai-harness-option>` blocks the turn on a choice, and
+///   `auto_approve` deliberately will not answer one (see
+///   `auto_approve_cannot_answer_a_question` in `app`). Headless declines it, so
+///   the model is told nobody is there and can carry on — a run that needed an
+///   answer is a poor run, but it has to end as a run rather than as a hang.
+async fn run_headless(
+    client: Client,
+    sandbox: Sandbox,
+    args: Args,
+    prompt: String,
+) -> Result<headless::RunRecord> {
+    let started = std::time::Instant::now();
+    let unconfined = !sandbox.is_confined();
+    let sandbox_root = sandbox.root().to_path_buf();
+    let sessions_dir = args.sessions_dir(&sandbox_root);
+
+    let mut app = build_app(&client, &sandbox, &args, sessions_dir);
+    // Not a default that `--no-auto-approve` could turn off: there is no modal
+    // to show and no one to answer it, so the alternative to approving is
+    // hanging until the timeout.
+    app.auto_approve = true;
+    if unconfined {
+        // Into the transcript as well as the run record, so a saved session read
+        // back later still says how it ran.
+        app.push_notice(
+            "Commands are running UNCONFINED — the sandbox is off because \
+             something outside the harness is expected to be the boundary.",
+        );
+    }
+    app.push_notice(check::startup_notice(app.check_command.as_deref()));
+
+    // Same reasoning as the interactive path: a `running` left on disk by a dead
+    // process is a claim about something that is not there.
+    jobs::sweep(&sandbox_root);
+
+    let (tx, mut rx) = mpsc::channel::<Tagged>(8);
+    let ctx = Ctx {
+        client,
+        sandbox,
+        fetcher: Fetcher::new(fetch::Policy::strict(args.timeout()))?,
+        timeout: args.timeout(),
+        job_ceiling: args.job_ceiling(),
+        jobs: JobRegistry::default(),
+        tx,
+    };
+    // Worth the one request: without the catalog there is no context window to
+    // take 80% of, and compaction falls back to a fixed byte count. A benchmark
+    // run should compact on the same trigger an interactive one would.
+    spawn_catalog_fetch(&ctx);
+
+    // One session, driven through the same `Sessions` the interactive loop uses
+    // so that `route_update` needs no headless variant.
+    let mut sessions = Sessions::new(app);
+    let id = sessions.current().id;
+    {
+        let slot = sessions.current_mut();
+        match slot.app.send_prompt(prompt) {
+            Some(messages) => spawn_request(id, &mut slot.app, &ctx, &mut slot.inflight, messages),
+            // A fresh session is idle and the prompt is non-empty by the time it
+            // reaches here, so this is unreachable; ending with `Error` rather
+            // than looping is the honest answer if it ever is not.
+            None => {
+                return Ok(headless::RunRecord::build(
+                    sessions.app(),
+                    headless::Exit::Error,
+                    started.elapsed().as_millis() as u64,
+                    0,
+                    unconfined,
+                ));
+            }
+        }
+    }
+
+    let deadline = args.headless_timeout();
+    let mut ticker = tokio::time::interval(TICK);
+    let mut questions_declined = 0usize;
+    let exit;
+
+    loop {
+        tokio::select! {
+            Some(tagged) = rx.recv() => route_update(tagged, &mut sessions, &ctx),
+            // Nothing to animate without a screen; the tick is what guarantees a
+            // wake-up often enough for the deadline below to be noticed even
+            // while a long command produces no updates at all.
+            _ = ticker.tick() => {}
+        }
+        while let Ok(tagged) = rx.try_recv() {
+            route_update(tagged, &mut sessions, &ctx);
+        }
+
+        {
+            let slot = sessions.current_mut();
+            if slot.app.question().is_some() {
+                questions_declined += 1;
+                if let Some(messages) = slot.app.decline_question() {
+                    spawn_request(id, &mut slot.app, &ctx, &mut slot.inflight, messages);
+                }
+            }
+            // Auto-approve resolves a parked action inside the `ReplyEnd` arm.
+            // This is the backstop for any path that parks one elsewhere: a
+            // `Pending` still sitting here after a full round of updates would
+            // otherwise wait for a keypress that is never coming.
+            if slot.app.pending().is_some() {
+                allow(id, &mut slot.app, &ctx, &mut slot.inflight);
+            }
+        }
+
+        // The in-progress variant, not `maybe_autosave`: with no screen, a
+        // session file that only appears when the turn ends is unreadable for
+        // exactly as long as it is interesting.
+        for slot in sessions.iter_mut() {
+            slot.app.autosave_in_progress();
+        }
+
+        if deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            exit = headless::Exit::Timeout;
+            break;
+        }
+
+        let slot = sessions.current();
+        // Two panels have no headless answer at all: the execute-this-plan
+        // prompt and `/undo`'s confirmation. Neither is reachable without a
+        // slash command this mode never issues, so reaching one means something
+        // is wrong — end rather than wait for a key.
+        if slot.app.executing().is_some() || slot.app.pending_undo().is_some() {
+            exit = headless::Exit::Error;
+            break;
+        }
+        if !slot.app.is_busy() && slot.inflight.is_none() {
+            // `iterations` is reset per prompt and the turn stops when it
+            // reaches the cap, so this distinguishes "the harness gave up" from
+            // "the model finished". A turn that ends normally on exactly the
+            // last iteration reports `budget`, which overstates the cap's role
+            // in a rare case and never understates it.
+            exit = if slot.app.iterations >= slot.app.max_iterations {
+                headless::Exit::Budget
+            } else {
+                headless::Exit::Complete
+            };
+            break;
+        }
+    }
+
+    // The same teardown the quit path does, for the same reasons: a job outlives
+    // the turn that started it, and nothing should be left running behind a
+    // process that has reported its result.
+    if let Ok(mut registry) = ctx.jobs.lock() {
+        for (_, cancel) in registry.drain() {
+            let _ = cancel.send(());
+        }
+    }
+    for slot in sessions.iter_mut() {
+        if let Some(inflight) = slot.inflight.take() {
+            let _ = inflight.cancel.send(());
+        }
+        slot.app.cancel();
+        slot.app.autosave_in_progress();
+    }
+
+    Ok(headless::RunRecord::build(
+        sessions.app(),
+        exit,
+        started.elapsed().as_millis() as u64,
+        questions_declined,
+        unconfined,
+    ))
 }
 
 /// Deliver an update to the session that asked for it.

@@ -41,15 +41,23 @@ have a section under step 4 of `docs/request-lifecycle.md`.
     deletions through the ordinary approval path — is the post's "update the
     playbook by delta rather than appending" in the shape we already have.
 
--   **Keep the protocol failures we already compute.** `Entry::Malformed`, the
-    retry counts and which `ProtocolError` fired are all recorded and then thrown
-    away by `roll_back_retries`. A running tally of which violations models
-    actually make is what would say which parser recovery or which line of the
-    contract to fix next. This is the only slice of the post's self-improving-
-    harness material worth taking: the rest (ADAS, AlphaEvolve, Darwin Gödel
-    Machine, joint weight-and-harness optimisation) is population search over
-    harness variants, which needs an automated evaluator this project has no
-    reason to build.
+-   ~~**Keep the protocol failures we already compute.**~~ **Done**, and more
+    cheaply than this entry assumed: `roll_back_retries` prunes only the
+    *model's* copy of the conversation, so `Entry::Malformed` was never actually
+    thrown away — the transcript had every attempt all along. `headless.rs`
+    derives the tally from it at the end of a run, grouped by parser reason, and
+    the smoke job in `bench.yml` fails a commit that introduces one on a trivial
+    prompt.
+
+    The dismissal in the second half of this entry needs revising too. The
+    population-search literature it waves off (ADAS, AlphaEvolve, DGM) is not
+    the only shape this comes in: Claw-SWE-Bench measured a **12.5–27.4 point**
+    Pass@1 spread from varying the harness alone on a fixed model, against 29.4
+    points across nine models on a fixed harness — the scaffold is a
+    model-tier-sized variable — and it did so with a single lineage and no
+    population machinery at all. The evaluator this project "has no reason to
+    build" is now three published ones it can be plugged into; see
+    `bench/README.md`.
 
 Two things the post argues for that are already here, worth not regressing: the
 approval modal and the `iterations` cap are exactly its "permission controls

@@ -91,6 +91,14 @@ pub struct Sandbox {
     /// When set, the one path writes may touch — the subtree allowance below is
     /// replaced by this single file. See [`Sandbox::writes_limited_to`].
     write_only: Option<PathBuf>,
+    /// Whether commands are actually confined.
+    ///
+    /// False only for [`Sandbox::unconfined`], where something outside the
+    /// harness is the boundary instead. Carried on the struct rather than
+    /// decided at each call site so that every path which runs a command —
+    /// `command`, `program`, and anything built on them — cannot disagree about
+    /// it.
+    confined: bool,
 }
 
 impl Sandbox {
@@ -129,7 +137,49 @@ impl Sandbox {
             root,
             home,
             write_only: None,
+            confined: true,
         })
+    }
+
+    /// A sandbox that confines nothing, for running inside a container that is
+    /// already the isolation boundary.
+    ///
+    /// This is the one way to run commands without Seatbelt, and it exists for
+    /// benchmark runners: they hand each task its own container, so the
+    /// confinement the harness would add is the confinement it already has. The
+    /// harness cannot verify that claim from in here — which is exactly why
+    /// [`crate::config::Args::validate`] refuses this outside `--headless`, and
+    /// why the run record carries `unconfined: true` so no result can be read as
+    /// confined when it was not.
+    ///
+    /// Unlike [`Sandbox::new`] this needs neither macOS nor `sandbox-exec`, but
+    /// it still resolves the root: the working directory is where commands run
+    /// and where reads are confined in-process, and neither of those stops
+    /// mattering because the kernel is no longer involved.
+    pub fn unconfined(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let root = std::fs::canonicalize(root)
+            .with_context(|| format!("resolving sandbox root {}", root.display()))?;
+        if !root.is_dir() {
+            bail!("sandbox root {} is not a directory", root.display());
+        }
+        // Still resolved, because `denies_read` is built from it and the
+        // credential denylist stays in force for in-process reads whether or not
+        // the kernel is enforcing anything.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|h| std::fs::canonicalize(h).ok());
+        Ok(Self {
+            root,
+            home,
+            write_only: None,
+            confined: false,
+        })
+    }
+
+    /// Whether the kernel is confining what commands can reach.
+    pub fn is_confined(&self) -> bool {
+        self.confined
     }
 
     pub fn root(&self) -> &Path {
@@ -265,6 +315,11 @@ impl Sandbox {
     /// Build the sandboxed command. `script` is passed to `sh -c` inside the
     /// sandbox, so the confinement applies to it and every process it spawns.
     pub fn command(&self, script: &str) -> tokio::process::Command {
+        if !self.confined {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.arg("-c").arg(script).current_dir(&self.root);
+            return command;
+        }
         let mut command = tokio::process::Command::new(SANDBOX_EXEC);
         command
             .arg("-p")
@@ -280,6 +335,11 @@ impl Sandbox {
     /// argument is passed literally, so a value like a file path can never be
     /// reinterpreted as shell syntax.
     pub fn program(&self, program: &str, args: &[&str]) -> tokio::process::Command {
+        if !self.confined {
+            let mut command = tokio::process::Command::new(program);
+            command.args(args).current_dir(&self.root);
+            return command;
+        }
         let mut command = tokio::process::Command::new(SANDBOX_EXEC);
         command.arg("-p").arg(self.profile()).arg(program);
         command.args(args).current_dir(&self.root);
@@ -507,5 +567,52 @@ mod tests {
     #[test]
     fn rejects_a_nonexistent_root() {
         assert!(Sandbox::new("/tmp/definitely-does-not-exist-ai-harness").is_err());
+    }
+}
+
+#[cfg(test)]
+mod unconfined_tests {
+    use super::*;
+
+    /// The whole point of the mode: no `sandbox-exec` in front of the command.
+    /// Asserted on the program actually being spawned rather than on a flag,
+    /// because the flag is not what confines anything.
+    #[test]
+    fn an_unconfined_command_does_not_go_through_seatbelt() {
+        let sandbox =
+            Sandbox::unconfined(std::env::temp_dir()).expect("temp dir should be a valid root");
+        assert!(!sandbox.is_confined());
+        let command = sandbox.command("echo hi");
+        assert_eq!(command.as_std().get_program(), "/bin/sh");
+    }
+
+    #[test]
+    fn an_unconfined_program_runs_directly() {
+        let sandbox =
+            Sandbox::unconfined(std::env::temp_dir()).expect("temp dir should be a valid root");
+        let command = sandbox.program("echo", &["hi"]);
+        assert_eq!(command.as_std().get_program(), "echo");
+    }
+
+    /// Unconfined is about the kernel, not about secrets: the credential
+    /// denylist is what `crate::files` consults for an in-process read, and it
+    /// costs nothing to keep enforcing.
+    #[test]
+    fn the_credential_denylist_survives_going_unconfined() {
+        let root = std::env::temp_dir();
+        let sandbox = Sandbox::unconfined(&root).expect("temp dir should be a valid root");
+        assert!(
+            sandbox.denies_read(&sandbox.root().join(".env")),
+            "a secret is still a secret when the container is the boundary"
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_not_a_directory_is_refused() {
+        let file = std::env::temp_dir().join("ai-harness-unconfined-root-test");
+        std::fs::write(&file, b"x").expect("writing the fixture");
+        let result = Sandbox::unconfined(&file);
+        let _ = std::fs::remove_file(&file);
+        assert!(result.is_err(), "a file is not a workspace");
     }
 }

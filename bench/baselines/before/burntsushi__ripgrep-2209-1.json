@@ -1,0 +1,35 @@
+{
+  "exit": "timeout",
+  "model": "deepseek/deepseek-v4-pro",
+  "iterations": 25,
+  "wall_ms": 900035,
+  "ledger": {
+    "prompt_tokens": 285420,
+    "completion_tokens": 6062,
+    "requests": 25,
+    "waiting_ms": 859206,
+    "cached_tokens": 225385,
+    "last_prompt_tokens": 23983
+  },
+  "actions": {
+    "reads": 0,
+    "searches": 4,
+    "fetches": 0,
+    "shells": 17,
+    "writes": 0,
+    "denied": 0
+  },
+  "protocol_errors": {
+    "total": 0,
+    "by_reason": {}
+  },
+  "questions_declined": 0,
+  "compactions": 0,
+  "check": {
+    "command": "cargo check --all-targets",
+    "runs": 0,
+    "final_exit": null
+  },
+  "session_path": "/tmp/ai-harness/sessions/session-1787517271",
+  "unconfined": true
+}

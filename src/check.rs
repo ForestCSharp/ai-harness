@@ -8,7 +8,11 @@
 //! the switch.
 //!
 //! ```text
-//! Cargo.toml at the root  →  cargo check --all-targets
+//! Cargo.toml at the root   →  cargo check --all-targets
+//! go.mod                   →  go build ./...
+//! package.json script      →  npm run typecheck | npm run check
+//! tsconfig.json            →  npx --no-install tsc --noEmit
+//! Ruff configured          →  ruff check .
 //! ```
 //!
 //! **Conservative on purpose.** A default that guesses wrong is worse than no
@@ -38,7 +42,53 @@ pub fn detect(root: &Path) -> Option<String> {
     if root.join("go.mod").is_file() {
         return Some("go build ./...".to_string());
     }
-    npm_script(root)
+    // A `package.json` script comes before `tsconfig.json` deliberately: a
+    // project that named its own check has said what it wants run, and guessing
+    // past that would override an answer rather than supply a missing one.
+    if let Some(script) = npm_script(root) {
+        return Some(script);
+    }
+    if root.join("tsconfig.json").is_file() {
+        // `--noEmit` is the whole reason this clears the bar: it is a typecheck
+        // with no artifacts. `--no-install` so a missing toolchain fails
+        // immediately instead of silently downloading one mid-turn.
+        return Some("npx --no-install tsc --noEmit".to_string());
+    }
+    ruff(root)
+}
+
+/// Files that mean this project has chosen Ruff.
+///
+/// Python has no universal check the way Cargo and Go do — `python -m
+/// compileall` writes bytecode, a test suite is slow, and neither is safe to
+/// pick on someone's behalf. A Ruff configuration is different: it is the
+/// project saying which linter it runs, and Ruff is fast enough to pay for on
+/// every writing turn. So Python is inferred exactly when it has been named,
+/// and left alone otherwise.
+const RUFF_CONFIGS: &[&str] = &["ruff.toml", ".ruff.toml"];
+
+fn ruff(root: &Path) -> Option<String> {
+    let configured = RUFF_CONFIGS.iter().any(|name| root.join(name).is_file())
+        || pyproject_names_ruff(root).unwrap_or(false);
+    configured.then(|| "ruff check .".to_string())
+}
+
+/// Whether `pyproject.toml` carries a `[tool.ruff]` section.
+///
+/// Matched as text rather than parsed: there is no TOML parser in this binary,
+/// adding one to answer a yes/no question would be the tail wagging the dog, and
+/// the section header is unambiguous enough that a substring is the honest
+/// implementation. Bounded like [`npm_script`], for the same reason.
+fn pyproject_names_ruff(root: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(root.join("pyproject.toml")).ok()?;
+    if text.len() > MAX_PACKAGE_JSON {
+        return None;
+    }
+    Some(
+        text.lines()
+            .map(str::trim)
+            .any(|line| line == "[tool.ruff]" || line.starts_with("[tool.ruff.")),
+    )
 }
 
 /// The scripts a `package.json` may offer, in the order they are preferred.
@@ -268,5 +318,74 @@ mod tests {
         let absent = startup_notice(None);
         assert!(absent.contains("unverified"), "{absent}");
         assert!(absent.contains("--check"), "{absent}");
+    }
+
+    /// A project that named its own check has answered the question; inferring
+    /// past it would override the answer rather than supply a missing one.
+    #[test]
+    fn a_package_json_script_beats_tsconfig() {
+        let dir = tempdir("script-beats-tsconfig");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"typecheck":"tsc -p ."}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
+        assert_eq!(detect(&dir).as_deref(), Some("npm run typecheck"));
+        clean(&dir);
+    }
+
+    #[test]
+    fn tsconfig_alone_is_a_typecheck() {
+        let dir = tempdir("tsconfig-alone");
+        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
+        assert_eq!(
+            detect(&dir).as_deref(),
+            Some("npx --no-install tsc --noEmit")
+        );
+        clean(&dir);
+    }
+
+    #[test]
+    fn ruff_is_inferred_from_its_own_config() {
+        let dir = tempdir("ruff-toml");
+        std::fs::write(dir.join("ruff.toml"), "line-length = 100\n").unwrap();
+        assert_eq!(detect(&dir).as_deref(), Some("ruff check ."));
+        clean(&dir);
+    }
+
+    #[test]
+    fn ruff_is_inferred_from_a_pyproject_section() {
+        let dir = tempdir("ruff-pyproject");
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = \"x\"\n\n[tool.ruff.lint]\nselect = [\"E\"]\n",
+        )
+        .unwrap();
+        assert_eq!(detect(&dir).as_deref(), Some("ruff check ."));
+        clean(&dir);
+    }
+
+    /// The conservative half of the rule, and the one worth protecting: a Python
+    /// project that has not named a linter gets no check rather than a guessed
+    /// one. `--check` is how someone chooses for it.
+    #[test]
+    fn python_without_a_named_linter_is_left_alone() {
+        let dir = tempdir("bare-python");
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
+        std::fs::write(dir.join("setup.py"), "").unwrap();
+        assert_eq!(detect(&dir), None, "a guess here would be worse than none");
+        clean(&dir);
+    }
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-harness-check-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn clean(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

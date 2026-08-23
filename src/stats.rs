@@ -21,7 +21,7 @@ use crate::app::Entry;
 /// resolved into a full rewrite before the modal, so both land as a
 /// `WriteResult`. Splitting them would mean counting *proposals* for one of
 /// them, which would quietly include the ones you refused.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Actions {
     pub reads: usize,
     /// Greps and globs together — both are `Entry::SearchResult`, and the

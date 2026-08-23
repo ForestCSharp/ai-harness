@@ -1824,6 +1824,26 @@ impl App {
         }
     }
 
+    /// Save a turn that is still running.
+    ///
+    /// [`App::maybe_autosave`] refuses while busy, which is right interactively:
+    /// the screen is the view, and the session file is for what has settled.
+    /// Unattended there is no screen — a fifteen-minute headless run persisted
+    /// nothing until it ended, so the one moment you most want to look at a
+    /// stuck turn is the one moment there is nothing on disk to look at.
+    ///
+    /// Keeps the fingerprint guard rather than writing unconditionally, which is
+    /// what stops this costing a serialisation on every tick: `fingerprint` is
+    /// two lengths, and it only moves when something was actually appended.
+    /// Streamed deltas do not append — they accumulate in the display buffer —
+    /// so a long reply arriving token by token still writes nothing.
+    pub fn autosave_in_progress(&mut self) {
+        if self.history.len() <= 1 || self.fingerprint() == self.last_saved {
+            return;
+        }
+        self.persist_current();
+    }
+
     /// Save after a completed turn. A no-op unless idle, past the empty startup
     /// state, and actually changed — so it neither writes mid-turn nor litters
     /// the directory before a conversation has begun.
@@ -6670,6 +6690,56 @@ mod tests {
         assert!(
             session_files(&dir).is_empty(),
             "a turn in flight must not be saved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The counterpart to `autosave_is_skipped_while_busy`: the same state that
+    /// the interactive rule deliberately refuses to save is the state an
+    /// unattended run most needs on disk.
+    #[test]
+    fn a_running_turn_is_saved_for_an_unattended_run() {
+        let dir = session_temp_dir("in-progress");
+        let mut app = app_in(&dir);
+        app.input.insert_str("mid turn");
+        app.submit().unwrap(); // now Waiting
+
+        app.maybe_autosave();
+        assert!(
+            session_files(&dir).is_empty(),
+            "the interactive rule must keep refusing a turn in flight"
+        );
+
+        app.autosave_in_progress();
+        assert_eq!(
+            session_files(&dir).len(),
+            1,
+            "a headless run must be able to see a turn that has not finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard that keeps this from serialising the session on every tick of
+    /// the headless loop, which runs at 80ms and would otherwise pay for a full
+    /// write between every pair of round-trips.
+    #[test]
+    fn an_unchanged_running_turn_is_not_rewritten() {
+        let dir = session_temp_dir("in-progress-unchanged");
+        let mut app = app_in(&dir);
+        app.input.insert_str("mid turn");
+        app.submit().unwrap();
+        app.autosave_in_progress();
+
+        let name = session_files(&dir)[0].clone();
+        let path = dir.join(&name).join("session.json");
+        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Nothing was appended, so the fingerprint has not moved.
+        app.autosave_in_progress();
+        let second = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            first, second,
+            "an unchanged conversation must not be rewritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

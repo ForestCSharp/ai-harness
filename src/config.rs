@@ -244,9 +244,111 @@ pub struct Args {
     /// Output price in dollars per million tokens. See `--price-in`.
     #[arg(long, env = "AI_HARNESS_PRICE_OUT")]
     pub price_out: Option<f64>,
+
+    /// Run one prompt with no terminal and exit, printing a JSON record.
+    ///
+    /// This is the mode a benchmark runner drives. There is no screen and nobody
+    /// to answer the approval modal, so the run approves its own actions —
+    /// `--auto-approve` is implied and cannot be turned off here, since a
+    /// headless run that stopped to ask would simply hang until its timeout.
+    /// Everything else about a turn is unchanged: the same contract, the same
+    /// protocol, the same iteration budget, the same project check.
+    #[arg(long, env = "AI_HARNESS_HEADLESS")]
+    pub headless: bool,
+
+    /// The prompt for a headless run. `-` reads it from stdin.
+    ///
+    /// Stdin is worth having because a task statement is often a paragraph with
+    /// newlines and quoting in it, and passing that through a shell argument is
+    /// how it gets mangled.
+    #[arg(long, env = "AI_HARNESS_PROMPT")]
+    pub prompt: Option<String>,
+
+    /// Where a headless run writes its JSON record. Defaults to stdout.
+    #[arg(long, env = "AI_HARNESS_HEADLESS_OUTPUT")]
+    pub headless_output: Option<PathBuf>,
+
+    /// Wall-clock ceiling on a headless run, in seconds.
+    ///
+    /// `--max-iterations` bounds round-trips and `--command-timeout` bounds one
+    /// quiet command, but neither bounds the clock: a turn that keeps making
+    /// progress slowly can outlive any benchmark harness willing to wait for it.
+    /// A run stopped this way reports `timeout` rather than pretending to have
+    /// finished. 0 disables it.
+    #[arg(long, default_value_t = 1800, env = "AI_HARNESS_HEADLESS_TIMEOUT")]
+    pub headless_timeout: u64,
+
+    /// How commands are confined.
+    ///
+    /// `auto` is the sandbox this harness is built on and the only value worth
+    /// using interactively. `none` exists for one situation: running inside a
+    /// container that is *already* the isolation boundary, which is how every
+    /// benchmark runner works. It is refused outside `--headless` — see
+    /// [`Args::validate`].
+    #[arg(long, value_enum, default_value_t, env = "AI_HARNESS_SANDBOX")]
+    pub sandbox: SandboxMode,
+}
+
+/// How commands are confined. See [`Args::sandbox`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum SandboxMode {
+    /// Confine commands with the platform sandbox, refusing to run if there is
+    /// not one. The default, and the only thing an interactive session accepts.
+    #[default]
+    Auto,
+    /// Run commands unconfined, because something outside the harness is
+    /// providing the isolation.
+    None,
 }
 
 impl Args {
+    /// Reject flag combinations that cannot mean anything, before the terminal
+    /// is taken over and before any work starts.
+    ///
+    /// The one that matters is `--sandbox=none`. The harness's containment
+    /// story is that a command you approve is confined and a command you did not
+    /// approve does not run; unconfined *and* self-approving is both halves gone
+    /// at once. That combination is defensible when a container is the boundary
+    /// instead, and indefensible at a prompt where the user believes the
+    /// sandbox notice they saw at startup. So it is allowed exactly where the
+    /// container assumption holds and refused everywhere else — structurally,
+    /// rather than by documenting that you should not.
+    pub fn validate(&self) -> Result<()> {
+        if self.sandbox == SandboxMode::None && !self.headless {
+            anyhow::bail!(
+                "--sandbox=none is only accepted with --headless.\n\
+                 It exists for running inside a container that already provides \
+                 the isolation. Interactively there is nothing else confining \
+                 the commands, so the harness refuses rather than running them \
+                 unconfined."
+            );
+        }
+        if self.headless && self.prompt.is_none() {
+            anyhow::bail!("--headless needs --prompt <TEXT> (or --prompt - to read stdin)");
+        }
+        Ok(())
+    }
+
+    /// Wall-clock ceiling on a headless run, or `None` when disabled.
+    pub fn headless_timeout(&self) -> Option<Duration> {
+        (self.headless_timeout > 0).then(|| Duration::from_secs(self.headless_timeout))
+    }
+
+    /// The headless prompt, reading stdin when it is `-`.
+    pub fn prompt_text(&self) -> Result<Option<String>> {
+        let Some(prompt) = &self.prompt else {
+            return Ok(None);
+        };
+        if prompt != "-" {
+            return Ok(Some(prompt.clone()));
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .context("reading the prompt from stdin")?;
+        Ok(Some(text))
+    }
+
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.command_timeout.max(1))
     }
@@ -314,6 +416,54 @@ mod tests {
         assert_eq!(
             args(&[]).sessions_dir(root),
             root.join(".ai_harness").join("sessions")
+        );
+    }
+
+    /// The containment rule the mode exists under. Unconfined *and*
+    /// self-approving is both halves of the harness's safety story gone at once;
+    /// it is defensible only where a container is the boundary instead, which is
+    /// what `--headless` stands in for.
+    #[test]
+    fn unconfined_is_refused_outside_headless() {
+        let err = args(&["--sandbox", "none"])
+            .validate()
+            .expect_err("interactive use must not be able to turn the sandbox off");
+        assert!(
+            err.to_string().contains("--headless"),
+            "the message must say what would make it legal: {err}"
+        );
+    }
+
+    #[test]
+    fn unconfined_is_accepted_with_headless() {
+        args(&["--sandbox", "none", "--headless", "--prompt", "hi"])
+            .validate()
+            .expect("a container-isolated run is the case this mode is for");
+    }
+
+    #[test]
+    fn headless_needs_a_prompt() {
+        let err = args(&["--headless"])
+            .validate()
+            .expect_err("a headless run with nothing to do is a hang waiting to happen");
+        assert!(err.to_string().contains("--prompt"), "{err}");
+    }
+
+    /// The default has to stay the confined one: a flag nobody passed must never
+    /// be the reason commands ran unsandboxed.
+    #[test]
+    fn the_sandbox_defaults_to_confined() {
+        let default = args(&[]);
+        assert_eq!(default.sandbox, SandboxMode::Auto);
+        default.validate().expect("the default must be legal");
+    }
+
+    #[test]
+    fn a_zero_headless_timeout_disables_the_deadline() {
+        assert_eq!(args(&["--headless-timeout", "0"]).headless_timeout(), None);
+        assert_eq!(
+            args(&["--headless-timeout", "60"]).headless_timeout(),
+            Some(Duration::from_secs(60))
         );
     }
 

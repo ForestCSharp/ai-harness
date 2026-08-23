@@ -1,0 +1,2 @@
+# The wrapper shells out to the ai-harness binary and parses its JSON record,
+# so it needs nothing from PyPI. HAL requires the file to exist.

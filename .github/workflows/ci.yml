@@ -1,0 +1,77 @@
+name: ci
+
+# Everything here is free and needs no secrets, so it runs on every push and on
+# every pull request — including forks, which by design cannot reach the API key
+# and therefore cannot run anything in bench.yml.
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    # Both platforms, because they run different tests. The sandbox suite is
+    # `#[cfg(all(test, target_os = "macos"))]` and only macOS exercises it;
+    # Linux is where the benchmark containers actually run, and is the only
+    # place a non-macOS build break would surface.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets --locked
+      # The `live_` tests are excluded by default and stay that way: they need a
+      # key and reach the network, which is bench.yml's business.
+      - run: cargo test --locked
+
+  image:
+    # The benchmark adapters bind-mount the binary this image produces, so image
+    # rot breaks every benchmark run silently. Building it per commit is the
+    # cheapest place to find that out.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: bench/Dockerfile
+          push: false
+          tags: ai-harness:bench
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  adapters:
+    # The adapters are plain Python with no dependencies, so this is a syntax
+    # and import check rather than a test suite — enough to catch the case where
+    # a rename in the shared runner breaks all three without anyone noticing
+    # until a benchmark run fails an hour in.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m compileall -q bench/
+      - run: python -c "import sys; sys.path.insert(0, 'bench/runner'); import ai_harness_runner; print('runner imports clean')"

@@ -1060,6 +1060,108 @@ Give it extra guidance (appended to the protocol contract, never replacing it):
 cargo run -- --system "Prefer ripgrep over grep."
 ```
 
+## Headless runs
+
+`--headless` runs one prompt with no terminal and prints a JSON record of what
+happened. It is how the harness is driven by something that is not a person —
+a benchmark runner, a CI job, a script.
+
+```bash
+cargo run -- --headless --prompt "count the rust files in src"
+```
+
+```bash
+echo "$TASK" | cargo run -- --headless --prompt - --headless-output run.json
+```
+
+**It is the same loop**, with the screen and the keyboard taken out: the same
+contract, the same strict parsing, the same retry path, the same iteration
+budget, the same project check gating the end of a turn, the same compaction
+trigger. Forking that logic to get a headless mode would mean measuring a
+harness nobody actually runs.
+
+Two things it has to do that a person otherwise does:
+
+- **Approve.** There is no modal and nobody to answer it, so `--auto-approve` is
+  forced on and cannot be turned off here. The alternative is not safety, it is
+  hanging until the timeout.
+- **Decline.** `<ai-harness-option>` blocks a turn on a choice, and auto-approve
+  deliberately will not answer one. A headless run declines it and the model is
+  told nobody is there. A run that needed an answer is a poor run, but it has to
+  end as a run rather than as a hang — and `questions_declined` in the record
+  says it happened.
+
+The record:
+
+```json
+{
+  "exit": "complete",
+  "model": "deepseek/deepseek-v4-pro",
+  "iterations": 2,
+  "wall_ms": 3998,
+  "ledger": { "prompt_tokens": 7914, "completion_tokens": 120, "requests": 2,
+              "waiting_ms": 3984, "cached_tokens": 0 },
+  "actions": { "reads": 0, "searches": 1, "fetches": 0, "shells": 0,
+               "writes": 0, "denied": 0 },
+  "protocol_errors": { "total": 0, "by_reason": {} },
+  "questions_declined": 0,
+  "compactions": 0,
+  "check": { "command": "cargo check --all-targets", "runs": 0, "final_exit": null },
+  "session_path": ".ai_harness/sessions/session-1787509494",
+  "unconfined": false
+}
+```
+
+Nothing is kept during the run to produce this. Every number is derived at the
+end from the transcript, the ledger, and the session directory — the rule
+[`/stats`](#project-memory) already follows — which also means a record can be
+rebuilt from a saved session long after the process is gone.
+
+`protocol_errors` is the one figure here that nothing else reports, and it costs
+nothing: a corrective retry prunes only the *model's* copy of the conversation,
+so the transcript keeps every malformed reply and the tally is already on disk.
+
+Four things worth knowing:
+
+- **`exit` distinguishes who gave up.** `complete` is the model ending its turn;
+  `budget` is `--max-iterations` running out; `timeout` is `--headless-timeout`,
+  a wall-clock bound that exists because neither of the other two is one — a turn
+  making slow progress can outlive any runner willing to wait for it.
+- **The process exits 0 whenever a record was produced**, including a run that
+  timed out. Those are outcomes, and the record states them; a non-zero status
+  would be indistinguishable from the binary failing to start, which is the one
+  thing a runner genuinely needs to tell apart.
+- **`--prompt -` reads stdin**, which is how a task statement with newlines and
+  quoting in it survives the trip.
+- **It still writes a session**, so `/load` opens a headless run afterwards and
+  reads it like any other conversation.
+
+### `--sandbox=none`
+
+The sandbox is macOS-only and every benchmark runner is a Linux container, so
+there is one way to run commands unconfined:
+
+```bash
+ai-harness --headless --sandbox none --prompt "..."
+```
+
+**It is refused without `--headless`**, and that refusal is the whole design.
+The containment story here is two-part — a command you approve is confined, and
+a command you did not approve does not run. Unconfined *and* self-approving is
+both halves gone at once. That is defensible when a per-task container is the
+boundary instead, and indefensible at a prompt where you have just been told at
+startup that there is a sandbox. So it is allowed exactly where the container
+assumption holds, structurally, rather than documented as something you should
+not do.
+
+The record carries `unconfined: true`, and a notice goes into the transcript, so
+a saved session read back later still says how it ran. The credential denylist
+stays in force regardless: it is what `<ai-harness-read>` consults in-process,
+and it costs nothing to keep.
+
+See [`bench/README.md`](bench/README.md) for the benchmark adapters this exists
+for.
+
 ## Context compaction
 
 Those bounds keep one turn from running away. They do nothing about the slower

@@ -1,0 +1,144 @@
+name: bench
+
+# Anything here spends real money on the OpenRouter key, so two rules hold.
+#
+# 1. Fork pull requests can never run it. That is a GitHub constraint rather
+#    than a policy choice — secrets are not exposed to `pull_request` from a
+#    fork — and the guard below makes the skip explicit instead of leaving the
+#    job to fail confusingly on a missing key. Forks still get ci.yml in full.
+# 2. The automatic runs are bounded. `smoke` is a single prompt; the full
+#    benchmark sweeps are `workflow_dispatch` only, because a 350-instance Claw
+#    run per commit is a different order of spend from a smoke test.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Which suite to run
+        type: choice
+        options: [claw, harnessbench]
+        default: claw
+      tasks:
+        description: How many instances (empty runs the full suite)
+        type: string
+        default: "20"
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: headless smoke
+    # `github.repository` on a push, and on a PR only when the branch lives in
+    # this repo rather than a fork.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # Pinned in repository variables rather than here, so changing the model a
+      # benchmark runs against is a deliberate settings edit and shows up as one.
+      OPENROUTER_MODEL: ${{ vars.BENCH_MODEL || 'deepseek/deepseek-v4-pro' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+
+      # The end-to-end assertion that matters for this repository: a headless
+      # run against its own source finishes, reports a clean protocol, and
+      # produces a record with the shape every adapter parses.
+      - name: run one headless turn
+        run: |
+          ./target/release/ai-harness \
+            --headless \
+            --prompt "How many Rust source files are in src/? Answer with the number." \
+            --max-iterations 8 \
+            --headless-timeout 240 \
+            --headless-output record.json
+
+      - name: check the record
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          record = json.load(open("record.json"))
+          print(json.dumps(record, indent=2))
+          failures = []
+          if record["exit"] != "complete":
+              failures.append(f"exit was {record['exit']}, expected complete")
+          if record["ledger"]["requests"] < 1:
+              failures.append("no requests were made")
+          # Not a hard failure on its own, but a protocol error on a trivial
+          # prompt means the contract or the parser moved. Surfacing it here is
+          # the cheapest early warning this repository has.
+          if record["protocol_errors"]["total"] > 0:
+              failures.append(f"protocol errors: {record['protocol_errors']}")
+          if record["questions_declined"] > 0:
+              failures.append("the model asked a question on a trivial prompt")
+          if failures:
+              sys.exit("smoke run failed:\n  " + "\n  ".join(failures))
+          print("ok")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-record
+          path: record.json
+
+  suite:
+    name: ${{ inputs.benchmark }} suite
+    # Dispatch only. This is the job that costs real money at scale, and it
+    # needs an external benchmark checkout that this repository does not vendor.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_MODEL: ${{ vars.BENCH_MODEL || 'deepseek/deepseek-v4-pro' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: ai-harness
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo build --release --locked
+        working-directory: ai-harness
+
+      - name: check out the benchmark
+        run: |
+          case "${{ inputs.benchmark }}" in
+            claw)         git clone --depth 1 https://github.com/opensquilla/claw-swe-bench bench-repo ;;
+            harnessbench) git clone --depth 1 https://github.com/Qihoo360/harness-bench bench-repo ;;
+          esac
+
+      # Copying rather than symlinking: both benchmarks import the adapter as
+      # part of their own package, and a symlink out of the package directory is
+      # the kind of thing that works locally and not in a container.
+      - name: install the adapter
+        run: |
+          case "${{ inputs.benchmark }}" in
+            claw)
+              cp ai-harness/bench/adapters/claw/ai_harness.py bench-repo/claw_swebench/claws/
+              ;;
+            harnessbench)
+              cp ai-harness/bench/adapters/harnessbench/ai_harness.py bench-repo/src/harnessbench/adapters/
+              ;;
+          esac
+          echo "Adapter installed. Registration (claws/__init__.py + CLAW_DEFAULTS,"
+          echo "or config/harness.yaml) is described in bench/README.md and is not"
+          echo "yet automated — see the note there before trusting a first run."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.benchmark }}-results
+          path: |
+            bench-repo/results/**
+            bench-repo/logs/**
+          if-no-files-found: warn
