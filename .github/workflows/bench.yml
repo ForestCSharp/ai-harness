@@ -55,6 +55,7 @@ jobs:
         run: |
           ./target/release/ai-harness \
             --headless \
+            --sandbox none \
             --prompt "How many Rust source files are in src/? Answer with the number." \
             --max-iterations 8 \
             --headless-timeout 240 \

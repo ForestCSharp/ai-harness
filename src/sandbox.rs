@@ -182,6 +182,32 @@ impl Sandbox {
         self.confined
     }
 
+    /// The sandbox a test should build for the platform it is running on.
+    ///
+    /// **A stopgap, and worth naming as one.** Seatbelt is macOS-only, so on
+    /// Linux `new` refuses and every test that builds a sandbox to exercise
+    /// something *else* — the check loop, jobs, memory — dies in its setup with
+    /// an error about confinement it was never testing. This keeps those tests
+    /// running on Linux by handing them the unconfined sandbox, which is honest
+    /// for what they assert and dishonest as a description of the platform:
+    /// Linux has no confinement here at all.
+    ///
+    /// The real answer is a Linux backend (Landlock is the fit — an
+    /// unprivileged, self-applied policy, the same shape as Seatbelt), at which
+    /// point this becomes `new` everywhere and can go. Tests that assert on
+    /// confinement itself stay macOS-gated either way and keep using `new`.
+    #[cfg(test)]
+    pub fn for_tests(root: impl AsRef<Path>) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::new(root).expect("a sandbox for the test's working directory")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::unconfined(root).expect("an unconfined sandbox for the test's working directory")
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -380,6 +406,9 @@ fn check_profile_safe(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    // Only the macOS-gated tests below call this; on Linux they are compiled
+    // out and it is left with no callers rather than being wrong.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn temp_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ai-harness-sbtest-{name}"));
         let _ = std::fs::create_dir_all(&dir);

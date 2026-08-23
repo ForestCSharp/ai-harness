@@ -23,3 +23,10 @@ Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF
 2026-08-23 16:53:07 [INFO] claw_swebench.workspace: Stripped future commits/tags from burntsushi__ripgrep-2209
 2026-08-23 16:53:07 [INFO] claw_swebench.workspace: Injected global gitignore for build artifacts.
 2026-08-23 16:53:07 [INFO] claw_swebench.orchestrator: Sending task to ai-harness for burntsushi__ripgrep-2209 (agent=swe-burntsushi__ripgrep-2209)...
+2026-08-23 17:08:08 [INFO] claw_swebench.orchestrator: Agent finished: success=False finish=timeout duration=900.2s
+2026-08-23 17:08:08 [INFO] claw_swebench.workspace: Cleaning up container ai-harness-swe-burntsushi__ripgrep-2209
+2026-08-23 17:08:08 [INFO] claw_swebench.orchestrator: [1/1] burntsushi__ripgrep-2209 → timeout (916.1s, patch_empty=True)
+2026-08-23 17:08:08 [INFO] claw_swebench.orchestrator: Batch complete: {'timeout': 1}
+2026-08-23 17:08:08 [INFO] __main__: ============================================================
+2026-08-23 17:08:08 [INFO] __main__: Run complete: baseline-before-burntsushi__ripgrep-2209-2
+2026-08-23 17:08:08 [INFO] __main__:   burntsushi__ripgrep-2209 → EMPTY (916.1s)

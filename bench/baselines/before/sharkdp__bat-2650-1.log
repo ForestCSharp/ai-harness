@@ -1,0 +1,25 @@
+2026-08-23 17:38:39 [INFO] __main__: Config: claw=ai-harness dataset=SWE-bench/SWE-bench_Multilingual model=deepseek/deepseek-v4-pro timeout=900s gitignore=True
+2026-08-23 17:38:39 [INFO] claw_swebench.dataset: Loading dataset SWE-bench/SWE-bench_Multilingual (split=test)...
+2026-08-23 17:38:39 [INFO] httpx: HTTP Request: HEAD https://huggingface.co/datasets/SWE-bench/SWE-bench_Multilingual/resolve/main/README.md "HTTP/1.1 307 Temporary Redirect"
+2026-08-23 17:38:39 [INFO] httpx: HTTP Request: HEAD https://huggingface.co/api/resolve-cache/datasets/SWE-bench/SWE-bench_Multilingual/846e647b9f33c0b51b739d005d13d85493c9af09/README.md "HTTP/1.1 200 OK"
+2026-08-23 17:38:39 [INFO] httpx: HTTP Request: HEAD https://huggingface.co/datasets/SWE-bench/SWE-bench_Multilingual/resolve/846e647b9f33c0b51b739d005d13d85493c9af09/SWE-bench_Multilingual.py "HTTP/1.1 404 Not Found"
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-08-23 17:38:39 [WARNING] huggingface_hub.utils._http: Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-08-23 17:38:40 [INFO] httpx: HTTP Request: HEAD https://s3.amazonaws.com/datasets.huggingface.co/datasets/datasets/SWE-bench/SWE-bench_Multilingual/SWE-bench/SWE-bench_Multilingual.py "HTTP/1.1 404 Not Found"
+2026-08-23 17:38:40 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/datasets/SWE-bench/SWE-bench_Multilingual/revision/846e647b9f33c0b51b739d005d13d85493c9af09 "HTTP/1.1 200 OK"
+2026-08-23 17:38:40 [INFO] httpx: HTTP Request: HEAD https://huggingface.co/datasets/SWE-bench/SWE-bench_Multilingual/resolve/846e647b9f33c0b51b739d005d13d85493c9af09/.huggingface.yaml "HTTP/1.1 404 Not Found"
+2026-08-23 17:38:40 [INFO] httpx: HTTP Request: GET https://datasets-server.huggingface.co/info?dataset=SWE-bench/SWE-bench_Multilingual "HTTP/1.1 200 OK"
+2026-08-23 17:38:40 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/datasets/SWE-bench/SWE-bench_Multilingual/tree/846e647b9f33c0b51b739d005d13d85493c9af09/data?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-08-23 17:38:40 [INFO] httpx: HTTP Request: GET https://huggingface.co/api/datasets/SWE-bench/SWE-bench_Multilingual/tree/846e647b9f33c0b51b739d005d13d85493c9af09?recursive=false&expand=false "HTTP/1.1 200 OK"
+2026-08-23 17:38:40 [INFO] httpx: HTTP Request: HEAD https://huggingface.co/datasets/SWE-bench/SWE-bench_Multilingual/resolve/846e647b9f33c0b51b739d005d13d85493c9af09/dataset_infos.json "HTTP/1.1 404 Not Found"
+2026-08-23 17:38:40 [INFO] claw_swebench.dataset: Loaded 300 instances from dataset.
+2026-08-23 17:38:40 [INFO] claw_swebench.dataset: Filtered to 1 instances.
+2026-08-23 17:38:40 [INFO] __main__: Loaded 1 instances to process.
+2026-08-23 17:38:40 [INFO] claw_swebench.orchestrator: Running 1 instances with 1 worker(s).
+2026-08-23 17:38:40 [INFO] claw_swebench.orchestrator: [1/1] Running sharkdp__bat-2650...
+2026-08-23 17:38:40 [INFO] claw_swebench.workspace: Starting container ai-harness-swe-sharkdp__bat-2650 from image sweb.eval.x86_64.sharkdp__bat-2650:latest
+2026-08-23 17:38:41 [INFO] claw_swebench.workspace: Container ai-harness-swe-sharkdp__bat-2650 started.
+2026-08-23 17:38:41 [INFO] claw_swebench.workspace: Preparing instance sharkdp__bat-2650 at commit e2bf85e749d8
+2026-08-23 17:38:51 [INFO] claw_swebench.workspace: Stripped future commits/tags from sharkdp__bat-2650
+2026-08-23 17:38:51 [INFO] claw_swebench.workspace: Injected global gitignore for build artifacts.
+2026-08-23 17:38:51 [INFO] claw_swebench.orchestrator: Sending task to ai-harness for sharkdp__bat-2650 (agent=swe-sharkdp__bat-2650)...

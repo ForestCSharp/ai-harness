@@ -1,0 +1,38 @@
+{
+  "exit": "timeout",
+  "model": "deepseek/deepseek-v4-pro",
+  "iterations": 28,
+  "wall_ms": 900037,
+  "ledger": {
+    "prompt_tokens": 479330,
+    "completion_tokens": 39065,
+    "requests": 33,
+    "waiting_ms": 882351,
+    "cached_tokens": 418208,
+    "last_prompt_tokens": 21787
+  },
+  "actions": {
+    "reads": 11,
+    "searches": 10,
+    "fetches": 0,
+    "shells": 6,
+    "writes": 0,
+    "denied": 0
+  },
+  "protocol_errors": {
+    "total": 5,
+    "by_reason": {
+      "<ai-harness-grep> does not take `\"grep\"`; it takes only dir= and glob=. Nothing was applied \u2014 reply again using only the attributes <ai-harness-grep> accepts": 1,
+      "the model returned an empty reply": 4
+    }
+  },
+  "questions_declined": 0,
+  "compactions": 0,
+  "check": {
+    "command": "cargo check --all-targets",
+    "runs": 0,
+    "final_exit": null
+  },
+  "session_path": "/tmp/ai-harness/sessions/session-1787522906",
+  "unconfined": true
+}

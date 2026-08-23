@@ -7582,7 +7582,7 @@ mod file_tests {
         }
 
         let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
-        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.sandbox = Some(Sandbox::for_tests(&dir));
         app.input.insert_str("what is in that file?");
         app.submit().unwrap();
         (app, dir)
@@ -8835,7 +8835,7 @@ mod file_tests {
 
         let sessions = root.join(crate::config::HARNESS_DIR).join("sessions");
         let mut app = App::new("m".into(), None, 10, sessions);
-        app.sandbox = Some(Sandbox::new(&root).unwrap());
+        app.sandbox = Some(Sandbox::for_tests(&root));
         app.input.insert_str("clean up");
         app.submit().unwrap();
 
@@ -9251,7 +9251,7 @@ mod plan_tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
 
         let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
-        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.sandbox = Some(Sandbox::for_tests(&dir));
         // `App::new` built the contract before the sandbox existed, so it has
         // none of the sections derived from the project root. Rebuild, as the
         // first prompt does in a real session — otherwise a test that compares
@@ -9515,7 +9515,7 @@ mod memory_tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
 
         let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
-        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.sandbox = Some(Sandbox::for_tests(&dir));
         app.refresh_contract();
         (app, dir)
     }
@@ -10168,7 +10168,7 @@ mod job_tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
 
         let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
-        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.sandbox = Some(Sandbox::for_tests(&dir));
         app.refresh_contract();
         (app, dir)
     }
@@ -10496,7 +10496,7 @@ mod check_tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
 
         let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
-        app.sandbox = Some(Sandbox::new(&dir).unwrap());
+        app.sandbox = Some(Sandbox::for_tests(&dir));
         app.check_command = Some("cargo check".into());
         app.refresh_contract();
         (app, dir)

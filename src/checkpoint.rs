@@ -547,7 +547,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let session = root.join(".ai_harness").join("sessions").join("s");
         std::fs::create_dir_all(&session).unwrap();
-        let sandbox = Sandbox::new(root.clone()).expect("sandbox");
+        let sandbox = Sandbox::for_tests(root.clone());
         // Canonicalised by the sandbox (/var → /private/var on macOS), so use its
         // idea of the root for anything compared against a captured path.
         let root = sandbox.root().to_path_buf();

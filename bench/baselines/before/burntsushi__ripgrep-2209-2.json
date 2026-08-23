@@ -1,0 +1,38 @@
+{
+  "exit": "timeout",
+  "model": "deepseek/deepseek-v4-pro",
+  "iterations": 31,
+  "wall_ms": 900034,
+  "ledger": {
+    "prompt_tokens": 563129,
+    "completion_tokens": 61768,
+    "requests": 33,
+    "waiting_ms": 899731,
+    "cached_tokens": 487680,
+    "last_prompt_tokens": 27408
+  },
+  "actions": {
+    "reads": 23,
+    "searches": 8,
+    "fetches": 0,
+    "shells": 0,
+    "writes": 0,
+    "denied": 0
+  },
+  "protocol_errors": {
+    "total": 2,
+    "by_reason": {
+      "<ai-harness-read> does not take `\"file\"`; it takes only offset= and limit=. Nothing was applied \u2014 reply again using only the attributes <ai-harness-read> accepts": 1,
+      "the model returned an empty reply": 1
+    }
+  },
+  "questions_declined": 0,
+  "compactions": 0,
+  "check": {
+    "command": "cargo check --all-targets",
+    "runs": 0,
+    "final_exit": null
+  },
+  "session_path": "/tmp/ai-harness/sessions/session-1787521988",
+  "unconfined": true
+}

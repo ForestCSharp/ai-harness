@@ -184,7 +184,13 @@ impl Request {
     }
 
     /// A filename search over the whole working directory.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// These three builders exist for the tests; production constructs the
+    /// struct directly in `app`. Dead twice over, so the condition says both
+    /// reasons at once: outside a test build nothing calls them, and inside one
+    /// on a platform other than macOS their callers are compiled away with the
+    /// gated test modules.
+    #[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
     pub fn glob(pattern: &str) -> Self {
         Self {
             kind: SearchKind::Glob,
@@ -195,14 +201,14 @@ impl Request {
     }
 
     /// The same search, confined to `dir`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
     pub fn in_dir(mut self, dir: &str) -> Self {
         self.dir = Some(dir.to_string());
         self
     }
 
     /// The same grep, restricted to filenames matching `glob`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
     pub fn filtered(mut self, glob: &str) -> Self {
         self.glob = Some(glob.to_string());
         self

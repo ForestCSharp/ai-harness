@@ -3983,7 +3983,7 @@ mod tests {
         std::fs::write(dir.join("m.rs"), "let x = 1;\n").unwrap();
 
         let mut app = App::new("test/model".into(), None, 10, dir.join("sessions"));
-        app.sandbox = Some(crate::sandbox::Sandbox::new(&dir).unwrap());
+        app.sandbox = Some(crate::sandbox::Sandbox::for_tests(&dir));
         app.input.insert_str("bump it");
         app.submit().unwrap();
         app.push_response(

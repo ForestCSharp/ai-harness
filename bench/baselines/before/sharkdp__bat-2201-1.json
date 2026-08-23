@@ -1,0 +1,41 @@
+{
+  "exit": "timeout",
+  "model": "deepseek/deepseek-v4-pro",
+  "iterations": 33,
+  "wall_ms": 900026,
+  "ledger": {
+    "prompt_tokens": 1181192,
+    "completion_tokens": 37406,
+    "requests": 39,
+    "waiting_ms": 797657,
+    "cached_tokens": 1083904,
+    "last_prompt_tokens": 49300
+  },
+  "actions": {
+    "reads": 14,
+    "searches": 3,
+    "fetches": 0,
+    "shells": 11,
+    "writes": 2,
+    "denied": 0
+  },
+  "protocol_errors": {
+    "total": 6,
+    "by_reason": {
+      "<ai-harness-read> does not take `\"file\"`; it takes only offset= and limit=. Nothing was applied \u2014 reply again using only the attributes <ai-harness-read> accepts": 2,
+      "<ai-harness-read> was empty": 1,
+      "reply must start with a tag, but began with: \"Let me understand the issue more deeply by examining the relevant code and tests.\\n\\n<ai-harness-read>\\n<ai-harness-memory \"\u2026": 1,
+      "reply must start with a tag, but began with: \"Now I understand the issue. Let me trace through the code:\\n\\n1. In `clap_app.rs`, `-P` is `--no-paging`, and `-pp` is two\"\u2026": 1,
+      "reply must start with a tag, but began with: \"Now let me understand the issue more clearly. The problem is:\\n\\n1. `-P` (short for `--no-paging`) doesn't override `--pag\"\u2026": 1
+    }
+  },
+  "questions_declined": 0,
+  "compactions": 0,
+  "check": {
+    "command": "cargo check --all-targets",
+    "runs": 0,
+    "final_exit": null
+  },
+  "session_path": "/tmp/ai-harness/sessions/session-1787523817",
+  "unconfined": true
+}

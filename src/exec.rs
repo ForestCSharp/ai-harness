@@ -132,9 +132,13 @@ impl WriteOutcome {
 }
 
 /// Run `script` inside `sandbox`, giving up after `timeout`, with no
-/// cancellation. The app uses [`run_cancellable`]; this convenience wrapper is
-/// exercised by the test suite.
-#[cfg_attr(not(test), allow(dead_code))]
+/// cancellation. The app uses [`run_streaming`]; this convenience wrapper and
+/// [`run_cancellable`] beneath it are exercised only by the test suite.
+///
+/// Dead for two separate reasons, so the condition names both: outside a test
+/// build nothing calls them, and inside one on a platform other than macOS
+/// their callers go away with the gated test modules.
+#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
 pub async fn run(sandbox: &Sandbox, script: &str, timeout: Duration) -> Result<CommandOutput> {
     // No cancellation: a future that never resolves.
     run_cancellable(sandbox, script, timeout, std::future::pending()).await
@@ -146,6 +150,7 @@ pub async fn run(sandbox: &Sandbox, script: &str, timeout: Duration) -> Result<C
 ///
 /// Non-streaming: the convenience shape for callers that only want the finished
 /// output. [`run_streaming`] does the work.
+#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
 pub async fn run_cancellable(
     sandbox: &Sandbox,
     script: &str,
