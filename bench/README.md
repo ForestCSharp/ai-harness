@@ -210,3 +210,30 @@ than left to fail on a missing key. Its `smoke` job runs one real headless turn
 per push and PR from this repo; the full suites are `workflow_dispatch` only,
 because a 350-instance sweep per commit is a different order of spend.
 `BENCH_MODEL` pins the model as a repository variable.
+
+### Giving CI a key
+
+Four controls, in descending order of how much they actually protect you:
+
+1. **A separate OpenRouter key with a recurring spend cap.** Create one just for
+   CI — not the key in your local `.env` — and set a limit that resets (say $20
+   monthly). This is the control that bounds the damage from a leak, a loop, or
+   a runaway dispatch, and it holds regardless of everything below. Revoking it
+   does not disturb local development.
+2. **Store it as a repository secret** named `OPENROUTER_API_KEY`, under
+   Settings → Secrets and variables → Actions. Encrypted at rest, injected as an
+   env var, masked in logs.
+3. **Approve the expensive job.** `suite` declares `environment: bench`. Add
+   required reviewers to that environment under Settings → Environments and a
+   dispatch will wait for a human before it can reach the key. Until you do, the
+   environment exists but gates nothing.
+4. **The key is scoped to the step that uses it**, not the job — so it is absent
+   from the environment of `checkout`, the toolchain installer, the cache action
+   and the artifact uploader. Third-party actions are the realistic path by which
+   a secret leaves a public repository.
+
+**What none of this stops:** anyone with *write* access can exfiltrate a secret
+by adding a workflow step that transforms it — log masking only catches the
+literal string. The trust boundary is who can push workflows, not who can read
+the repository. That is why the spend cap is first on this list and the storage
+mechanism is second.

@@ -38,9 +38,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      # Pinned in repository variables rather than here, so changing the model a
-      # benchmark runs against is a deliberate settings edit and shows up as one.
+      # The model is not a secret, so it can sit at job level. Pinned in
+      # repository variables rather than here, so changing the model a benchmark
+      # runs against is a deliberate settings edit and shows up as one.
       OPENROUTER_MODEL: ${{ vars.BENCH_MODEL || 'deepseek/deepseek-v4-pro' }}
     steps:
       - uses: actions/checkout@v5
@@ -51,7 +51,14 @@ jobs:
       # The end-to-end assertion that matters for this repository: a headless
       # run against its own source finishes, reports a clean protocol, and
       # produces a record with the shape every adapter parses.
+      # The key is scoped to this step rather than the job. At job level it
+      # would also be in the environment of checkout, the toolchain installer,
+      # the cache action and the artifact uploader — third-party code that has
+      # no use for it, and the realistic path by which a secret leaves a public
+      # repository. Only the process that talks to OpenRouter gets it.
       - name: run one headless turn
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           ./target/release/ai-harness \
             --headless \
@@ -97,8 +104,13 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 720
+    # An approval gate for the job that can spend real money. Add required
+    # reviewers to this environment under Settings -> Environments; until you
+    # do, the environment exists but gates nothing, so the protection is a
+    # settings change rather than a code one. Scoping the key to the environment
+    # as well as the step means a dispatch cannot reach it without that approval.
+    environment: bench
     env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       OPENROUTER_MODEL: ${{ vars.BENCH_MODEL || 'deepseek/deepseek-v4-pro' }}
     steps:
       - uses: actions/checkout@v5
@@ -122,6 +134,8 @@ jobs:
       # part of their own package, and a symlink out of the package directory is
       # the kind of thing that works locally and not in a container.
       - name: install the adapter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           case "${{ inputs.benchmark }}" in
             claw)

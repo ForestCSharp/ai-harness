@@ -23,3 +23,10 @@ Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF
 2026-08-23 17:38:51 [INFO] claw_swebench.workspace: Stripped future commits/tags from sharkdp__bat-2650
 2026-08-23 17:38:51 [INFO] claw_swebench.workspace: Injected global gitignore for build artifacts.
 2026-08-23 17:38:51 [INFO] claw_swebench.orchestrator: Sending task to ai-harness for sharkdp__bat-2650 (agent=swe-sharkdp__bat-2650)...
+2026-08-23 17:51:03 [INFO] claw_swebench.orchestrator: Agent finished: success=True finish=stop duration=731.3s
+2026-08-23 17:51:03 [INFO] claw_swebench.workspace: Cleaning up container ai-harness-swe-sharkdp__bat-2650
+2026-08-23 17:51:03 [INFO] claw_swebench.orchestrator: [1/1] sharkdp__bat-2650 → patch_collected (743.0s, patch_empty=False)
+2026-08-23 17:51:03 [INFO] claw_swebench.orchestrator: Batch complete: {'patch_collected': 1}
+2026-08-23 17:51:03 [INFO] __main__: ============================================================
+2026-08-23 17:51:03 [INFO] __main__: Run complete: baseline-before-sharkdp__bat-2650-1
+2026-08-23 17:51:03 [INFO] __main__:   sharkdp__bat-2650 → patch_collected (743.0s)
