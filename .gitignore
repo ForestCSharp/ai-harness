@@ -9,6 +9,10 @@ secrets/
 
 tmp/
 
+# Python bytecode from the benchmark adapters and tooling under bench/.
+__pycache__/
+*.pyc
+
 # Per-project harness state: saved sessions, and whatever else becomes
 # session-scoped. Written under the working directory the harness runs against.
 .ai_harness/

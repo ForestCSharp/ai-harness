@@ -45,6 +45,18 @@ pub enum Entry {
     Malformed {
         reason: String,
         raw: String,
+        /// The provider's finish reason for this reply, when it gave one.
+        ///
+        /// Recorded here rather than only on a successful action because this is
+        /// where it answers a question: a malformed reply that finished on
+        /// `length` was cut off, and one that finished on `stop` was genuinely
+        /// wrong. Deriving that later from the transcript is what lets a
+        /// benchmark sweep say which of the two it is measuring.
+        ///
+        /// `serde(default)` and no `session::VERSION` bump, the same way
+        /// `Session::ledger` and the action `diff` were added.
+        #[serde(default)]
+        finish_reason: Option<String>,
     },
     /// The outcome of a command the user allowed.
     CommandResult(Box<CommandOutput>),
@@ -297,6 +309,31 @@ fn first_line(text: &str) -> &str {
 
 /// A short phrase for what an action does, for anywhere one has to be named
 /// rather than shown: what a denial refused, what a session is busy with.
+/// Substitute [`protocol::ProtocolError::Truncated`] when the provider says the
+/// reply was cut short.
+///
+/// Whatever the parser reported in that case is a symptom, not the cause: a
+/// reply that stops mid-element is an unterminated tag, a reply that stops
+/// mid-sentence is prose with no element, and a reply that produced nothing at
+/// all is empty. All three are the same event, and telling the model to study
+/// the contract for any of them sends it to fix something that was never wrong.
+///
+/// Only `length` is treated this way. `stop` is the model choosing to end, so a
+/// malformation under `stop` is a real one and keeps its own error.
+fn cut_short(
+    error: protocol::ProtocolError,
+    finish_reason: Option<&str>,
+) -> protocol::ProtocolError {
+    match finish_reason {
+        Some(reason) if reason.eq_ignore_ascii_case("length") => {
+            protocol::ProtocolError::Truncated {
+                reason: reason.to_string(),
+            }
+        }
+        _ => error,
+    }
+}
+
 pub fn action_label(action: &Action) -> String {
     match action {
         Action::Shell(command) => command.clone(),
@@ -2589,7 +2626,40 @@ impl App {
     /// dropping it would leave two user turns adjacent.
     /// Returns messages to send immediately, which happens when a malformed
     /// reply earns a corrective retry.
+    /// Take a finished reply along with everything the provider said about it.
+    ///
+    /// The production entry point. [`App::push_response`] is the same thing
+    /// without a finish reason, which is the shape the tests use and the shape
+    /// every caller had before the provider's verdict was worth keeping.
+    pub fn push_completion(
+        &mut self,
+        completion: crate::openrouter::Completion,
+    ) -> Option<Vec<Message>> {
+        self.push_reply(
+            completion.content,
+            completion.usage,
+            completion.finish_reason.as_deref(),
+        )
+    }
+
+    /// A reply with no finish reason attached.
+    ///
+    /// Test-only now that production goes through [`App::push_completion`]:
+    /// every caller is a test that cares about the parsing and not about why
+    /// the provider stopped. Kept rather than rewritten into the hundred-odd
+    /// call sites that use it, and gated so it cannot quietly become a
+    /// production path that loses the finish reason again.
+    #[cfg(test)]
     pub fn push_response(&mut self, content: String, usage: Option<Usage>) -> Option<Vec<Message>> {
+        self.push_reply(content, usage, None)
+    }
+
+    fn push_reply(
+        &mut self,
+        content: String,
+        usage: Option<Usage>,
+        finish_reason: Option<&str>,
+    ) -> Option<Vec<Message>> {
         self.frame(Direction::Received, content.clone());
         self.follow = true;
         // Count the spend before validating: a malformed reply cost real tokens
@@ -2600,10 +2670,13 @@ impl App {
 
         let (content, reply) = match protocol::parse_reply(&content) {
             Ok(reply) => (content, reply),
-            Err(err) => match self.recover_reply(&content, &err) {
-                Some(recovered) => recovered,
-                None => return self.retry_after(content, err),
-            },
+            Err(err) => {
+                let err = cut_short(err, finish_reason);
+                match self.recover_reply(&content, &err) {
+                    Some(recovered) => recovered,
+                    None => return self.retry_after(content, err, finish_reason),
+                }
+            }
         };
         let protocol::Reply { action, memory } = reply;
 
@@ -2613,7 +2686,11 @@ impl App {
             && matches!(action, Action::Response(_))
             && memory == protocol::Attached::Absent
         {
-            return self.retry_after(content, protocol::ProtocolError::MissingMemory);
+            return self.retry_after(
+                content,
+                protocol::ProtocolError::MissingMemory,
+                finish_reason,
+            );
         }
 
         // Only a valid reply counts as progress against the loop budget.
@@ -3122,6 +3199,7 @@ impl App {
         &mut self,
         content: String,
         error: protocol::ProtocolError,
+        finish_reason: Option<&str>,
     ) -> Option<Vec<Message>> {
         // Remember where context was clean, before the first bad reply — and
         // roll back to it, so a streak of failures does not stack up. Attempt
@@ -3137,6 +3215,7 @@ impl App {
         self.transcript.push(Entry::Malformed {
             reason: error.to_string(),
             raw: content.clone(),
+            finish_reason: finish_reason.map(str::to_string),
         });
 
         if self.retries > self.max_retries {
@@ -4935,7 +5014,7 @@ mod tests {
             .find(|e| matches!(e, Entry::Malformed { .. }))
             .expect("a malformed entry should be recorded");
         match flagged {
-            Entry::Malformed { raw, reason } => {
+            Entry::Malformed { raw, reason, .. } => {
                 assert_eq!(raw, "Sure, I'll help!");
                 assert!(!reason.is_empty(), "the reason must say what went wrong");
             }
@@ -5774,6 +5853,68 @@ mod tests {
     }
 
     /// Submit a prompt, completing the turn so the app is idle again.
+    fn truncated(content: &str, finish: Option<&str>) -> crate::openrouter::Completion {
+        crate::openrouter::Completion {
+            content: content.to_string(),
+            usage: None,
+            finish_reason: finish.map(str::to_string),
+        }
+    }
+
+    fn last_malformed(app: &App) -> (&str, Option<&str>) {
+        app.transcript
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Malformed {
+                    reason,
+                    finish_reason,
+                    ..
+                } => Some((reason.as_str(), finish_reason.as_deref())),
+                _ => None,
+            })
+            .expect("the reply should have been rejected")
+    }
+
+    /// The reclassification the finish-reason capture exists for. A reply that
+    /// stops mid-element reaches the parser as an unterminated tag, and telling
+    /// the model to study the contract sends it to fix something it did right.
+    #[test]
+    fn a_cut_off_reply_is_not_reported_as_a_protocol_violation() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        submit_prompt(&mut app, "do something");
+        app.push_completion(truncated("<ai-harness-read>src/ma", Some("length")));
+
+        let (reason, finish) = last_malformed(&app);
+        assert!(reason.contains("cut short"), "{reason}");
+        assert_eq!(finish, Some("length"), "the provider's word is kept as-is");
+    }
+
+    /// The other half of the rule: `stop` means the model chose to end there, so
+    /// a malformation under it is a real one and keeps its own error.
+    #[test]
+    fn a_reply_that_stopped_normally_keeps_its_real_error() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        submit_prompt(&mut app, "do something");
+        app.push_completion(truncated("not a tag at all", Some("stop")));
+
+        let (reason, finish) = last_malformed(&app);
+        assert!(!reason.contains("cut short"), "{reason}");
+        assert_eq!(finish, Some("stop"));
+    }
+
+    /// A provider that reports nothing must behave exactly as before.
+    #[test]
+    fn an_unreported_finish_reason_changes_nothing() {
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+        submit_prompt(&mut app, "do something");
+        app.push_completion(truncated("not a tag at all", None));
+
+        let (reason, finish) = last_malformed(&app);
+        assert!(!reason.contains("cut short"), "{reason}");
+        assert_eq!(finish, None);
+    }
+
     fn submit_prompt(app: &mut App, text: &str) {
         app.input.insert_str(text);
         app.submit().unwrap();
@@ -8104,6 +8245,7 @@ mod file_tests {
         Ok(Completion {
             content: text.to_string(),
             usage: None,
+            finish_reason: None,
         })
     }
 
@@ -8488,6 +8630,7 @@ mod file_tests {
         app.apply_summary(
             job,
             Ok(Completion {
+                finish_reason: None,
                 content: "a summary".into(),
                 usage: Some(Usage {
                     prompt_tokens: 5_000,

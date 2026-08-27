@@ -175,6 +175,18 @@ struct ModelCatalog {
 pub struct Completion {
     pub content: String,
     pub usage: Option<Usage>,
+    /// Why the model stopped, as the provider reported it — `stop`, `length`,
+    /// `content_filter`, and so on.
+    ///
+    /// Kept because without it the harness cannot tell a *truncated* reply from
+    /// a *malformed* one, and tells the model the wrong thing about both. A
+    /// reply cut off at the output limit is not a contract violation, and
+    /// answering it with the contract teaches nothing; five empty replies in one
+    /// benchmark sweep could not be diagnosed at all for want of this field.
+    ///
+    /// `None` when the provider omitted it, which is not an error — the caller
+    /// falls back to the message it would have given before.
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +239,13 @@ pub enum StreamEvent {
     /// the conversation, and a chain of thought in either would be read as the
     /// model's answer.
     Reasoning(String),
+    /// Why the model stopped, from `choices[].finish_reason`.
+    ///
+    /// Its own variant rather than a field on [`Self::Done`], because `Done`
+    /// ends the stream and this arrives in the chunk *before* the one carrying
+    /// usage. Folding the two together would terminate early and lose the token
+    /// counts — which is a worse trade than the one this field exists to fix.
+    Finish(String),
     /// The stream finished. Usage arrives here, in the final chunk.
     Done { usage: Option<Usage> },
 }
@@ -378,9 +397,11 @@ impl Client {
 
         let mut content = String::new();
         let mut usage = None;
+        let mut finish_reason = None;
         while let Some(event) = stream.next().await {
             match event? {
                 StreamEvent::Delta(delta) => content.push_str(&delta),
+                StreamEvent::Finish(reason) => finish_reason = Some(reason),
                 // Dropped, not appended. The caller here is the compaction
                 // summariser, and a chain of thought folded into the summary
                 // would become conversation the model answers from.
@@ -391,7 +412,11 @@ impl Client {
                 StreamEvent::Done { usage: None } => {}
             }
         }
-        Ok(Completion { content, usage })
+        Ok(Completion {
+            content,
+            usage,
+            finish_reason,
+        })
     }
 }
 
@@ -516,13 +541,14 @@ fn parse_sse_event(block: &str) -> Option<Result<StreamEvent>> {
         return Some(Err(anyhow!("OpenRouter stream error: {}", err.message)));
     }
 
-    let delta = chunk.choices.into_iter().next().map(|c| c.delta);
-    let (content, reasoning) = delta.map_or_else(
+    let choice = chunk.choices.into_iter().next();
+    let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
+    let (content, reasoning) = choice.map_or_else(
         || (String::new(), String::new()),
-        |d| {
+        |c| {
             (
-                d.content.unwrap_or_default(),
-                d.reasoning.unwrap_or_default(),
+                c.delta.content.unwrap_or_default(),
+                c.delta.reasoning.unwrap_or_default(),
             )
         },
     );
@@ -539,6 +565,13 @@ fn parse_sse_event(block: &str) -> Option<Result<StreamEvent>> {
     }
     if !reasoning.is_empty() {
         return Some(Ok(StreamEvent::Reasoning(reasoning)));
+    }
+
+    // The chunk that closes the message: empty delta, a finish reason, and no
+    // usage yet. OpenRouter sends it separately from the content chunks, which
+    // is why checking it after content costs nothing in practice.
+    if let Some(reason) = finish_reason {
+        return Some(Ok(StreamEvent::Finish(reason)));
     }
 
     // A usage-only final chunk carries no content; report it as Done so the
@@ -697,6 +730,8 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1107,7 +1142,7 @@ mod tests {
             match event.unwrap() {
                 StreamEvent::Reasoning(r) => thought.push_str(&r),
                 StreamEvent::Delta(d) => said.push_str(&d),
-                StreamEvent::Done { .. } => {}
+                StreamEvent::Finish(_) | StreamEvent::Done { .. } => {}
             }
         }
         server.join().unwrap();
@@ -1240,6 +1275,39 @@ mod tests {
     #[test]
     fn parse_sse_event_reads_a_content_delta() {
         let event = parse_sse_event(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#);
+        assert_eq!(event.unwrap().unwrap(), StreamEvent::Delta("hi".into()));
+    }
+
+    #[test]
+    fn parse_sse_event_reads_a_finish_reason() {
+        let event = parse_sse_event(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#);
+        assert_eq!(
+            event.unwrap().unwrap(),
+            StreamEvent::Finish("length".into()),
+            "a truncated reply must be reported as such"
+        );
+    }
+
+    /// The reason must not terminate the stream: usage arrives in a later chunk,
+    /// and folding the two together would end the read before the token counts.
+    #[test]
+    fn a_finish_reason_does_not_end_the_stream() {
+        assert!(!matches!(
+            parse_sse_event(r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
+                .unwrap()
+                .unwrap(),
+            StreamEvent::Done { .. }
+        ));
+    }
+
+    /// Content wins a chunk carrying both, the same trade the reasoning arm
+    /// makes. OpenRouter sends them separately, so this costs nothing in
+    /// practice — but it should fail loudly here if that ever changes.
+    #[test]
+    fn content_still_wins_a_chunk_that_also_finishes() {
+        let event = parse_sse_event(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+        );
         assert_eq!(event.unwrap().unwrap(), StreamEvent::Delta("hi".into()));
     }
 
@@ -1524,6 +1592,7 @@ mod tests {
                     content.push_str(&d);
                 }
                 StreamEvent::Reasoning(r) => reasoning.push_str(&r),
+                StreamEvent::Finish(_) => {}
                 StreamEvent::Done { usage: u } => {
                     if u.is_some() {
                         usage = u;

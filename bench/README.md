@@ -47,9 +47,12 @@ transcript keeps every malformed reply.
 
 ## `--sandbox=none`
 
-The Seatbelt sandbox is macOS-only and every one of these benchmarks runs Linux
-containers. `--sandbox=none` turns confinement off **and is refused unless
-`--headless` is also set** — the case it exists for is a per-task container that
+Commands are confined on macOS (Seatbelt) and Linux (Landlock), so a benchmark
+container on native Linux gets real confinement and needs nothing special. The
+exception is **x86_64 emulation on Apple Silicon**, where Landlock is absent
+(`ENOSYS`) — and SWE-bench images are x86_64, so on a Mac the containers have no
+kernel confinement available. `--sandbox=none` turns confinement off **and is
+refused unless `--headless` is also set** — the case it exists for is a per-task container that
 is already the boundary, and at an interactive prompt there would be nothing
 else confining anything. The record carries `unconfined: true` so a result can
 never be read as confined when it was not.
@@ -75,24 +78,16 @@ docker create --name x ai-harness:bench && docker cp x:/opt/ai-harness/ai-harnes
 
 ```bash
 git clone https://github.com/opensquilla/claw-swe-bench && cd claw-swe-bench
+git checkout fcece5f4c0817430ce953b52c80c931a40cd9b83   # the verified commit
 pip install -r requirements.txt
-cp ../bench/adapters/claw/ai_harness.py claw_swebench/claws/
+python3 ../bench/register.py claw .
 ```
 
-Register in `claw_swebench/claws/__init__.py`:
-
-```python
-from claw_swebench.claws.ai_harness import AiHarnessAdapter
-CLAWS["ai-harness"] = AiHarnessAdapter
-```
-
-and in `claw_swebench/config.py`:
-
-```python
-CLAW_DEFAULTS["ai-harness"] = {
-    "model": "deepseek/deepseek-v4-pro", "timeout": 3600, "max_turns": 300,
-}
-```
+`register.py` copies the adapter in **and registers it** — `CLAWS`,
+`CLAW_DEFAULTS`, and the equivalents for Harness-Bench. Copying alone is not
+enough: an unregistered adapter means a run that clones, copies, executes
+nothing, and reports success. It is idempotent, and it fails loudly if an anchor
+has moved, because a silently skipped patch produces exactly that empty run.
 
 ```bash
 AI_HARNESS_BIN=/abs/path/to/ai-harness python run_infer.py \
@@ -117,12 +112,14 @@ hal-eval --benchmark swebench_verified_mini \
 ### Harness-Bench
 
 ```bash
-cp bench/adapters/harnessbench/ai_harness.py <harness-bench>/src/harnessbench/adapters/
-# register in src/harnessbench/adapters/__init__.py, then add to config/harness.yaml:
-#   ai-harness: {adapter: ai_harness, command: /path/to/ai-harness,
-#                model: deepseek/deepseek-v4-pro, confined: true}
+git checkout 1025086a446653702b80cfb48babbeec35db6b2c   # the verified commit
+python3 bench/register.py harnessbench <harness-bench>
 PYTHONPATH=src python3 -m harnessbench.cli run-task --task 001-file --harness ai-harness
 ```
+
+`confined: true` is the default and the interesting setting — this benchmark
+runs on the host, so the real sandbox applies and `security_score` is a term in
+its combined score. Set it false only on a kernel without Landlock.
 
 This one runs the agent **on the host** against a prepared workspace, with an
 isolated `HOME`, rather than in a container. So the real sandbox can stay on —

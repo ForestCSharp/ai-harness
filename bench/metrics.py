@@ -69,6 +69,7 @@ def metrics(record: dict[str, Any]) -> dict[str, Any]:
         "writes": actions.get("writes", 0),
         "shells": actions.get("shells", 0),
         "protocol_errors": record.get("protocol_errors", {}).get("total", 0),
+        "finish_reasons": record.get("protocol_errors", {}).get("by_finish_reason", {}),
         "wall_s": round((record.get("wall_ms") or 0) / 1000, 1),
         "cache_hit_rate": (
             ledger.get("cached_tokens", 0) / prompt_tokens if prompt_tokens else 0.0
@@ -117,6 +118,16 @@ def summarise(label: str, directory: Path) -> dict[str, Any] | None:
         f"  SECONDARY wrote at all    {aggregate['wrote_count']}/{aggregate['runs']} runs"
     )
     print(f"  GUARD    protocol_errors {aggregate['protocol_errors_total']} total")
+
+    # Why those replies stopped. A sweep whose errors are mostly `length` needs
+    # shorter replies, not a better contract; without this the two look the same.
+    finishes: dict[str, int] = {}
+    for _, m in rows:
+        for reason, count in (m.get("finish_reasons") or {}).items():
+            finishes[reason] = finishes.get(reason, 0) + count
+    if finishes:
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(finishes.items()))
+        print(f"           by finish reason: {breakdown}")
 
     # The gate this whole phase exists to answer.
     gate = aggregate["lookup_ratio_min"] >= 0.5

@@ -291,6 +291,26 @@ pub fn search_label(pattern: &str, dir: Option<&str>, glob: Option<&str>) -> Str
     label
 }
 
+/// What a tag carries in its *body*, phrased for an error message.
+///
+/// Exists because of a specific mistake models actually make rather than a
+/// hypothetical one: `<ai-harness-edit file=…>` and `<ai-harness-write file=…>`
+/// do take a path attribute, so `file=` gets generalised to `<ai-harness-read>`,
+/// which carries its path in the body instead. Three of fourteen malformed
+/// replies in one benchmark sweep were exactly that. Naming the right shape
+/// costs a sentence; leaving the model to infer it costs a round-trip.
+fn body_hint(tag: &str) -> String {
+    let (what, example) = match tag {
+        READ_TAG => ("The path", "src/main.rs"),
+        GREP_TAG => ("The pattern", "fn parse_reply"),
+        GLOB_TAG => ("The pattern", "**/*.rs"),
+        FETCH_TAG => ("The URL", "https://example.com"),
+        SHELL_TAG => ("The command", "ls -1"),
+        _ => return String::new(),
+    };
+    format!(" {what} goes in the body: <{tag}>{example}</{tag}>.")
+}
+
 /// The reply tags, phrased for an error message: `<a>, <b>, or <c>`.
 fn expected_tags() -> String {
     let names: Vec<String> = REPLY_TAGS.iter().map(|tag| format!("<{tag}>")).collect();
@@ -370,6 +390,18 @@ pub fn elide_results(raw: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     Empty,
+    /// The provider stopped the reply before the model finished writing it.
+    ///
+    /// Not a contract violation, and that is the whole reason it exists. A
+    /// truncated reply arrives at the parser looking like an ordinary
+    /// malformation — an unterminated tag, prose with no element, nothing at
+    /// all — and answering it with the contract teaches the model to fix
+    /// something that was never wrong. `App` substitutes this when the provider
+    /// reported `length`, so the correction can say what actually happened.
+    Truncated {
+        /// The provider's own word for it, quoted back rather than interpreted.
+        reason: String,
+    },
     /// Reply did not begin with a tag.
     NotATag {
         found: String,
@@ -478,6 +510,10 @@ impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "the model returned an empty reply"),
+            Self::Truncated { reason } => write!(
+                f,
+                "the reply was cut short by the provider ({reason}) before it was complete"
+            ),
             Self::NotATag { found } => write!(
                 f,
                 "reply must start with a tag, but began with: {}",
@@ -530,14 +566,15 @@ impl fmt::Display for ProtocolError {
             ),
             Self::UnknownAttribute { tag, attr } => write!(
                 f,
-                "<{tag}> does not take `{}`; it takes only {}. Nothing was applied — \
+                "<{tag}> does not take `{}`; it takes only {}.{} Nothing was applied — \
                  reply again using only the attributes <{tag}> accepts",
                 snippet(attr),
                 allowed_attrs(tag)
                     .iter()
                     .map(|name| format!("{name}="))
                     .collect::<Vec<_>>()
-                    .join(" and ")
+                    .join(" and "),
+                body_hint(tag)
             ),
             Self::UnterminatedAttribute { tag, attr } => write!(
                 f,
@@ -1111,6 +1148,37 @@ pub fn encode_correction(error: &ProtocolError, raw: &str) -> String {
              and stop. The harness will run it and send you the real result; that \
              result is the only source you may treat as what actually happened.",
             capitalise(did_not_happen(tag))
+        );
+    }
+    // A truncated reply is not a protocol mistake, and the boilerplate would
+    // send the model looking for one. Say what happened and ask for the same
+    // action again, smaller.
+    if let ProtocolError::Truncated { reason } = error {
+        return format!(
+            "Your last reply was cut off before it finished — the provider \
+             reported `{reason}`, which means the model's output limit was \
+             reached. Nothing was applied, and nothing about the protocol was \
+             wrong.\n\n\
+             Reply again with the same action, but smaller. If you were writing \
+             a whole file, use <{EDIT_TAG}> to change only the lines that differ \
+             instead of <{WRITE_TAG}> for the whole thing. If you were about to \
+             explain your reasoning first, leave it out — the element alone is \
+             what the harness reads."
+        );
+    }
+    // An empty reply is most often a reasoning model spending the whole
+    // completion on tokens the harness never sees. The generic correction would
+    // quote the contract at a model that did not break it.
+    if let ProtocolError::Empty = error {
+        return format!(
+            "Your last reply had no content at all — the harness received zero \
+             bytes. Nothing was applied.\n\n\
+             If you were reasoning, note that the harness only ever sees the \
+             content of a reply, never the reasoning that preceded it: whatever \
+             you worked out was not received. Reply again with the element \
+             itself, starting at `<`, and put nothing before it.\n\n\
+             Exactly one of {} is expected.",
+            expected_tags()
         );
     }
     // The reply wrapped one good element in something it should not have. The
@@ -2609,6 +2677,58 @@ mod tests {
                 "attrs: {attrs}"
             );
         }
+    }
+
+    /// Three of fourteen malformed replies in one benchmark sweep were
+    /// `<ai-harness-read file="...">`, generalised from the edit and write
+    /// elements that really do take a path attribute. The reply stays rejected;
+    /// what changed is that the correction shows the shape that works.
+    #[test]
+    fn the_attribute_error_says_where_the_path_belongs() {
+        let err = action(&format!("<{READ_TAG} file=x.rs></{READ_TAG}>")).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("goes in the body"), "{text}");
+        assert!(
+            text.contains(&format!("<{READ_TAG}>src/main.rs</{READ_TAG}>")),
+            "the message should show the working shape: {text}"
+        );
+    }
+
+    #[test]
+    fn a_grep_attribute_error_names_the_pattern() {
+        let err = action(&format!("<{GREP_TAG} grep=x>y</{GREP_TAG}>")).unwrap_err();
+        assert!(
+            err.to_string().contains("The pattern goes in the body"),
+            "{err}"
+        );
+    }
+
+    /// A truncated reply broke nothing, so the correction must not send the
+    /// model looking for a mistake in a contract it followed.
+    #[test]
+    fn a_cut_off_reply_is_told_that_rather_than_the_contract() {
+        let text = encode_correction(
+            &ProtocolError::Truncated {
+                reason: "length".into(),
+            },
+            "<ai-harness-read>src/ma",
+        );
+        assert!(text.contains("cut off"), "{text}");
+        assert!(text.contains("output limit"), "{text}");
+        assert!(
+            !text.contains("Exactly one of"),
+            "quoting the contract is exactly what this case must not do: {text}"
+        );
+    }
+
+    /// The largest single error category in the sweep was zero-byte replies.
+    /// The likely cause is a completion spent entirely on reasoning, which the
+    /// harness never receives — worth saying, since the model cannot see that.
+    #[test]
+    fn an_empty_reply_is_told_its_reasoning_was_not_received() {
+        let text = encode_correction(&ProtocolError::Empty, "");
+        assert!(text.contains("no content at all"), "{text}");
+        assert!(text.contains("reasoning"), "{text}");
     }
 
     #[test]

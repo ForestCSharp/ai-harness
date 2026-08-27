@@ -1138,12 +1138,23 @@ Four things worth knowing:
 
 ### `--sandbox=none`
 
-The sandbox is macOS-only and every benchmark runner is a Linux container, so
-there is one way to run commands unconfined:
+Commands are confined on **macOS** (Seatbelt) and **Linux** (Landlock), and
+`Sandbox::new` fails closed anywhere else. Landlock is allowlist-only, so the
+Linux policy is the inverse of the macOS one — it grants read on the system
+hierarchies, the working directory and the build caches, and grants nothing else
+under `$HOME`, which puts credential directories outside the policy by
+construction rather than on a denylist.
+
+There is still one way to run commands unconfined:
 
 ```bash
 ai-harness --headless --sandbox none --prompt "..."
 ```
+
+The case it exists for is narrower than it was. Landlock is **unavailable under
+x86_64 emulation on Apple Silicon**, and SWE-bench images are x86_64 — so a
+benchmark container on a Mac has no kernel confinement available at all, and
+this is how you say so deliberately rather than discovering it as a failure.
 
 **It is refused without `--headless`**, and that refusal is the whole design.
 The containment story here is two-part — a command you approve is confined, and
@@ -1248,8 +1259,8 @@ is inside the boundary, not outside it. Use the mode on a tree you can restore
 from git, and prefer `--confirm-fetch` alongside it if the task involves reading
 the web.
 
-Non-macOS platforms fail closed at startup rather than running commands
-unsandboxed.
+Platforms with no backend fail closed at startup rather than running commands
+unsandboxed, and so does a Linux kernel too old for Landlock (5.13).
 
 ## Cost
 

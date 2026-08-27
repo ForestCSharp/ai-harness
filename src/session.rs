@@ -978,6 +978,7 @@ mod tests {
             Entry::Malformed {
                 reason: "bad".into(),
                 raw: "oops".into(),
+                finish_reason: Some("length".into()),
             },
             Entry::CommandResult(Box::new(CommandOutput {
                 command: "ls".into(),

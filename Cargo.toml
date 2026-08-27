@@ -20,3 +20,9 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 url = "2.5.8"
+
+# Linux confinement. Landlock is an unprivileged, self-applied kernel policy —
+# the same shape as Seatbelt on macOS — so it fits the existing `command()` /
+# `program()` seam without a helper binary or user namespaces.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"

@@ -123,37 +123,101 @@ jobs:
       - run: cargo build --release --locked
         working-directory: ai-harness
 
+      # Pinned, not HEAD. Two dispatches a month apart must measure the same
+      # benchmark or the numbers cannot be compared, and `--depth 1` of a moving
+      # branch quietly guarantees they cannot. These are the commits the adapters
+      # were written and verified against.
       - name: check out the benchmark
         run: |
           case "${{ inputs.benchmark }}" in
-            claw)         git clone --depth 1 https://github.com/opensquilla/claw-swe-bench bench-repo ;;
-            harnessbench) git clone --depth 1 https://github.com/Qihoo360/harness-bench bench-repo ;;
-          esac
-
-      # Copying rather than symlinking: both benchmarks import the adapter as
-      # part of their own package, and a symlink out of the package directory is
-      # the kind of thing that works locally and not in a container.
-      - name: install the adapter
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          case "${{ inputs.benchmark }}" in
             claw)
-              cp ai-harness/bench/adapters/claw/ai_harness.py bench-repo/claw_swebench/claws/
+              git clone https://github.com/opensquilla/claw-swe-bench bench-repo
+              git -C bench-repo checkout fcece5f4c0817430ce953b52c80c931a40cd9b83
               ;;
             harnessbench)
-              cp ai-harness/bench/adapters/harnessbench/ai_harness.py bench-repo/src/harnessbench/adapters/
+              git clone https://github.com/Qihoo360/harness-bench bench-repo
+              git -C bench-repo checkout 1025086a446653702b80cfb48babbeec35db6b2c
               ;;
           esac
-          echo "Adapter installed. Registration (claws/__init__.py + CLAW_DEFAULTS,"
-          echo "or config/harness.yaml) is described in bench/README.md and is not"
-          echo "yet automated — see the note there before trusting a first run."
+
+      # Fails loudly if an anchor is gone, which means upstream restructured.
+      # A silent skip here would produce a run that measures nothing and reports
+      # success, which is the one outcome worse than not starting.
+      - name: register the adapter
+        run: python3 ai-harness/bench/register.py ${{ inputs.benchmark }} bench-repo
+
+      - name: install benchmark dependencies
+        run: |
+          if [ -f bench-repo/requirements.txt ]; then
+            pip install -r bench-repo/requirements.txt
+          fi
+          pip install -e bench-repo 2>/dev/null || true
+
+      # SWE-bench task images are roughly 2 GB each and a GitHub runner has
+      # about 14 GB free, so the instance count is bounded by disk long before
+      # it is bounded by money. Reclaiming the preinstalled toolchains buys the
+      # room for a handful more.
+      - name: free disk space
+        if: inputs.benchmark == 'claw'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          df -h / | tail -1
+
+      - name: run the suite
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          AI_HARNESS_BIN: ${{ github.workspace }}/ai-harness/target/release/ai-harness
+        run: |
+          COUNT="${{ inputs.tasks }}"
+          COUNT="${COUNT:-3}"
+          case "${{ inputs.benchmark }}" in
+            claw)
+              head -n "$COUNT" bench-repo/config/multilingual_300_instances.txt > instances.txt
+              echo "Running $(wc -l < instances.txt) instance(s):"; cat instances.txt
+              cd bench-repo && python3 run_infer.py \
+                --claw ai-harness \
+                --dataset multilingual \
+                --run_id "ci-${{ github.run_id }}" \
+                --instance_file ../instances.txt \
+                --no_resume
+              ;;
+            harnessbench)
+              cd bench-repo && PYTHONPATH=src python3 -m harnessbench.cli run-suite \
+                --harness ai-harness --to-task "$COUNT"
+              ;;
+          esac
+
+      - name: summarise
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, json, pathlib
+          records = sorted(glob.glob("bench-repo/artifacts/*/*/run_record.json"))
+          if not records:
+              print("No run records — the suite produced nothing to summarise.")
+              raise SystemExit
+          out = pathlib.Path("summary.md")
+          rows = ["| instance | exit | iters | writes | perr | tokens in |", "| --- | --- | --- | --- | --- | --- |"]
+          for path in records:
+              d = json.loads(pathlib.Path(path).read_text())
+              rows.append(
+                  f"| {pathlib.Path(path).parent.name} | {d.get('exit')} | "
+                  f"{d.get('iterations')} | {d.get('actions', {}).get('writes')} | "
+                  f"{d.get('protocol_errors', {}).get('total')} | "
+                  f"{d.get('ledger', {}).get('prompt_tokens')} |"
+              )
+          table = "\n".join(rows)
+          out.write_text(table + "\n")
+          print(table)
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ inputs.benchmark }}-results
           path: |
+            bench-repo/artifacts/**
             bench-repo/results/**
-            bench-repo/logs/**
+            summary.md
           if-no-files-found: warn

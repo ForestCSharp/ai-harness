@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+#[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Paths denied for both read and write, relative to the user's home directory.
@@ -108,15 +109,7 @@ impl Sandbox {
     /// macOS `/tmp` is a symlink to `/private/tmp`, so an uncanonicalised root
     /// would silently never match and confine nothing.
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
-        if !cfg!(target_os = "macos") {
-            bail!(
-                "command execution is only sandboxed on macOS; refusing to run \
-                 commands rather than run them unconfined"
-            );
-        }
-        if !Path::new(SANDBOX_EXEC).exists() {
-            bail!("{SANDBOX_EXEC} not found; refusing to run commands unsandboxed");
-        }
+        preflight()?;
 
         let root = root.as_ref();
         let root = std::fs::canonicalize(root)
@@ -124,14 +117,27 @@ impl Sandbox {
         if !root.is_dir() {
             bail!("sandbox root {} is not a directory", root.display());
         }
+        #[cfg(target_os = "macos")]
         check_profile_safe(&root)?;
 
         // A missing or odd home directory is not fatal; it only means there are
-        // no home-relative denies to add.
+        // no home-relative denies to add. The `check_profile_safe` filter is a
+        // Seatbelt concern — a home path it cannot express in SBPL — so it does
+        // not apply to the Landlock backend, which takes paths as bytes.
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .and_then(|h| std::fs::canonicalize(h).ok())
-            .filter(|h| check_profile_safe(h).is_ok());
+            .filter(|h| {
+                #[cfg(target_os = "macos")]
+                {
+                    check_profile_safe(h).is_ok()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = h;
+                    true
+                }
+            });
 
         Ok(Self {
             root,
@@ -184,25 +190,19 @@ impl Sandbox {
 
     /// The sandbox a test should build for the platform it is running on.
     ///
-    /// **A stopgap, and worth naming as one.** Seatbelt is macOS-only, so on
-    /// Linux `new` refuses and every test that builds a sandbox to exercise
-    /// something *else* — the check loop, jobs, memory — dies in its setup with
-    /// an error about confinement it was never testing. This keeps those tests
-    /// running on Linux by handing them the unconfined sandbox, which is honest
-    /// for what they assert and dishonest as a description of the platform:
-    /// Linux has no confinement here at all.
-    ///
-    /// The real answer is a Linux backend (Landlock is the fit — an
-    /// unprivileged, self-applied policy, the same shape as Seatbelt), at which
-    /// point this becomes `new` everywhere and can go. Tests that assert on
-    /// confinement itself stay macOS-gated either way and keep using `new`.
+    /// Now simply [`Sandbox::new`] wherever a backend exists — macOS via
+    /// Seatbelt, Linux via Landlock. It was briefly a stopgap that handed Linux
+    /// an *unconfined* sandbox so that tests exercising the check loop, jobs and
+    /// memory could run there at all; the Landlock backend is what retired that.
+    /// Only a platform with no backend still gets the unconfined one, and its
+    /// tests are honest about asserting nothing regarding confinement.
     #[cfg(test)]
     pub fn for_tests(root: impl AsRef<Path>) -> Self {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             Self::new(root).expect("a sandbox for the test's working directory")
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             Self::unconfined(root).expect("an unconfined sandbox for the test's working directory")
         }
@@ -254,6 +254,9 @@ impl Sandbox {
     /// Render the Seatbelt (SBPL) profile.
     ///
     /// Deny rules come last so they take precedence over the broad `allow`.
+    /// The SBPL profile handed to `sandbox-exec`. macOS only: Landlock takes
+    /// paths rather than a rendered policy, so there is nothing to render.
+    #[cfg(target_os = "macos")]
     pub fn profile(&self) -> String {
         // Plan mode's narrowing: one file in place of the whole subtree. Phrased
         // as a comment the reader of a leaked profile can understand, since this
@@ -346,15 +349,25 @@ impl Sandbox {
             command.arg("-c").arg(script).current_dir(&self.root);
             return command;
         }
-        let mut command = tokio::process::Command::new(SANDBOX_EXEC);
-        command
-            .arg("-p")
-            .arg(self.profile())
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(script)
-            .current_dir(&self.root);
-        command
+        #[cfg(target_os = "linux")]
+        {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.arg("-c").arg(script).current_dir(&self.root);
+            self.landlock(&mut command);
+            command
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+            command
+                .arg("-p")
+                .arg(self.profile())
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(&self.root);
+            command
+        }
     }
 
     /// Run a program directly under the sandbox, with no shell in between. Each
@@ -366,10 +379,227 @@ impl Sandbox {
             command.args(args).current_dir(&self.root);
             return command;
         }
-        let mut command = tokio::process::Command::new(SANDBOX_EXEC);
-        command.arg("-p").arg(self.profile()).arg(program);
-        command.args(args).current_dir(&self.root);
-        command
+        #[cfg(target_os = "linux")]
+        {
+            let mut command = tokio::process::Command::new(program);
+            command.args(args).current_dir(&self.root);
+            self.landlock(&mut command);
+            command
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+            command.arg("-p").arg(self.profile()).arg(program);
+            command.args(args).current_dir(&self.root);
+            command
+        }
+    }
+}
+
+/// Refuse to build a sandbox where one cannot be enforced.
+///
+/// Checked at startup rather than at the first command, so a machine that
+/// cannot confine anything says so before a turn begins — the same reason the
+/// Seatbelt check has always been here rather than in `command()`.
+fn preflight() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if !Path::new(SANDBOX_EXEC).exists() {
+            bail!("{SANDBOX_EXEC} not found; refusing to run commands unsandboxed");
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use landlock::{ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+        // Creating a ruleset asks the kernel for one; it restricts nothing until
+        // `restrict_self`, so this is a safe probe to run in the harness's own
+        // process. Hard-requiring the first ABI is the question worth asking: a
+        // kernel that cannot do even that has no confinement to offer.
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(ABI::V1))
+            .and_then(|ruleset| ruleset.create())
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "this kernel cannot enforce Landlock ({err}), so commands \
+                     cannot be confined; refusing to run them unconfined. \
+                     Landlock needs Linux 5.13 or newer with the LSM enabled at \
+                     boot. Inside a container that is already the isolation \
+                     boundary, `--headless --sandbox=none` is the deliberate way \
+                     past this."
+                )
+            })?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        bail!(
+            "command execution is only sandboxed on macOS and Linux; refusing to \
+             run commands rather than run them unconfined"
+        )
+    }
+}
+
+/// The Linux backend: a Landlock policy the child applies to itself before exec.
+///
+/// Deliberately the same *shape* as the Seatbelt profile rather than a different
+/// architecture — a policy attached to one command, built from the same root,
+/// home and `write_only` fields — so the two platforms cannot drift apart in
+/// what they confine.
+///
+/// **The policy inverts, and tightens.** Seatbelt is `(allow default)` with a
+/// credential denylist; Landlock is allowlist-only and cannot express "allow
+/// everything except". So this grants read on the system hierarchies, the
+/// workspace and the build caches, and grants nothing else under `$HOME` —
+/// which excludes `~/.ssh`, `~/.aws` and the rest *by construction* rather than
+/// by enumeration. That closes the gap the denylist openly has, and it is why
+/// the Linux read confinement is stronger than the macOS one rather than a
+/// weaker approximation of it.
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{CACHE_HOME_FILES, CACHE_HOME_SUBPATHS, Sandbox};
+    use std::path::PathBuf;
+
+    /// System hierarchies a command has to read to be able to run at all: the
+    /// interpreter, the shared libraries, the toolchain, the certificate store.
+    /// Read-only — nothing here is a place a command has any business writing.
+    const SYSTEM_READ: &[&str] = &[
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/opt",
+        "/proc",
+        "/dev",
+        "/run",
+        "/var/lib",
+        "/var/cache",
+    ];
+
+    /// Writable outside the workspace — deliberately almost nothing.
+    ///
+    /// Kept to parity with the Seatbelt profile, which is `(deny file-write*)`
+    /// followed by allowances for the workspace, the caches, and
+    /// `file-write-data` on the terminal and null sinks. `/dev/null` is that
+    /// last allowance; discarding output is not a write anyone means to confine.
+    ///
+    /// **`/tmp` is deliberately absent.** It was here at first, on the reasoning
+    /// that toolchains need scratch space — and `plan_mode_keeps_the_workspace_read_only`
+    /// caught what that actually costs: a workspace under `/tmp` inherits the
+    /// grant, so plan mode stops confining writes at all. macOS has never
+    /// allowed it and works; if a real toolchain turns out to need it, that is a
+    /// change to make on both platforms at once rather than a divergence to
+    /// leave here.
+    const SYSTEM_WRITE: &[&str] = &["/dev/null"];
+
+    impl Sandbox {
+        /// Attach the policy to a command that has not been spawned yet.
+        pub(super) fn landlock(&self, command: &mut tokio::process::Command) {
+            let read = self.landlock_read_paths();
+            let write = self.landlock_write_paths();
+            // SAFETY: `pre_exec` runs between fork and exec, where only
+            // async-signal-safe work is strictly permitted. Landlock is applied
+            // here rather than in the parent because it must not restrict the
+            // harness itself — the harness reads files the commands it runs may
+            // not. This is what every Landlock sandboxer does, including the
+            // crate's own example.
+            unsafe {
+                command.pre_exec(move || restrict(&read, &write));
+            }
+        }
+
+        /// Everything a command may read. Notably absent: `$HOME` at large.
+        fn landlock_read_paths(&self) -> Vec<PathBuf> {
+            let mut paths: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
+            paths.push(self.root.clone());
+            // The workspace stays readable in plan mode — researching a codebase
+            // is the whole point of the mode; it is writing that is narrowed.
+            paths.extend(self.cache_paths());
+            existing(paths)
+        }
+
+        /// Everything a command may write, which is the half that differs
+        /// between an ordinary turn and plan mode.
+        fn landlock_write_paths(&self) -> Vec<PathBuf> {
+            let mut paths: Vec<PathBuf> = SYSTEM_WRITE.iter().map(PathBuf::from).collect();
+            match &self.write_only {
+                // Plan mode. Landlock grants access to a path that exists, so a
+                // plan file not yet written falls back to its directory — which
+                // is wider than the single `(literal …)` Seatbelt gets, and is
+                // the one place the two platforms genuinely differ. The session
+                // directory is still a far smaller target than the workspace.
+                Some(plan) => {
+                    if plan.exists() {
+                        paths.push(plan.clone());
+                    } else if let Some(parent) = plan.parent() {
+                        paths.push(parent.to_path_buf());
+                    }
+                }
+                None => {
+                    paths.push(self.root.clone());
+                    paths.extend(self.cache_paths());
+                }
+            }
+            existing(paths)
+        }
+
+        /// Build caches under the home directory. Without these no build
+        /// command works, which is the same reason the Seatbelt profile carves
+        /// them out.
+        fn cache_paths(&self) -> Vec<PathBuf> {
+            let Some(home) = &self.home else {
+                return Vec::new();
+            };
+            CACHE_HOME_SUBPATHS
+                .iter()
+                .chain(CACHE_HOME_FILES)
+                .map(|entry| home.join(entry))
+                .collect()
+        }
+    }
+
+    /// Landlock rules are taken on an open descriptor, so a path that is not
+    /// there yet cannot be granted. Dropping them is right rather than fatal:
+    /// a machine without `/opt` or without a cargo registry is ordinary.
+    fn existing(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        paths.into_iter().filter(|p| p.exists()).collect()
+    }
+
+    /// Apply the policy to the calling process. Runs in the child.
+    fn restrict(read: &[PathBuf], write: &[PathBuf]) -> std::io::Result<()> {
+        use landlock::{
+            ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+            path_beneath_rules,
+        };
+
+        // Fixed at compile time, not probed. The crate is explicit that building
+        // an ABI from the running kernel "can lead to unreliable sandboxing where
+        // rules might differ between executions" — so ask for the newest set and
+        // let best-effort mode, which is the default, drop whatever this kernel
+        // lacks. The floor that matters was already hard-required in `preflight`.
+        let abi = ABI::V9;
+        let status = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))
+            .and_then(|r| r.create())
+            .and_then(|r| r.add_rules(path_beneath_rules(read, AccessFs::from_read(abi))))
+            .and_then(|r| r.add_rules(path_beneath_rules(write, AccessFs::from_all(abi))))
+            .and_then(|r| r.restrict_self())
+            .map_err(std::io::Error::other)?;
+
+        // Fail closed. `preflight` already established that this kernel has
+        // Landlock, so reaching here unenforced means something went wrong that
+        // the harness cannot see — and a command that believes it is confined
+        // when it is not is worse than one that refuses to start.
+        if status.ruleset == RulesetStatus::NotEnforced {
+            return Err(std::io::Error::other(
+                "Landlock reported the ruleset was not enforced; refusing to run \
+                 this command unconfined",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -382,6 +612,7 @@ pub fn path_is_safe(path: &Path) -> bool {
 }
 
 /// Escape a path for an SBPL string literal.
+#[cfg(target_os = "macos")]
 fn escape(path: &str) -> String {
     path.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -415,6 +646,9 @@ mod tests {
         std::fs::canonicalize(&dir).unwrap()
     }
 
+    // `escape` renders SBPL string literals, which only the Seatbelt backend
+    // produces.
+    #[cfg(target_os = "macos")]
     #[test]
     fn escapes_quotes_and_backslashes() {
         assert_eq!(escape(r#"a"b"#), r#"a\"b"#);
@@ -643,5 +877,140 @@ mod unconfined_tests {
         let result = Sandbox::unconfined(&file);
         let _ = std::fs::remove_file(&file);
         assert!(result.is_err(), "a file is not a workspace");
+    }
+}
+
+/// Does the Landlock policy actually stop anything?
+///
+/// The tests above prove a sandbox can be *built*; these prove a command is
+/// *confined*, which is the only claim worth making. They spawn real processes
+/// and assert on what the kernel allowed, not on what a path check computed.
+#[cfg(all(test, target_os = "linux"))]
+mod landlock_tests {
+    use super::*;
+
+    fn workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-harness-ll-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_write_inside_the_workspace_is_allowed() {
+        let dir = workspace("inside");
+        let sandbox = Sandbox::new(&dir).expect("landlock should be available");
+        let out = sandbox
+            .command("echo hi > inside.txt")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(dir.join("inside.txt").is_file(), "the write should land");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/var/tmp` is granted neither read nor write — unlike `/tmp`, which every
+    /// toolchain needs. A write there is the kernel refusing, not a path check.
+    #[tokio::test]
+    async fn a_write_outside_the_workspace_is_refused() {
+        let dir = workspace("outside");
+        let escape = Path::new("/var/tmp/ai-harness-landlock-escape.txt");
+        let _ = std::fs::remove_file(escape);
+        let sandbox = Sandbox::new(&dir).expect("landlock should be available");
+        let out = sandbox
+            .command(&format!("echo escaped > {}", escape.display()))
+            .output()
+            .await
+            .unwrap();
+        assert!(!out.status.success(), "the write should have been refused");
+        assert!(!escape.exists(), "and nothing should have been created");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The claim that makes the Linux policy *stronger* than the macOS one: the
+    /// home directory is not granted at all, so credentials under it are
+    /// excluded by construction rather than by an admittedly partial denylist.
+    /// Probed by writing a harmless name — if the policy holds, nothing is
+    /// created, and if it does not, the test says so rather than the harness
+    /// discovering it later.
+    #[tokio::test]
+    async fn the_home_directory_is_not_writable() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return; // No home to confine; nothing to assert.
+        };
+        let dir = workspace("home");
+        let probe = home.join(".ai-harness-landlock-probe");
+        let _ = std::fs::remove_file(&probe);
+        let sandbox = Sandbox::new(&dir).expect("landlock should be available");
+        let out = sandbox
+            .command(&format!("echo probe > {}", probe.display()))
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "a home write should have been refused"
+        );
+        assert!(!probe.exists(), "and nothing should have been created");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reading the toolchain has to keep working, or every command fails for a
+    /// reason that has nothing to do with policy.
+    #[tokio::test]
+    async fn system_paths_stay_readable() {
+        let dir = workspace("system");
+        let sandbox = Sandbox::new(&dir).expect("landlock should be available");
+        let out = sandbox
+            .command("ls /usr/bin > /dev/null")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan mode narrows writes to the plan file's directory. Wider than the
+    /// single `(literal …)` Seatbelt gets — see `landlock_write_paths` — but the
+    /// workspace itself must still be read-only.
+    #[tokio::test]
+    async fn plan_mode_keeps_the_workspace_read_only() {
+        let dir = workspace("plan");
+        let plans = dir.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan = plans.join("plan.md");
+        std::fs::write(&plan, "draft").unwrap();
+
+        let sandbox = Sandbox::new(&dir)
+            .expect("landlock should be available")
+            .writes_limited_to(&plan);
+        let refused = sandbox
+            .command("echo nope > elsewhere.txt")
+            .output()
+            .await
+            .unwrap();
+        assert!(!refused.status.success(), "the workspace must be read-only");
+        assert!(!dir.join("elsewhere.txt").exists());
+
+        let allowed = sandbox
+            .command(&format!("echo written > {}", plan.display()))
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            allowed.status.success(),
+            "the plan file must stay writable: {}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

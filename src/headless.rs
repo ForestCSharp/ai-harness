@@ -50,6 +50,13 @@ pub struct ProtocolErrors {
     /// Violations by the reason the parser gave, so a run that failed the same
     /// way nine times is distinguishable from one that failed nine ways once.
     pub by_reason: BTreeMap<String, usize>,
+    /// The same violations by the provider's finish reason.
+    ///
+    /// What separates "the model broke the contract" from "the reply was cut
+    /// off and the parser saw the stump". A sweep whose errors are mostly
+    /// `length` needs shorter replies, not a better contract — and until this
+    /// was recorded there was no way to tell the two apart.
+    pub by_finish_reason: BTreeMap<String, usize>,
 }
 
 /// What the project check did, if there was one.
@@ -124,9 +131,16 @@ impl RunRecord {
 fn protocol_errors(transcript: &[Entry]) -> ProtocolErrors {
     let mut errors = ProtocolErrors::default();
     for entry in transcript {
-        if let Entry::Malformed { reason, .. } = entry {
+        if let Entry::Malformed {
+            reason,
+            finish_reason,
+            ..
+        } = entry
+        {
             errors.total += 1;
             *errors.by_reason.entry(reason.clone()).or_default() += 1;
+            let finish = finish_reason.clone().unwrap_or_else(|| "unreported".into());
+            *errors.by_finish_reason.entry(finish).or_default() += 1;
         }
     }
     errors
@@ -193,14 +207,17 @@ mod tests {
             Entry::Malformed {
                 reason: "two elements".to_string(),
                 raw: String::new(),
+                finish_reason: None,
             },
             Entry::Malformed {
                 reason: "two elements".to_string(),
                 raw: String::new(),
+                finish_reason: None,
             },
             Entry::Malformed {
                 reason: "unknown tag".to_string(),
                 raw: String::new(),
+                finish_reason: None,
             },
         ];
         let errors = protocol_errors(&transcript);

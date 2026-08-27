@@ -85,39 +85,50 @@ stay a deliberate choice.
 
 ## Cross-platform sandbox support
 
-The current sandbox (`src/sandbox.rs`) is macOS-only: it uses `/usr/bin/sandbox-exec`
-with Seatbelt (SBPL) profiles and `Sandbox::new` bails on non-macOS. To support
-Linux and Windows, introduce a `Sandbox` trait (or enum with per-platform
-backends) and keep the existing Seatbelt code as the macOS backend.
+**Linux is done, via Landlock rather than the bubblewrap this entry used to
+recommend.** `src/sandbox.rs` now has two backends behind the same two choke
+points (`command`, `program`): Seatbelt on macOS, Landlock on Linux. Everything
+else — `root`, `denies_read`, `writes_limited_to`, the path constants — was
+already platform-independent, so no trait or enum was needed; the seam this
+entry proposed building turned out to already exist.
 
-### Backends
+Why Landlock beat the recommendation here:
 
-- **macOS** (already done): `sandbox-exec` with SBPL profiles — workspace-only
-  writes, credential denylist, network allowed. Keep as-is.
-- **Linux**: **bubblewrap** (`bwrap`) — mount namespace with read-only system
-  views, read-write workspace, optional `--unshare-net` / `--unshare-pid`.
-  Requires `bubblewrap` installed (`apt install bubblewrap` on Debian/Ubuntu).
-- **Windows**: **Job Objects** with `CreateRestrictedToken` — CPU/memory caps,
-  kill-on-close, no breakaway. Filesystem/network isolation is weaker than
-  Linux/macOS; document that honestly in a SECURITY note.
+-   It is a policy a process applies to **itself** before exec, which is the same
+    shape as Seatbelt. Bubblewrap re-parents the process under a helper binary,
+    which is a different architecture wearing the same hat.
+-   No binary to install, and no user namespaces — which are restricted in
+    exactly the container and CI environments the benchmarks run in.
+-   Verified unprivileged inside a container at ABI 8.
 
-### Candidate libraries
+**The policy inverts, and comes out stronger.** Seatbelt is `(allow default)`
+plus a credential denylist the README admits is "not exhaustive". Landlock is
+allowlist-only and cannot express that, so the Linux backend grants read on the
+system hierarchies, the workspace and the build caches, and grants nothing else
+under `$HOME` — which excludes `~/.ssh`, `~/.aws` and everything like them by
+construction. `sandbox::landlock_tests` proves it against the kernel rather than
+against a path check.
 
-1. **nanosandbox** (crates.io, v0.1.0 June 2026) — cross-platform sandbox with
-   Linux (namespaces/cgroups v2/seccomp), macOS (sandbox-exec/App Sandbox),
-   Windows (Job Objects/CreateRestrictedToken). Builder API with mounts, memory
-   limits, wall-time limits. **Risk**: brand new, v0.1.0, unproven adoption.
-2. **openclaw-rs** (Neurallabs) — agent runtime with a cross-platform sandbox
-   layer using the same three backends above. MIT, on crates.io. Useful as a
-   **reference design** for the trait/config split even if we roll our own.
-3. **gaol** (Servo Project, v0.2.1 Oct 2019) — cross-platform, whitelist-based.
-   **Not recommended**: last released 2019, uses Rust 2015, self-described as
-   "only lightly reviewed" and "not battle-tested."
+Two things worth knowing:
 
-### Suggested approach
+-   **Landlock is absent under x86_64 emulation on Apple Silicon** (`ENOSYS`;
+    ABI 8 natively on arm64). SWE-bench images are x86_64, so `--sandbox=none`
+    remains necessary for benchmark containers on a Mac. It is not a stopgap for
+    Linux any more — it is for the emulated case.
+-   **Plan mode is slightly wider on Linux.** Landlock grants access to paths
+    that exist, so a plan file not yet written falls back to its directory where
+    Seatbelt gets a single `(literal …)`. Still far smaller than the workspace,
+    and the only place the two backends genuinely differ.
 
-Keep the existing macOS Seatbelt backend and add Linux/Windows backends behind a
-shared trait. This avoids depending on an immature crate (nanosandbox) while
-matching each platform's capabilities honestly. The `SandboxConfig` /
-`SandboxLevel` pattern from openclaw-rs maps closely to our existing `Sandbox` +
-`writes_limited_to` design.
+### Windows
+
+Still open, and still the shape this entry originally described: **Job Objects**
+with `CreateRestrictedToken` — CPU/memory caps, kill-on-close, no breakaway.
+Filesystem and network isolation are weaker than either backend above, and that
+should be documented honestly rather than papered over. Nothing here is blocked
+on it; `Sandbox::new` fails closed on any platform without a backend, which is
+the correct behaviour until one exists.
+
+The crate survey that used to live here (nanosandbox, openclaw-rs, gaol) is
+retired: two backends are written, and neither needed a dependency beyond the
+`landlock` crate itself.

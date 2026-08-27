@@ -661,7 +661,7 @@ fn handle_update(
             *inflight = None;
             app.mark_request_done();
             app.finish_stream();
-            match app.push_response(completion.content, completion.usage) {
+            match app.push_completion(completion) {
                 Some(messages) => spawn_request(id, app, ctx, inflight, messages),
                 // An auto-approved fetch is parked rather than returned, since
                 // it is background work the app layer cannot start itself.
@@ -2032,6 +2032,7 @@ async fn stream_reply(
 
     let mut content = String::new();
     let mut usage = None;
+    let mut finish_reason = None;
     loop {
         tokio::select! {
             // Interrupt takes priority so a fast stream cannot starve it.
@@ -2062,10 +2063,19 @@ async fn stream_reply(
                         return Some(Err("UI closed".to_string()));
                     }
                 }
+                // Why the model stopped. Recorded rather than shown: it is
+                // what decides which correction a malformed reply earns.
+                Some(Ok(StreamEvent::Finish(reason))) => finish_reason = Some(reason),
                 Some(Ok(StreamEvent::Done { usage: Some(u) })) => usage = Some(u),
                 Some(Ok(StreamEvent::Done { usage: None })) => {}
                 Some(Err(e)) => return Some(Err(format!("{e:#}"))),
-                None => return Some(Ok(Completion { content, usage })),
+                None => {
+                    return Some(Ok(Completion {
+                        content,
+                        usage,
+                        finish_reason,
+                    }));
+                }
             },
         }
     }

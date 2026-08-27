@@ -1785,7 +1785,7 @@ fn render_entry(
                 }
             }
         }
-        Entry::Malformed { reason, raw } => {
+        Entry::Malformed { reason, raw, .. } => {
             // Red, like every other failure in the transcript. Yellow here meant
             // this read as a warning beside the `!` in the sessions view and the
             // partial-checkpoint note, when a rejected reply is a failure: the
