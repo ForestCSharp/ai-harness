@@ -246,8 +246,13 @@ pub enum StreamEvent {
     /// usage. Folding the two together would terminate early and lose the token
     /// counts — which is a worse trade than the one this field exists to fix.
     Finish(String),
-    /// The stream finished. Usage arrives here, in the final chunk.
-    Done { usage: Option<Usage> },
+    /// The stream finished. Usage arrives here, in the final chunk — which may
+    /// also carry the finish reason, so it is reported alongside rather than
+    /// left to [`Self::Finish`].
+    Done {
+        usage: Option<Usage>,
+        finish_reason: Option<String>,
+    },
 }
 
 impl Client {
@@ -408,8 +413,17 @@ impl Client {
                 StreamEvent::Reasoning(_) => {}
                 // Usage arrives in its own chunk, followed by a `[DONE]` whose
                 // usage is None; keep the populated one.
-                StreamEvent::Done { usage: Some(u) } => usage = Some(u),
-                StreamEvent::Done { usage: None } => {}
+                StreamEvent::Done {
+                    usage: found,
+                    finish_reason: reason,
+                } => {
+                    if found.is_some() {
+                        usage = found;
+                    }
+                    if reason.is_some() {
+                        finish_reason = reason;
+                    }
+                }
             }
         }
         Ok(Completion {
@@ -450,9 +464,18 @@ fn sse_events(
                 let raw = state.buffer.drain(..boundary.end).collect::<Vec<_>>();
                 let block = String::from_utf8_lossy(&raw[..boundary.content]);
                 match parse_sse_event(&block) {
-                    Some(Ok(StreamEvent::Done { usage })) => {
+                    Some(Ok(StreamEvent::Done {
+                        usage,
+                        finish_reason,
+                    })) => {
                         state.done = true;
-                        return Some((Ok(StreamEvent::Done { usage }), state));
+                        return Some((
+                            Ok(StreamEvent::Done {
+                                usage,
+                                finish_reason,
+                            }),
+                            state,
+                        ));
                     }
                     Some(result) => return Some((result, state)),
                     None => continue, // comment or contentless keepalive
@@ -524,7 +547,10 @@ fn parse_sse_event(block: &str) -> Option<Result<StreamEvent>> {
         return None;
     }
     if data == "[DONE]" {
-        return Some(Ok(StreamEvent::Done { usage: None }));
+        return Some(Ok(StreamEvent::Done {
+            usage: None,
+            finish_reason: None,
+        }));
     }
 
     let chunk: StreamChunk = match serde_json::from_str(&data) {
@@ -567,17 +593,23 @@ fn parse_sse_event(block: &str) -> Option<Result<StreamEvent>> {
         return Some(Ok(StreamEvent::Reasoning(reasoning)));
     }
 
-    // The chunk that closes the message: empty delta, a finish reason, and no
-    // usage yet. OpenRouter sends it separately from the content chunks, which
-    // is why checking it after content costs nothing in practice.
-    if let Some(reason) = finish_reason {
-        return Some(Ok(StreamEvent::Finish(reason)));
+    // A final chunk can carry usage *and* a finish reason at once, and usage
+    // decides the variant. Checking the reason first looks harmless and is not:
+    // `Done` is what ends the stream, so returning `Finish` for a chunk that
+    // also had usage drops the token counts entirely. That shipped once, and the
+    // benchmark smoke job caught it as `requests: 0` on a run that had plainly
+    // made requests.
+    if chunk.usage.is_some() {
+        return Some(Ok(StreamEvent::Done {
+            usage: chunk.usage,
+            finish_reason,
+        }));
     }
 
-    // A usage-only final chunk carries no content; report it as Done so the
-    // caller records token counts.
-    if let Some(usage) = chunk.usage {
-        return Some(Ok(StreamEvent::Done { usage: Some(usage) }));
+    // The chunk that closes the message when the provider sends the reason on
+    // its own, ahead of usage. Non-terminating, so the usage chunk still lands.
+    if let Some(reason) = finish_reason {
+        return Some(Ok(StreamEvent::Finish(reason)));
     }
     None
 }
@@ -1288,6 +1320,33 @@ mod tests {
         );
     }
 
+    /// The regression this file shipped once. OpenRouter's final chunk carries
+    /// the finish reason *and* the usage together; reporting it as `Finish`
+    /// dropped the token counts, and the run record came back saying `requests:
+    /// 0` for a turn that had plainly made requests. Usage decides the variant.
+    #[test]
+    fn a_chunk_with_both_usage_and_a_finish_reason_keeps_the_usage() {
+        let event = parse_sse_event(
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#,
+        );
+        match event.unwrap().unwrap() {
+            StreamEvent::Done {
+                usage,
+                finish_reason,
+            } => {
+                let usage = usage.expect("the token counts must survive");
+                assert_eq!(usage.prompt_tokens, 11);
+                assert_eq!(usage.completion_tokens, 7);
+                assert_eq!(
+                    finish_reason.as_deref(),
+                    Some("stop"),
+                    "and so must the reason"
+                );
+            }
+            other => panic!("expected Done carrying usage, got {other:?}"),
+        }
+    }
+
     /// The reason must not terminate the stream: usage arrives in a later chunk,
     /// and folding the two together would end the read before the token counts.
     #[test]
@@ -1315,7 +1374,10 @@ mod tests {
     fn parse_sse_event_treats_done_as_terminal() {
         assert_eq!(
             parse_sse_event("data: [DONE]").unwrap().unwrap(),
-            StreamEvent::Done { usage: None }
+            StreamEvent::Done {
+                usage: None,
+                finish_reason: None,
+            }
         );
     }
 
@@ -1332,7 +1394,7 @@ mod tests {
             r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
         );
         match event.unwrap().unwrap() {
-            StreamEvent::Done { usage: Some(u) } => {
+            StreamEvent::Done { usage: Some(u), .. } => {
                 assert_eq!(u.prompt_tokens, 3);
                 assert_eq!(u.completion_tokens, 1);
             }
@@ -1593,7 +1655,7 @@ mod tests {
                 }
                 StreamEvent::Reasoning(r) => reasoning.push_str(&r),
                 StreamEvent::Finish(_) => {}
-                StreamEvent::Done { usage: u } => {
+                StreamEvent::Done { usage: u, .. } => {
                     if u.is_some() {
                         usage = u;
                     }

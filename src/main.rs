@@ -2066,8 +2066,17 @@ async fn stream_reply(
                 // Why the model stopped. Recorded rather than shown: it is
                 // what decides which correction a malformed reply earns.
                 Some(Ok(StreamEvent::Finish(reason))) => finish_reason = Some(reason),
-                Some(Ok(StreamEvent::Done { usage: Some(u) })) => usage = Some(u),
-                Some(Ok(StreamEvent::Done { usage: None })) => {}
+                Some(Ok(StreamEvent::Done {
+                    usage: found,
+                    finish_reason: reason,
+                })) => {
+                    if found.is_some() {
+                        usage = found;
+                    }
+                    if reason.is_some() {
+                        finish_reason = reason;
+                    }
+                }
                 Some(Err(e)) => return Some(Err(format!("{e:#}"))),
                 None => {
                     return Some(Ok(Completion {
