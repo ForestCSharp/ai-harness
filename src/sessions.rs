@@ -83,6 +83,9 @@ pub struct Row {
     pub busy: bool,
     pub turns: usize,
     pub focused: bool,
+    /// The directory the session runs in — its sandbox root, which `/cd`
+    /// moves. Empty when there is no sandbox, which only tests see.
+    pub cwd: String,
     /// The last few things that happened, oldest first. What the session is
     /// *doing* is the reason to look at this list at all — a column of names and
     /// the word "streaming" says which one is busy but not what with.
@@ -515,6 +518,11 @@ impl Sessions {
                     busy: app.is_busy() && !blocked,
                     turns: app.turn_number,
                     focused: i == self.current,
+                    cwd: app
+                        .sandbox
+                        .as_ref()
+                        .map(|s| s.root().display().to_string())
+                        .unwrap_or_default(),
                     activity: app.activity(ACTIVITY_LINES),
                 }
             })
@@ -576,6 +584,10 @@ impl Sessions {
     fn matches(&self, i: usize, terms: &[String]) -> bool {
         let app = &self.slots[i].app;
         let mut haystack = format!("{} {}", app.session_name(), app.model).to_lowercase();
+        if let Some(sandbox) = &app.sandbox {
+            haystack.push(' ');
+            haystack.push_str(&sandbox.root().display().to_string().to_lowercase());
+        }
         for line in app.activity(ACTIVITY_LINES) {
             haystack.push(' ');
             haystack.push_str(&line.to_lowercase());

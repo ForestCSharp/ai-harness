@@ -230,6 +230,29 @@ impl Sandbox {
         }
     }
 
+    /// This sandbox moved to `root`, keeping whether it confines anything.
+    ///
+    /// What `/cd` is built on. Confinement is preserved rather than re-decided:
+    /// a `--sandbox none` run must not quietly acquire a boundary it was started
+    /// without, and a confined one must not quietly lose the one it was started
+    /// with — moving is a change of *where*, never of *whether*.
+    ///
+    /// `write_only` is deliberately dropped. It names one file in the tree being
+    /// left behind, so carrying it over would leave a sandbox rooted here whose
+    /// only writable path is somewhere else.
+    ///
+    /// Goes through the same constructors as a launch does, so the new root gets
+    /// the same canonicalisation, the same "is it a directory", and on macOS the
+    /// same `check_profile_safe` — a path that could not have been launched in
+    /// cannot be reached by moving into it either.
+    pub fn rooted_at(&self, root: impl AsRef<Path>) -> Result<Self> {
+        if self.confined {
+            Self::new(root)
+        } else {
+            Self::unconfined(root)
+        }
+    }
+
     /// Whether an already-resolved path falls under the read denylist.
     ///
     /// Built from the same constants the SBPL profile is rendered from, so an
@@ -654,6 +677,83 @@ mod tests {
         assert_eq!(escape(r#"a"b"#), r#"a\"b"#);
         assert_eq!(escape(r"a\b"), r"a\\b");
         assert_eq!(escape("/plain/path"), "/plain/path");
+    }
+
+    /// A unique directory per test, so a parallel run cannot have two tests
+    /// creating and removing the same path.
+    fn moving_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-harness-cd-{}-{name}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("inner"));
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn rooted_at_moves_the_root() {
+        let dir = moving_root("moves");
+        let sandbox = Sandbox::for_tests(&dir);
+        let moved = sandbox.rooted_at(dir.join("inner")).unwrap();
+        assert_eq!(moved.root(), dir.join("inner"));
+        assert_eq!(sandbox.root(), dir, "the original is left alone");
+    }
+
+    /// The invariant worth a test of its own: moving changes *where* a sandbox
+    /// confines, never *whether* it does. A `--sandbox none` run must not
+    /// silently acquire a boundary by moving into a directory.
+    #[test]
+    fn rooted_at_keeps_whether_it_confines() {
+        let dir = moving_root("confinement");
+
+        let loose = Sandbox::unconfined(&dir).unwrap();
+        assert!(!loose.rooted_at(dir.join("inner")).unwrap().is_confined());
+
+        let tight = Sandbox::for_tests(&dir);
+        let moved = tight.rooted_at(dir.join("inner")).unwrap();
+        assert_eq!(moved.is_confined(), tight.is_confined());
+    }
+
+    /// `write_only` names one file in the tree being left behind, so carrying it
+    /// across a move would leave a sandbox rooted here whose only writable path
+    /// is somewhere else entirely.
+    #[test]
+    fn rooted_at_drops_the_write_only_path() {
+        let dir = moving_root("writeonly");
+        let planning = Sandbox::for_tests(&dir).writes_limited_to(dir.join("plan.md"));
+        assert!(planning.write_only.is_some());
+        let moved = planning.rooted_at(dir.join("inner")).unwrap();
+        assert!(moved.write_only.is_none());
+    }
+
+    /// The claim `/cd` actually makes, checked where it is enforced: a command
+    /// built from the moved sandbox is spawned in the new directory. Asserted on
+    /// the working directory of the process about to be spawned rather than on
+    /// `root()`, because that is the field the kernel acts on.
+    #[test]
+    fn a_command_from_a_moved_sandbox_runs_in_the_new_directory() {
+        let dir = moving_root("runs-in");
+        let moved = Sandbox::for_tests(&dir)
+            .rooted_at(dir.join("inner"))
+            .unwrap();
+
+        let command = moved.command("pwd");
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(dir.join("inner").as_path())
+        );
+        let program = moved.program("pwd", &[]);
+        assert_eq!(
+            program.as_std().get_current_dir(),
+            Some(dir.join("inner").as_path())
+        );
+    }
+
+    #[test]
+    fn rooted_at_refuses_what_is_not_a_directory() {
+        let dir = moving_root("refuses");
+        std::fs::write(dir.join("file"), "x").unwrap();
+        let sandbox = Sandbox::for_tests(&dir);
+        assert!(sandbox.rooted_at(dir.join("file")).is_err());
+        assert!(sandbox.rooted_at(dir.join("nope")).is_err());
+        assert_eq!(sandbox.root(), dir, "a refused move changes nothing");
     }
 
     #[test]

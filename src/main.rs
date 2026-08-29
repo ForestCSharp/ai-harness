@@ -27,7 +27,7 @@ mod ui;
 mod wrap;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -210,6 +210,10 @@ fn build_app(client: &Client, sandbox: &Sandbox, args: &Args, sessions_dir: Path
     // Resolved from the project as well as the flags, so a recognised project is
     // checked whether or not anyone remembered to ask.
     app.check_command = check::resolve(&sandbox_root, args.check.as_deref(), args.no_check);
+    // Kept so `/cd` can resolve it again in the project it moves to. See
+    // `App::check_flag`.
+    app.check_flag = args.check.clone();
+    app.no_check = args.no_check;
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
@@ -338,7 +342,10 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                 // `/jobs kill` parks an id, since stopping a job means reaching
                 // the registry of task handles and that belongs to the harness.
                 if let Some(job) = sessions.app_mut().take_pending_job_kill() {
-                    let stopped = kill_job(&ctx, &job);
+                    // The session's own directory: the job was listed from there
+                    // and its pid file is there, wherever `/cd` has moved it.
+                    let root = session_sandbox(sessions.app(), &ctx.sandbox).root().to_path_buf();
+                    let stopped = kill_job(&ctx, &root, &job);
                     sessions.app_mut().push_notice(if stopped {
                         format!("Killed job {job}.")
                     } else {
@@ -1167,7 +1174,7 @@ fn allow(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
     }
 
     let generation = app.next_generation();
-    let sandbox = action_sandbox(app, ctx);
+    let sandbox = action_sandbox(app, &ctx.sandbox);
     let timeout = ctx.timeout;
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -1261,7 +1268,7 @@ fn spawn_watched(
     let generation = app.next_generation();
     app.start_running(command.clone());
 
-    let sandbox = action_sandbox(app, ctx);
+    let sandbox = action_sandbox(app, &ctx.sandbox);
     let timeout = ctx.timeout;
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -1317,7 +1324,9 @@ fn spawn_watched(
 /// `None` means the job could not be started and the user has been told; there
 /// is nothing to send the model, because from its point of view nothing changed.
 fn spawn_job(id: u64, app: &mut App, ctx: &Ctx, command: String) -> Option<Vec<Message>> {
-    let root = ctx.sandbox.root().to_path_buf();
+    // The session's directory, not the launch one: a job started after a `/cd`
+    // runs there, so its directory belongs there too.
+    let root = session_sandbox(app, &ctx.sandbox).root().to_path_buf();
     let handle = match jobs::create(&root, &command) {
         Ok(handle) => handle,
         Err(message) => {
@@ -1326,7 +1335,7 @@ fn spawn_job(id: u64, app: &mut App, ctx: &Ctx, command: String) -> Option<Vec<M
         }
     };
 
-    let sandbox = action_sandbox(app, ctx);
+    let sandbox = action_sandbox(app, &ctx.sandbox);
     let ceiling = ctx.job_ceiling;
     let tx = ctx.tx.clone();
     let registry = Arc::clone(&ctx.jobs);
@@ -1401,7 +1410,7 @@ fn spawn_job(id: u64, app: &mut App, ctx: &Ctx, command: String) -> Option<Vec<M
 /// The registry first, since a handle stops the task cleanly and takes the
 /// process group with it. Falling back to the recorded pid covers the job this
 /// harness did not start — after a restart the directory is all there is.
-fn kill_job(ctx: &Ctx, id: &str) -> bool {
+fn kill_job(ctx: &Ctx, root: &Path, id: &str) -> bool {
     let handle = ctx
         .jobs
         .lock()
@@ -1411,7 +1420,7 @@ fn kill_job(ctx: &Ctx, id: &str) -> bool {
         let _ = cancel.send(());
         return true;
     }
-    jobs::kill(ctx.sandbox.root(), id)
+    jobs::kill(root, id)
 }
 
 /// Refuse the pending command and let the model know.
@@ -1423,15 +1432,28 @@ fn deny(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
 
 /// The sandbox a model-authored action runs under.
 ///
-/// Ordinarily the one `main` built. In plan mode it is narrowed to the session's
-/// plan file, so nothing a command does can change the tree being planned about —
-/// the guarantee is the kernel's, which is why it holds for a shell command and
-/// not only for a write the harness can inspect.
-fn action_sandbox(app: &App, ctx: &Ctx) -> Sandbox {
+/// The session's own, falling back to the one `main` built. `/cd` replaces
+/// `app.sandbox`, and a session that has moved must run its commands where it
+/// moved to — while a session that has not is still using the launch sandbox,
+/// which is the same object either way. `ctx.sandbox` covers the `App` built
+/// without one, which only tests do.
+///
+/// In plan mode it is then narrowed to the session's plan file, so nothing a
+/// command does can change the tree being planned about — the guarantee is the
+/// kernel's, which is why it holds for a shell command and not only for a write
+/// the harness can inspect.
+fn action_sandbox(app: &App, launch: &Sandbox) -> Sandbox {
+    let base = session_sandbox(app, launch);
     match app.plan_path().filter(|_| app.planning()) {
-        Some(plan) => ctx.sandbox.writes_limited_to(plan),
-        None => ctx.sandbox.clone(),
+        Some(plan) => base.writes_limited_to(plan),
+        None => base,
     }
+}
+
+/// The directory a session is working in, as a sandbox. See [`action_sandbox`],
+/// which narrows this for plan mode; everything else wants it as it stands.
+fn session_sandbox(app: &App, launch: &Sandbox) -> Sandbox {
+    app.sandbox.clone().unwrap_or_else(|| launch.clone())
 }
 
 /// Accept a finished plan: leave plan mode and start the work.
@@ -1871,7 +1893,7 @@ fn spawn_search(
     request: search::Request,
 ) {
     let generation = app.next_generation();
-    let sandbox = ctx.sandbox.clone();
+    let sandbox = session_sandbox(app, &ctx.sandbox);
     let tx = ctx.tx.clone();
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -2100,6 +2122,31 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Which sandbox an action runs under, once `/cd` means a session can be
+    /// somewhere other than where the harness was launched. The session's own
+    /// answer has to win, or a moved session would keep running its commands in
+    /// the directory it left.
+    #[test]
+    fn a_moved_session_acts_in_its_own_directory() {
+        let launch = Sandbox::for_tests(std::env::temp_dir());
+        let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
+
+        // No sandbox of its own — only tests build an `App` this way — so the
+        // launch sandbox is the answer.
+        assert_eq!(session_sandbox(&app, &launch).root(), launch.root());
+
+        let moved = std::env::temp_dir().join("ai-harness-cd-main");
+        std::fs::create_dir_all(&moved).unwrap();
+        let moved = std::fs::canonicalize(&moved).unwrap();
+        app.sandbox = Some(launch.rooted_at(&moved).unwrap());
+        assert_eq!(session_sandbox(&app, &launch).root(), moved);
+        assert_eq!(
+            action_sandbox(&app, &launch).root(),
+            moved,
+            "and the narrowing for plan mode is applied on top of it, not instead"
+        );
     }
 
     /// One table for every list, so a motion cannot work in one modal and go

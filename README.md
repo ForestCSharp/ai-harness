@@ -761,15 +761,18 @@ keyboard layout, and the system takes the key before the terminal sees it.
 ┌ sessions ──────────────────────────────────────────────────────────
 │  / to search
 │  ⠋ session-1785873241        streaming  deepseek/deepseek-v4-pro  12 turns
+│      working dir: /Users/you/Desktop/ai_harness
 │      you: add a checkpoint module
 │      write src/checkpoint.rs
 │      cargo test 2>&1 | tail -20
 │
 │    session-1785873999 ‹current›   ready  z-ai/glm-5.2              3 turns
+│      working dir: /Users/you/Desktop/ai_harness
 │      you: why is retire_superseded_reads keyed on the range?
 │      Because keying on the path alone would retire a read of a diff…
 │
 │› ! session-1785874100        needs you  deepseek/deepseek-v4-pro   7 turns
+│      working dir: /Users/you/other-project
 │      you: clean up the tmp directory
 │      rm -rf tmp/*
 │
@@ -777,19 +780,22 @@ keyboard layout, and the system takes the key before the terminal sees it.
 └────────────────────────────────────────────────────────────────────
 ```
 
-Each session shows the last few things that happened in it, because which one is
-busy is a column of names but *what with* is the thing you came back for. It
-names actions as well as words: a session three commands into a build has said
-nothing, and showing it blank would be the least useful thing on the screen.
+Each session shows the directory it runs in, then the last few things that
+happened in it, because which one is busy is a column of names but *what with* is
+the thing you came back for. The directory is there for the same reason: two
+sessions can carry the same timestamp-shaped name, and where one is rooted is
+what pins it to a project. It names actions as well as words: a session three
+commands into a build has said nothing, and showing it blank would be the least
+useful thing on the screen.
 Whatever is streaming or running this instant goes last, being the newest. It is
 also what makes `!` actionable rather than alarming — the command waiting for
 your approval is right there under the name.
 
 `/` narrows the list, on the terms in [In any list](#in-any-list). It searches
-the **activity** as well as the name and the model, unlike the `/load` picker:
-every session here is called `session-<timestamp>`, so the name is the least
-distinguishing thing about it, and `/ parser` finding the one that is working on
-the parser is the whole point.
+the **activity** and the **directory** as well as the name and the model, unlike
+the `/load` picker: every session here is called `session-<timestamp>`, so the
+name is the least distinguishing thing about it, and `/ parser` finding the one
+that is working on the parser is the whole point.
 
 They run **at the same time**. A session you are not looking at keeps streaming
 and keeps running commands, which is the point: you can leave one working through

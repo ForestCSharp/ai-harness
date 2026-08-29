@@ -19,6 +19,8 @@ pub enum Command {
     Rewind,
     /// Open the sessions view, the same as `Ctrl+Space`.
     Sessions,
+    /// Move this session's working directory; `None` reports where it is.
+    Cd(Option<String>),
     /// List the project's memory notes and what the index made of them.
     Memory,
     /// List background jobs; `Some("kill <id>")` stops one.
@@ -107,6 +109,11 @@ impl Command {
             // Changes the contract and the sandbox mid-turn, and `/plan <task>`
             // would start a second turn on top of the first.
             Command::Plan(_) => false,
+            // The same objection, and a sharper one: the sandbox it replaces is
+            // the one an in-flight command is already running under, and the
+            // contract it rebuilds is the one the in-flight request was built
+            // from. A move has to happen between turns to mean anything.
+            Command::Cd(_) => false,
             // Restore files and truncate the conversation. Both would be undoing
             // a turn that is still adding to it.
             Command::Undo | Command::Rewind => false,
@@ -124,6 +131,7 @@ impl Command {
             Command::Undo => "undo",
             Command::Rewind => "rewind",
             Command::Sessions => "sessions",
+            Command::Cd(_) => "cd",
             Command::Memory => "memory",
             Command::Jobs(_) => "jobs",
             Command::Stats => "stats",
@@ -179,6 +187,7 @@ pub fn parse(input: &str) -> Input {
         "undo" => Command::Undo,
         "rewind" => Command::Rewind,
         "sessions" => Command::Sessions,
+        "cd" => Command::Cd(arg),
         "memory" | "memories" => Command::Memory,
         "jobs" | "job" => Command::Jobs(arg),
         "stats" => Command::Stats,
@@ -250,6 +259,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "sessions",
         description: "switch between running sessions, or start one (also Ctrl+Space)",
+    },
+    Spec {
+        name: "cd",
+        description: "move this session's working directory (/cd <path>, /cd to show it)",
     },
     Spec {
         name: "memory",
@@ -497,6 +510,8 @@ mod tests {
             "/undo",
             "/rewind",
             "/rename other",
+            "/cd",
+            "/cd somewhere",
         ] {
             assert!(
                 !command(input).runs_while_busy(),
@@ -544,10 +559,13 @@ mod tests {
 
         // A prefix shared by several commands offers all of them, in table order.
         let names: Vec<_> = matching("c").iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["clear", "compact", "checkpoints", "cost"]);
+        assert_eq!(names, vec!["clear", "compact", "checkpoints", "cd", "cost"]);
 
         let names: Vec<_> = matching("cl").iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["clear"]);
+
+        let names: Vec<_> = matching("cd").iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["cd"]);
 
         let names: Vec<_> = matching("f").iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["fork"]);
@@ -569,6 +587,21 @@ mod tests {
         assert_eq!(
             parse("/save   spaced  "),
             Input::Command(Command::Save(Some("spaced".into())))
+        );
+    }
+
+    /// A directory is the one argument that routinely contains spaces, and the
+    /// argument is everything after the first one — so it survives intact.
+    #[test]
+    fn cd_takes_a_path_including_one_with_spaces() {
+        assert_eq!(parse("/cd"), Input::Command(Command::Cd(None)));
+        assert_eq!(
+            parse("/cd /some/path"),
+            Input::Command(Command::Cd(Some("/some/path".into())))
+        );
+        assert_eq!(
+            parse("/cd ~/My Projects/thing"),
+            Input::Command(Command::Cd(Some("~/My Projects/thing".into())))
         );
     }
 

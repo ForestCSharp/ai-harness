@@ -7,7 +7,7 @@ Install into a checkout of https://github.com/opensquilla/claw-swe-bench:
     #     from claw_swebench.claws.ai_harness import AiHarnessAdapter
     #     CLAWS["ai-harness"] = AiHarnessAdapter
     # and add to CLAW_DEFAULTS in claw_swebench/config.py:
-    #     "ai-harness": {"model": "deepseek/deepseek-v4-pro",
+    #     "ai-harness": {"model": "z-ai/glm-5.3-flash",
     #                    "timeout": 3600, "max_turns": 300},
 
 Architecture, following ZeroClaw: ai-harness runs INSIDE the SWE-bench container

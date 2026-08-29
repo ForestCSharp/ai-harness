@@ -2379,6 +2379,26 @@ pub fn jobs_section(lines: &[String], dir: &str, dropped: usize) -> String {
     )
 }
 
+/// Where the working directory currently is, appended after [`system_prompt`].
+///
+/// The contract has always described the working directory without naming it,
+/// which was accurate while there was exactly one and it never moved. `/cd`
+/// makes it a thing that changes mid-conversation: earlier turns in the same
+/// history resolved their relative paths against a different tree, and a model
+/// told nothing would keep handing back paths from it. Rebuilt with the rest of
+/// the contract on every prompt, so it is the current answer rather than the one
+/// that was true when the session started.
+pub fn workdir_section(root: &str) -> String {
+    format!(
+        "The working directory is now {root}. Relative paths — in a \
+         <{READ_TAG}>, a <{GREP_TAG}>, a <{GLOB_TAG}>, a write, or a \
+         <{SHELL_TAG}> — resolve against it, and the sandbox is rooted there. \
+         If it differs from the directory earlier turns worked in, the paths in \
+         them are stale: look the file up again rather than reusing a path from \
+         the conversation."
+    )
+}
+
 /// The project's own `AGENTS.md`, appended after [`system_prompt`].
 ///
 /// Its own section rather than folded into the `extra` slot `--system` uses,

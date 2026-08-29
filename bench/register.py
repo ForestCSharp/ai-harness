@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 #: What the adapter is called in each benchmark's registry, and what model it
 #: defaults to. The model is only a default — every runner takes an override.
 CLAW_NAME = "ai-harness"
-DEFAULT_MODEL = "deepseek/deepseek-v4-pro"
+DEFAULT_MODEL = "z-ai/glm-5.3-flash"
 
 
 class Missing(RuntimeError):

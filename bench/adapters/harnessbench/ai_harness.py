@@ -9,7 +9,7 @@ Install into a checkout of https://github.com/Qihoo360/harness-bench:
     #     ai-harness:
     #       adapter: ai_harness
     #       command: /usr/local/bin/ai-harness
-    #       model: deepseek/deepseek-v4-pro
+    #       model: z-ai/glm-5.3-flash
     #       confined: true
 
     PYTHONPATH=src python3 -m harnessbench.cli run-task \\

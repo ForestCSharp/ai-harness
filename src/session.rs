@@ -55,6 +55,15 @@ pub struct Session {
     /// it left off rather than renumbering onto checkpoints already on disk.
     #[serde(default)]
     pub turn_number: usize,
+    /// The working directory this session was in, when `/cd` has moved it off
+    /// the one the harness was launched in. `None` means "wherever this launch
+    /// is rooted", which is what every session saved before `/cd` existed meant.
+    ///
+    /// Absolute and already canonical, since it comes from a live
+    /// [`crate::sandbox::Sandbox`]. Added on `ledger`'s precedent, with no
+    /// `VERSION` bump: it defaults when absent, and an older build ignores it.
+    #[serde(default)]
+    pub workdir: Option<std::path::PathBuf>,
 }
 
 impl Session {
@@ -75,6 +84,7 @@ impl Session {
             ledger,
             keep_checkpoints: None,
             turn_number: 0,
+            workdir: None,
         }
     }
 
@@ -84,6 +94,14 @@ impl Session {
     pub fn keeping(mut self, keep: Option<usize>, turn_number: usize) -> Self {
         self.keep_checkpoints = keep;
         self.turn_number = turn_number;
+        self
+    }
+
+    /// Set the working directory this session was in. A builder for the same
+    /// reason [`Session::keeping`] is one: optional, with a default every
+    /// existing caller means.
+    pub fn in_directory(mut self, workdir: Option<std::path::PathBuf>) -> Self {
+        self.workdir = workdir;
         self
     }
 }

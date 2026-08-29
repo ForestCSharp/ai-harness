@@ -704,6 +704,14 @@ pub struct App {
     /// The project's check command, from `--check`. `None` disables the whole
     /// verification step, which is the default.
     pub check_command: Option<String>,
+    /// The two flags `check_command` was resolved from, kept so it can be
+    /// resolved *again* when `/cd` moves the session into another project —
+    /// where the answer is a different command, or none. The resolved command
+    /// alone is not enough to redo that: it cannot say whether it came from
+    /// `--check` (which outranks the new project) or from detection (which the
+    /// new project should override).
+    pub check_flag: Option<String>,
+    pub no_check: bool,
     /// Whether a file has been written since the check last ran.
     ///
     /// The loop guard, and the reason the check needs no retry counter of its
@@ -868,6 +876,8 @@ impl App {
             pending_search: None,
             pending_job_kill: None,
             check_command: None,
+            check_flag: None,
+            no_check: false,
             wrote_since_check: false,
             pending_check: None,
             live_jobs: 0,
@@ -1191,6 +1201,7 @@ impl App {
             Command::Sessions => self.sessions_requested = true,
             Command::Memory => self.memory_report(),
             Command::Jobs(arg) => self.jobs_command(arg),
+            Command::Cd(arg) => self.cd_command(arg),
             Command::Stats => self.stats = true,
             Command::Checkpoints(arg) => self.checkpoints_command(arg),
             Command::Reasoning => {
@@ -1414,6 +1425,12 @@ impl App {
         // underneath a session — the model writes memories itself — and a cached
         // copy would be a second source of truth that goes stale silently. The
         // cost is a small read and a directory listing per prompt.
+        if let Some(sandbox) = &self.sandbox {
+            contract.push_str("\n\n");
+            contract.push_str(&protocol::workdir_section(
+                &sandbox.root().to_string_lossy(),
+            ));
+        }
         if let Some(text) = self.project_guidance() {
             contract.push_str("\n\n");
             contract.push_str(&protocol::project_guidance(&text));
@@ -1617,6 +1634,161 @@ impl App {
         self.push_notice(lines.join("\n"));
     }
 
+    /// `/cd` — move this session's working directory, or report where it is.
+    ///
+    /// The working directory *is* the sandbox root here — see [`Sandbox`], whose
+    /// `root` is documented as the directory writes are confined to — so moving
+    /// one moves the other. That is the honest reading rather than a shortcut: a
+    /// harness launched with `--workdir` elsewhere would have confined itself
+    /// there too, and `/cd` is that decision made later instead of at launch.
+    /// Which is why the notice says the boundary moved out loud, on the same
+    /// grounds the startup and auto-approve notices are said out loud.
+    ///
+    /// Per session. `self.sandbox` is per-`App`, so another open session stays
+    /// where it is, and a session spawned beside this one inherits the move
+    /// through [`App::spawn_sibling`].
+    fn cd_command(&mut self, arg: Option<String>) {
+        let Some(sandbox) = self.sandbox.clone() else {
+            return self.push_notice("No working directory without a sandbox.");
+        };
+        let Some(arg) = arg else {
+            return self.push_notice(format!("Working directory: {}", sandbox.root().display()));
+        };
+
+        let target = self.resolve_workdir(sandbox.root(), arg.trim());
+        let moved = match sandbox.rooted_at(&target) {
+            Ok(moved) => moved,
+            // Left exactly as it was. A `/cd` that half-succeeded would be worse
+            // than one that failed, since the session would be somewhere neither
+            // the user nor the model believed it to be.
+            Err(e) => return self.push_error(format!("{e:#}")),
+        };
+        if moved.root() == sandbox.root() {
+            return self.push_notice(format!("Already in {}.", moved.root().display()));
+        }
+
+        let root = moved.root().to_path_buf();
+        self.adopt_sandbox(moved);
+        self.push_notice(if self.sandbox.as_ref().is_some_and(Sandbox::is_confined) {
+            format!(
+                "Working directory: {} — commands and writes are now confined \
+                 there instead. Saved sessions and checkpoints stay where the \
+                 harness was launched.",
+                root.display()
+            )
+        } else {
+            format!("Working directory: {}", root.display())
+        });
+        // The same lopsided state `/plan` warns about on the way in, reached
+        // from the other direction: the plan lives under the sessions directory,
+        // which does not move, so a `/cd` can leave it outside the tree.
+        if self.planning
+            && let Some(plan) = self.plan_path()
+            && !plan.starts_with(&root)
+        {
+            self.push_notice(format!(
+                "Note: {} is outside the working directory now, so the model can \
+                 write the plan but cannot read or edit it — it will rewrite the \
+                 file whole each time.",
+                plan.display()
+            ));
+        }
+    }
+
+    /// Where `arg` points, given the directory the session is in.
+    ///
+    /// Resolved against the *session's* root, never the process's. The harness
+    /// calls `std::env::current_dir` exactly once, at startup, and never changes
+    /// it — so leaving a relative path to the OS would quietly resolve `/cd src`
+    /// against wherever the binary was launched from, which after one `/cd` is
+    /// no longer where the session is.
+    ///
+    /// A leading `~` is expanded here because nothing else will: `/cd` takes a
+    /// path, not a shell word, so no shell is ever involved to do it.
+    fn resolve_workdir(&self, root: &std::path::Path, arg: &str) -> std::path::PathBuf {
+        let expanded = match arg.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                match std::env::var_os("HOME") {
+                    Some(home) => {
+                        let mut path = std::path::PathBuf::from(home);
+                        // `join` on an absolute `/foo` would replace the home
+                        // directory rather than descend into it.
+                        if let Some(rest) = rest.strip_prefix('/') {
+                            path.push(rest);
+                        }
+                        return path;
+                    }
+                    // No HOME to expand against; fall through and let the
+                    // canonicalise below fail with the path as written.
+                    None => std::path::PathBuf::from(arg),
+                }
+            }
+            _ => std::path::PathBuf::from(arg),
+        };
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            root.join(expanded)
+        }
+    }
+
+    /// Move the session onto `sandbox` and re-resolve everything derived from
+    /// its root.
+    ///
+    /// Shared by `/cd` and by restoring a saved session, so a directory arrived
+    /// at either way carries the same consequences. What follows the root is the
+    /// *project*: its `AGENTS.md`, its memory, its jobs, and its check command.
+    /// What does not is this session's own storage — `sessions_dir`, and the
+    /// checkpoints numbered under it — which stays anchored where the harness
+    /// was launched, so a folder an in-flight turn is writing into can never
+    /// move out from under it.
+    fn adopt_sandbox(&mut self, sandbox: Sandbox) {
+        // Resolved again rather than kept: `--check` still outranks the new
+        // project, but a detected command belongs to the tree it was detected
+        // in, and carrying a `cargo test` into a directory with no Cargo.toml
+        // would fail every turn for a reason nothing on screen explains.
+        self.check_command =
+            crate::check::resolve(sandbox.root(), self.check_flag.as_deref(), self.no_check);
+        self.sandbox = Some(sandbox);
+        // Reads AGENTS.md, the memory index and the jobs list at the new root —
+        // all three are read from disk here rather than cached, which is what
+        // makes moving a matter of rebuilding the contract and nothing else.
+        self.refresh_contract();
+    }
+
+    /// Adopt the working directory a loaded session was saved in.
+    ///
+    /// Separate from [`App::apply_session`], which is contractually pure: this
+    /// canonicalises a path, stats it, and on macOS checks it against the
+    /// sandbox profile — and any of that can fail. Called after the conversation
+    /// is in place and before the contract is rebuilt, so the contract is built
+    /// at the directory the session is being resumed in.
+    ///
+    /// A directory that has since been deleted or renamed is a notice and a stay
+    /// where we are, never a failed load: the conversation is the thing being
+    /// restored, and losing it because a path moved would be the worse trade.
+    pub fn adopt_workdir(&mut self, workdir: Option<std::path::PathBuf>) {
+        let (Some(workdir), Some(sandbox)) = (workdir, self.sandbox.clone()) else {
+            return;
+        };
+        if workdir == sandbox.root() {
+            return;
+        }
+        match sandbox.rooted_at(&workdir) {
+            Ok(moved) => {
+                let root = moved.root().to_path_buf();
+                self.adopt_sandbox(moved);
+                self.push_notice(format!("Working directory: {}", root.display()));
+            }
+            Err(e) => self.push_notice(format!(
+                "This session was saved in {}, which is not usable now ({e}); \
+                 staying in {}.",
+                workdir.display(),
+                sandbox.root().display()
+            )),
+        }
+    }
+
     /// `/jobs` — list them, or park a kill for the event loop.
     ///
     /// Listing is done here because it is a directory read. Killing is *not*:
@@ -1799,6 +1971,7 @@ impl App {
             self.ledger.clone(),
         )
         .keeping(self.keep_checkpoints, self.turn_number)
+        .in_directory(self.sandbox.as_ref().map(|s| s.root().to_path_buf()))
     }
 
     /// Replace the in-memory session with a loaded one. Pure — does no I/O.
@@ -1930,8 +2103,12 @@ impl App {
     pub fn open_saved(&mut self, name: &str) -> bool {
         match crate::session::load(&self.sessions_dir, name) {
             Ok(session) => {
+                let workdir = session.workdir.clone();
                 self.apply_session(session);
                 self.current_session = name.to_string();
+                // Before the contract is rebuilt, since the contract is built
+                // from whatever directory the session is being resumed in.
+                self.adopt_workdir(workdir);
                 self.refresh_contract();
                 self.last_saved = self.fingerprint();
                 true
@@ -1952,9 +2129,11 @@ impl App {
         }
         match crate::session::load(&self.sessions_dir, &name) {
             Ok(session) => {
+                let workdir = session.workdir.clone();
                 self.apply_session(session);
                 // Auto-save now continues to the loaded session's file.
                 self.current_session = name.clone();
+                self.adopt_workdir(workdir);
                 // The loaded history carries the contract that was saved with it,
                 // which may name another session's plan file — or none, while plan
                 // mode is on now. The contract is derived from this process's
@@ -2260,6 +2439,9 @@ impl App {
         fresh.max_turn_bytes = self.max_turn_bytes;
         fresh.max_retries = self.max_retries;
         fresh.compact_at = self.compact_at;
+        fresh.check_command = self.check_command.clone();
+        fresh.check_flag = self.check_flag.clone();
+        fresh.no_check = self.no_check;
         fresh.price_in = self.price_in;
         fresh.price_out = self.price_out;
         // Plan mode is deliberately not inherited: it is a mode you are in for a
@@ -7168,9 +7350,12 @@ mod tests {
     #[test]
     fn completions_narrow_as_you_type() {
         let mut app = App::new("m".into(), None, 10, std::env::temp_dir());
-        // "c" is ambiguous four ways; one more character narrows, two settle it.
+        // "c" is ambiguous five ways; one more character narrows, two settle it.
         app.input.insert_str("/c");
-        assert_eq!(names(&app), vec!["clear", "compact", "checkpoints", "cost"]);
+        assert_eq!(
+            names(&app),
+            vec!["clear", "compact", "checkpoints", "cd", "cost"]
+        );
         app.input.insert_str("o");
         assert_eq!(names(&app), vec!["compact", "cost"]);
         app.input.insert_str("s");
@@ -10928,5 +11113,221 @@ mod check_tests {
         ];
         let counts = crate::stats::actions(&transcript);
         assert_eq!(counts.shells, 1, "only the model's command counts");
+    }
+}
+
+/// `/cd`: moving one session's working directory, and what follows it there.
+#[cfg(test)]
+mod cd_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A session in a fresh temp directory holding `inner/`, with its sessions
+    /// directory alongside — the arrangement a real launch has, and the one that
+    /// makes "session storage does not move" observable.
+    fn app_in_temp() -> (App, std::path::PathBuf) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let unique = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ai-harness-cd-app-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
+        app.sandbox = Some(Sandbox::for_tests(&dir));
+        // As `app_in_temp` does elsewhere: `App::new` built the contract before
+        // the sandbox existed, so rebuild it or every before/after comparison is
+        // against the wrong baseline.
+        app.refresh_contract();
+        (app, dir)
+    }
+
+    fn root(app: &App) -> std::path::PathBuf {
+        app.sandbox.as_ref().unwrap().root().to_path_buf()
+    }
+
+    fn last_notice(app: &App) -> String {
+        app.transcript
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::Notice(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn cd_with_no_argument_reports_where_the_session_is() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Cd(None));
+        assert!(last_notice(&app).contains(&dir.display().to_string()));
+        assert_eq!(root(&app), dir, "reporting is not moving");
+    }
+
+    #[test]
+    fn cd_moves_the_root() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Cd(Some("inner".into())));
+        assert_eq!(root(&app), dir.join("inner"));
+    }
+
+    /// The trap a relative path sets. `std::env::current_dir` is read once at
+    /// startup and never changes, so resolving against it would send `/cd inner`
+    /// to wherever the binary was launched from — which after one `/cd` is not
+    /// where the session is.
+    #[test]
+    fn a_relative_path_resolves_against_the_session_not_the_process() {
+        let (mut app, dir) = app_in_temp();
+        std::fs::create_dir_all(dir.join("inner/deeper")).unwrap();
+        app.run_command(Command::Cd(Some("inner".into())));
+        app.run_command(Command::Cd(Some("deeper".into())));
+        assert_eq!(root(&app), dir.join("inner/deeper"));
+        app.run_command(Command::Cd(Some("..".into())));
+        assert_eq!(root(&app), dir.join("inner"));
+    }
+
+    #[test]
+    fn a_bad_path_changes_nothing_and_says_so() {
+        let (mut app, dir) = app_in_temp();
+        let before = root(&app);
+        app.run_command(Command::Cd(Some("nowhere".into())));
+        assert_eq!(root(&app), before, "a refused move leaves the session put");
+        assert!(
+            matches!(app.transcript.last(), Some(Entry::Error(_))),
+            "and is reported as an error, not as a quiet no-op"
+        );
+        assert_eq!(before, dir);
+    }
+
+    /// The contract is what the model reads, so a move that the contract does
+    /// not mention is a move the model cannot act on.
+    #[test]
+    fn the_contract_names_the_directory_after_a_move() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Cd(Some("inner".into())));
+        let contract = &app.history[0].content;
+        assert!(
+            contract.contains(&dir.join("inner").display().to_string()),
+            "the contract must name where the session now is:\n{contract}"
+        );
+    }
+
+    /// AGENTS.md is read from disk per prompt, so it should follow the move
+    /// without anything else being told to.
+    #[test]
+    fn project_guidance_follows_the_move() {
+        let (mut app, dir) = app_in_temp();
+        std::fs::write(dir.join("inner/AGENTS.md"), "inner conventions\n").unwrap();
+        assert!(!app.history[0].content.contains("inner conventions"));
+
+        app.run_command(Command::Cd(Some("inner".into())));
+        assert!(
+            app.history[0].content.contains("inner conventions"),
+            "the new project's conventions must reach the contract"
+        );
+    }
+
+    /// A detected check belongs to the tree it was detected in. Carrying
+    /// `cargo test` into a directory with no Cargo.toml would fail every turn
+    /// for a reason nothing on screen explains.
+    #[test]
+    fn a_detected_check_is_resolved_again_at_the_new_root() {
+        let (mut app, dir) = app_in_temp();
+        std::fs::write(dir.join("inner/Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        app.check_command = crate::check::resolve(&dir, None, false);
+        assert_eq!(app.check_command, None, "the outer directory is no project");
+
+        app.run_command(Command::Cd(Some("inner".into())));
+        assert_eq!(
+            app.check_command,
+            crate::check::resolve(&dir.join("inner"), None, false),
+            "the new project decides"
+        );
+        assert!(app.check_command.is_some());
+    }
+
+    /// `--check` was the user's decision about this run, not a fact about the
+    /// tree, so moving must not overrule it.
+    #[test]
+    fn an_explicit_check_flag_survives_the_move() {
+        let (mut app, _dir) = app_in_temp();
+        app.check_flag = Some("make verify".into());
+        app.check_command = Some("make verify".into());
+        app.run_command(Command::Cd(Some("inner".into())));
+        assert_eq!(app.check_command.as_deref(), Some("make verify"));
+    }
+
+    /// Session storage stays anchored where the harness was launched, so a
+    /// folder an in-flight turn is writing into can never move out from under it.
+    #[test]
+    fn the_sessions_directory_does_not_move() {
+        let (mut app, dir) = app_in_temp();
+        let before = app.sessions_dir().to_path_buf();
+        app.run_command(Command::Cd(Some("inner".into())));
+        assert_eq!(app.sessions_dir(), before);
+        assert_eq!(before, dir.join("sessions"));
+    }
+
+    #[test]
+    fn a_moved_directory_round_trips_through_a_saved_session() {
+        let (mut app, dir) = app_in_temp();
+        app.run_command(Command::Cd(Some("inner".into())));
+
+        let json = serde_json::to_string(&app.to_session()).unwrap();
+        let saved: crate::session::Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(saved.workdir.as_deref(), Some(dir.join("inner").as_path()));
+
+        let (mut fresh, _dir2) = app_in_temp();
+        let elsewhere = root(&fresh);
+        fresh.apply_session(saved.clone());
+        assert_eq!(
+            root(&fresh),
+            elsewhere,
+            "apply_session is pure — it must not touch the sandbox"
+        );
+        fresh.adopt_workdir(saved.workdir);
+        assert_eq!(root(&fresh), dir.join("inner"));
+    }
+
+    /// Written before `/cd` existed, or saved by a build that never had it.
+    #[test]
+    fn a_session_without_a_workdir_stays_where_it_is() {
+        let (mut app, dir) = app_in_temp();
+        app.adopt_workdir(None);
+        assert_eq!(root(&app), dir);
+    }
+
+    /// The conversation is the thing being restored; losing it because a
+    /// directory was renamed would be the worse trade.
+    #[test]
+    fn a_workdir_that_is_gone_is_a_notice_not_a_failure() {
+        let (mut app, dir) = app_in_temp();
+        app.adopt_workdir(Some(dir.join("deleted-since")));
+        assert_eq!(root(&app), dir, "still usable, still where it was");
+        assert!(
+            last_notice(&app).contains("deleted-since"),
+            "and the user is told why: {}",
+            last_notice(&app)
+        );
+    }
+
+    /// `App::spawn_sibling`'s carry-over list is the one place that decides what
+    /// a new session beside this one inherits, and a field forgotten there
+    /// resets silently.
+    #[test]
+    fn a_session_spawned_beside_a_moved_one_inherits_the_move() {
+        let (mut app, dir) = app_in_temp();
+        app.check_flag = Some("make verify".into());
+        app.no_check = false;
+        app.run_command(Command::Cd(Some("inner".into())));
+
+        let sibling = app.spawn_sibling("beside".into());
+        assert_eq!(
+            sibling.sandbox.as_ref().unwrap().root(),
+            dir.join("inner").as_path()
+        );
+        assert_eq!(sibling.check_flag.as_deref(), Some("make verify"));
     }
 }

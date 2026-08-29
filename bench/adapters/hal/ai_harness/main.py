@@ -7,7 +7,7 @@ Install into a checkout of https://github.com/princeton-pli/hal-harness:
              --agent_dir agents/ai_harness \\
              --agent_function main.run \\
              --agent_name "ai-harness" \\
-             -A model=deepseek/deepseek-v4-pro
+             -A model=z-ai/glm-5.3-flash
 
 HAL owns the outer loop — task selection, Docker or VM isolation, Weave tracing,
 and the cost-controlled leaderboard. This file turns one task into one headless

@@ -2570,6 +2570,20 @@ fn session_entry(
     // Dim and indented under the name: the header is what you are choosing
     // between, the activity is what tells you which to choose.
     let dim = Style::default().fg(Color::DarkGray);
+    // The directory it runs in, labelled, on the line under the title. Several
+    // sessions can carry the same timestamp-shaped name and the same model;
+    // what pins one to a project is where it is rooted, and `/cd` moves it.
+    // Labelled rather than a bare path, which under a session name could read
+    // as anything. The title's style rather than the activity's dim: this
+    // names where the session lives, so it reads at the title's weight.
+    if !row.cwd.is_empty() {
+        let label = "working dir: ";
+        let room = width.saturating_sub(6 + label.chars().count()).max(1);
+        lines.push(Line::from(Span::styled(
+            format!("      {label}{}", truncate(&row.cwd, room)),
+            style,
+        )));
+    }
     for line in &row.activity {
         lines.push(Line::from(Span::styled(
             format!("      {}", truncate(line, width.saturating_sub(7).max(1))),
@@ -2819,6 +2833,7 @@ mod tests {
             busy: matches!(status, "streaming" | "thinking" | "running"),
             turns: 3,
             focused,
+            cwd: String::new(),
             activity: Vec::new(),
         }
     }
@@ -2966,6 +2981,30 @@ mod tests {
         let blocked_at = text.find("cleaner").unwrap();
         let command_at = text.find("rm -rf tmp/*").unwrap();
         assert!(blocked_at < command_at, "under its own session:\n{text}");
+    }
+
+    /// The directory a session runs in sits under its name: several can share
+    /// a timestamp-shaped name, and where one is rooted is what tells them
+    /// apart. A session with no sandbox renders no line at all.
+    #[test]
+    fn each_session_shows_the_directory_it_runs_in() {
+        let mut rooted = active_row("session-1", "streaming", &["you: go"]);
+        rooted.cwd = "/Users/forest/Desktop/ai_harness".into();
+        let floating = active_row("session-2", "ready", &["you: hi"]);
+        let (screen, _) = render_sessions(&[rooted, floating], 0, 78, 20);
+        let text = screen.join("\n");
+
+        assert_eq!(
+            text.matches("      working dir: /Users/forest/Desktop/ai_harness")
+                .count(),
+            1,
+            "the labelled cwd is indented under its own session, once:\n{text}"
+        );
+        assert_eq!(
+            text.matches("session-2").count(),
+            1,
+            "a session with no cwd shows nothing extra:\n{text}"
+        );
     }
 
     /// An entry is several rows tall, so a click anywhere in one has to pick
