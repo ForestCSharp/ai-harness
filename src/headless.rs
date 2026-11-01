@@ -128,7 +128,12 @@ impl RunRecord {
     }
 }
 
-fn protocol_errors(transcript: &[Entry]) -> ProtocolErrors {
+/// Pure over the transcript and so useful before a run is over: `/evaluate`
+/// hands the same tally to the model mid-session, which is the one performance
+/// signal it has no other way of seeing — a model that broke the contract twice
+/// has no memory of it, because `roll_back_retries` took the failed attempts out
+/// of its context on purpose.
+pub fn protocol_errors(transcript: &[Entry]) -> ProtocolErrors {
     let mut errors = ProtocolErrors::default();
     for entry in transcript {
         if let Entry::Malformed {

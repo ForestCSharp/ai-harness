@@ -2661,6 +2661,183 @@ error, so follow them exactly."
     prompt
 }
 
+/// What a session did, for [`evaluation_prompt`] to hand back to the model.
+///
+/// A struct rather than a dozen arguments because every field is a number and
+/// the call would otherwise be unreadable at both ends. Assembled by
+/// `App::evaluate_now` from things that already exist — [`crate::stats::actions`],
+/// the ledger, the transcript — so nothing here is tracked during the run.
+pub struct Performance<'a> {
+    pub turns: usize,
+    /// Round-trips to the model across the whole session. `App::iterations` is
+    /// reset by every prompt, so the ledger's request count is the only
+    /// session-wide figure that is true.
+    pub requests: u64,
+    pub actions: crate::stats::Actions,
+    pub protocol_errors: &'a crate::headless::ProtocolErrors,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub compactions: usize,
+    pub checks: usize,
+    /// Where the report goes, named in full so the model does not have to
+    /// construct it and get the numbering wrong.
+    pub path: &'a str,
+    /// Whether the harness's own source is readable from here. False in any
+    /// other project, where a finding citing `src/protocol.rs` would be
+    /// confident nonsense.
+    pub source_readable: bool,
+}
+
+/// Ask the model to judge its own performance this session and say what in the
+/// harness would have helped.
+///
+/// Sent as an ordinary prompt rather than a contract section, because this is a
+/// task and not a mode: there is nothing to toggle off afterwards.
+///
+/// The model already has the conversation — that is what makes the command
+/// cheap. All this adds is the things it cannot see from inside: what it spent,
+/// how many round-trips it took, and that the parser rejected it, which it has
+/// no memory of because `roll_back_retries` removed those attempts from its
+/// context.
+///
+/// Two deliberate choices in the wording. It asks for **counts, not ratios**:
+/// `bench/metrics.py` registers `lookup_ratio` as lookups per round-trip, which
+/// *rises* when batching works, so a prompt that praised a low ratio would be
+/// teaching the model to batch less. And it demands every finding be tied to a
+/// specific moment in the session, because the failure mode of asking a model
+/// to grade itself is a plausible wish list with nothing behind it.
+pub fn evaluation_prompt(p: &Performance) -> String {
+    let Performance {
+        turns,
+        requests,
+        actions,
+        protocol_errors,
+        prompt_tokens,
+        completion_tokens,
+        compactions,
+        checks,
+        path,
+        source_readable,
+    } = p;
+    let lookups = actions.reads + actions.searches + actions.fetches;
+
+    let mut errors = if protocol_errors.total == 0 {
+        "  protocol errors:   none\n".to_string()
+    } else {
+        let by_reason = protocol_errors
+            .by_reason
+            .iter()
+            .map(|(reason, n)| format!("{reason} x{n}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "  protocol errors:   {} ({by_reason})\n",
+            protocol_errors.total
+        )
+    };
+    if *compactions > 0 {
+        errors.push_str(&format!("  compactions:       {compactions}\n"));
+    }
+    if *checks > 0 {
+        errors.push_str(&format!("  project checks:    {checks}\n"));
+    }
+
+    let mut prompt = format!(
+        "Evaluate your own performance in this session, then write up what the \
+harness could do better.
+
+Here is what you cannot see from inside the conversation:
+
+  turns:             {turns}
+  round-trips:       {requests}
+  lookups:           {lookups} (reads {}, searches {}, fetches {})
+  shell commands:    {}
+  writes landed:     {}
+  denied:            {}
+{errors}  tokens:            {prompt_tokens} in / {completion_tokens} out
+
+The conversation above is the evidence. Read back over it against those numbers \
+and find where the effort actually went — not where it was supposed to go.
+",
+        actions.reads,
+        actions.searches,
+        actions.fetches,
+        actions.shells,
+        actions.writes,
+        actions.denied,
+    );
+
+    if *compactions > 0 {
+        prompt.push_str(
+            "\nNote that this conversation has been compacted, so its earlier part is a \
+summary rather than what was really said. Say so if a finding depends on \
+something you can no longer see, instead of reconstructing it.\n",
+        );
+    }
+
+    if turns <= &2 {
+        prompt.push_str(
+            "\nThis session is very short. If there is genuinely not enough here to draw a \
+conclusion from, say that and stop — an invented finding is worse than none.\n",
+        );
+    }
+
+    prompt.push_str(
+        "\nWhat to look for, roughly in order of how much it would be worth fixing:
+
+- Round-trips that bought nothing. A file read twice, a read of something a \
+grep would have found, several lookups that could have been one \
+<ai-harness-batch>, a command whose output you did not use.
+- Anything you got wrong because the contract did not tell you something, or \
+told you in a way you did not act on. A protocol error above is the clearest \
+case, but so is a thing you had to discover by failing.
+- Work the user had to do that the harness could have done, and approvals you \
+asked for that turned out to be unnecessary.
+- Where you guessed instead of looking, and what would have made looking cheaper.
+
+Rules for the write-up, because a self-assessment is easy to pad:
+
+- Every finding names the moment in this session that prompted it. No general \
+advice about agents, no restating things that went fine.
+- Rank by what it would be worth fixing, and say when something is small.
+- Be specific about the fix. \"Improve the contract\" is not a finding; \"the \
+read result says a window was cut short but not that offset= continues it\" is.
+- If the honest answer is that a turn went badly because of your own choices and \
+not the harness, say that. It is the more useful finding of the two.
+",
+    );
+
+    if *source_readable {
+        prompt.push_str(
+            "\nThe harness's own source is the working directory, so ground each finding in \
+the code: cite `file:line`. `src/protocol.rs` carries the contract and the \
+result encoders, `src/app.rs` dispatches the actions, and `TODO.md` lists what \
+is already known and planned — read it and do not re-propose what is on it.\n",
+        );
+    } else {
+        prompt.push_str(
+            "\nThe harness's own source is NOT readable from here — this session is running \
+in another project. So describe each finding in terms of behaviour you \
+observed and what the harness should do instead, and do not cite files or \
+line numbers you cannot see.\n",
+        );
+    }
+
+    prompt.push_str(&format!(
+        "\nFinish by writing the report to exactly this path, with \
+<{WRITE_TAG} {FILE_ATTR}={path}>:
+
+{path}
+
+Markdown. Previous evaluations, if any, are numbered beside it — read one first \
+if you want to know what has already been said. Note that this directory is \
+skipped by <{GREP_TAG}> and <{GLOB_TAG}>, so reach for a past report by path \
+rather than searching for it. Then end the turn with <{RESPONSE_TAG}> saying \
+what the headline finding was, in a sentence or two.\n"
+    ));
+    prompt
+}
+
 /// The subagent section of the contract, appended after [`system_prompt`] for a
 /// child conversation.
 ///

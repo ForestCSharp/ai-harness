@@ -27,6 +27,12 @@ pub enum Command {
     Jobs(Option<String>),
     /// Open the page of what this session has done.
     Stats,
+    /// Hand this session's own figures to the model and ask what the harness
+    /// should have done better.
+    ///
+    /// `/stats` shows those figures to a person; this shows them to the model,
+    /// which is the half of the loop that was missing.
+    Evaluate,
     /// List checkpoints; `Some` sets how many turns to keep.
     Checkpoints(Option<String>),
     /// Toggle plan mode. `Some` carries the task to start planning immediately.
@@ -87,6 +93,9 @@ impl Command {
             Command::Jobs(_) => true,
             // A page of numbers derived from what already happened.
             Command::Stats => true,
+            // It starts a turn of its own, so it needs the current one finished
+            // — and the figures it reports would be wrong mid-turn anyway.
+            Command::Evaluate => false,
             // The in-flight request already carries its model, so this lands on
             // the next turn — which is usually why it is being typed.
             Command::Model(_) => true,
@@ -135,6 +144,7 @@ impl Command {
             Command::Memory => "memory",
             Command::Jobs(_) => "jobs",
             Command::Stats => "stats",
+            Command::Evaluate => "evaluate",
             Command::Checkpoints(_) => "checkpoints",
             Command::Plan(_) => "plan",
             Command::Help => "help",
@@ -191,6 +201,7 @@ pub fn parse(input: &str) -> Input {
         "memory" | "memories" => Command::Memory,
         "jobs" | "job" => Command::Jobs(arg),
         "stats" => Command::Stats,
+        "evaluate" | "eval" => Command::Evaluate,
         "checkpoints" | "checkpoint" => Command::Checkpoints(arg),
         "plan" => Command::Plan(arg),
         "help" | "h" | "?" => Command::Help,
@@ -275,6 +286,10 @@ pub const COMMANDS: &[Spec] = &[
     Spec {
         name: "stats",
         description: "what this session has done, including how memory was used",
+    },
+    Spec {
+        name: "evaluate",
+        description: "ask the model to judge this session and suggest harness improvements",
     },
     Spec {
         name: "save",
@@ -375,6 +390,8 @@ mod tests {
     #[test]
     fn parses_each_command() {
         assert_eq!(command("/debug"), Command::Debug);
+        assert_eq!(command("/evaluate"), Command::Evaluate);
+        assert_eq!(command("/eval"), Command::Evaluate);
         assert_eq!(command("/auto"), Command::Auto);
         assert_eq!(command("/auto-approve"), Command::Auto);
         assert_eq!(command("/plan"), Command::Plan(None));
@@ -507,6 +524,7 @@ mod tests {
             "/fork",
             "/plan",
             "/plan do a thing",
+            "/evaluate",
             "/undo",
             "/rewind",
             "/rename other",

@@ -86,6 +86,32 @@ stay a deliberate choice.
 
 # Done since
 
+-   **`/evaluate` closes the improve loop**, which this file's own framing
+    against the harness-engineering post said was a gap: the plan → execute →
+    observe → improve cycle stopped at observe. Everything needed for the last
+    step already existed and was only ever shown to a *person* — `/stats` draws
+    the action counts, `/cost` the ledger, and `Entry::Malformed` has held every
+    protocol failure with its parser reason all along.
+
+    It is a composed prompt rather than a mode, which is what kept it small:
+    `/plan <task>` already proved a command can hand text to `send_prompt`, so
+    there is no new `App` state, no contract section, no sandbox change and
+    nothing to clear in `cancel()`. `/compact`'s out-of-band path was the
+    alternative and would have cost a new `Update` variant, a `pump_*`/`spawn_*`
+    pair and a new `Status` — that shape exists because a summary must bypass
+    the protocol parser, which is the opposite of what is wanted here.
+
+    Reused rather than rebuilt: `stats::actions`, the ledger, and
+    `headless::protocol_errors`, which turned out to be pure over the transcript
+    and merely private. One guard worth keeping: the prompt reports **counts,
+    not ratios**, because of the `lookup_ratio` direction problem below.
+
+    Open: nobody has judged the output yet on a real session. The quality of
+    this feature is the quality of its wording, so
+    `cargo test show_the_evaluation_prompt -- --ignored --nocapture` prints the
+    prompt for reading. If the reports come back vague, the fix is there and not
+    in more machinery.
+
 -   **Batched non-mutating actions**, as `<ai-harness-batch>`. The invariant held
     as this entry required: children are exactly the four auto-approved actions,
     and the relaxation reaches no other element.

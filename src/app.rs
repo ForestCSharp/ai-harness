@@ -1250,9 +1250,10 @@ impl App {
 
     /// Handle a locally-executed slash command.
     ///
-    /// Returns messages to send, which only `/plan <task>` does — a command that
-    /// both changes a mode and starts the first turn under it. Everything else is
-    /// local and returns `None`, which is the whole point of a slash command.
+    /// Returns messages to send, which two commands do: `/plan <task>`, which
+    /// both changes a mode and starts the first turn under it, and `/evaluate`,
+    /// which is a composed prompt wearing a command's clothes. Everything else
+    /// is local and returns `None`, which is the whole point of a slash command.
     pub fn run_command(&mut self, command: Command) -> Option<Vec<Message>> {
         let messages = self.dispatch_command(command);
         self.follow = true;
@@ -1277,6 +1278,7 @@ impl App {
             Command::Jobs(arg) => self.jobs_command(arg),
             Command::Cd(arg) => self.cd_command(arg),
             Command::Stats => self.stats = true,
+            Command::Evaluate => return self.evaluate_now(),
             Command::Checkpoints(arg) => self.checkpoints_command(arg),
             Command::Reasoning => {
                 self.show_reasoning = !self.show_reasoning;
@@ -1678,6 +1680,76 @@ impl App {
     /// model, and one dropped for budget is invisible too, and neither announces
     /// itself anywhere else. Rot is what kills a memory system, and this is
     /// where you find it.
+    /// Hand the session its own performance figures and ask what the harness
+    /// should have done better.
+    ///
+    /// The one command besides `/plan <task>` that starts a turn. It is a
+    /// composed prompt rather than a mode: the instruction goes out with the
+    /// numbers and there is nothing left behind to toggle off.
+    ///
+    /// Everything it reports is derived here from things that already exist —
+    /// `stats::actions` over the transcript, the ledger, the archive count on
+    /// disk — so nothing is tracked during the session for this.
+    fn evaluate_now(&mut self) -> Option<Vec<Message>> {
+        // The report goes in the session's own folder, which `maybe_autosave`
+        // may not have created yet. Make it now rather than letting the model's
+        // write fail *after* the user approved it, which is the worst possible
+        // place to discover a missing directory.
+        let index =
+            crate::session::next_evaluation_index(&self.sessions_dir, &self.current_session);
+        let path = match crate::session::ensure_folder(&self.sessions_dir, &self.current_session)
+            .and_then(|_| {
+                crate::session::evaluation_file(&self.sessions_dir, &self.current_session, index)
+            }) {
+            Ok(path) => path,
+            Err(e) => {
+                self.push_notice(format!("Could not prepare the session directory: {e:#}"));
+                return None;
+            }
+        };
+
+        let errors = crate::headless::protocol_errors(&self.transcript);
+        let performance = protocol::Performance {
+            turns: self.turn_number,
+            // Not `iterations`: that is reset by every prompt, so it would
+            // report this turn rather than the session.
+            requests: self.ledger.requests,
+            actions: crate::stats::actions(&self.transcript),
+            protocol_errors: &errors,
+            prompt_tokens: self.ledger.prompt_tokens,
+            completion_tokens: self.ledger.completion_tokens,
+            compactions: crate::session::archives_written(
+                &self.sessions_dir,
+                &self.current_session,
+            ),
+            checks: self
+                .transcript
+                .iter()
+                .filter(|e| matches!(e, Entry::CheckResult(_)))
+                .count(),
+            path: &path.to_string_lossy(),
+            source_readable: self.in_harness_repo(),
+        };
+        let prompt = protocol::evaluation_prompt(&performance);
+        self.send_composed_prompt(prompt)
+    }
+
+    /// Whether the working directory is this harness's own source tree.
+    ///
+    /// `/evaluate` asks for findings about the harness, and they are only worth
+    /// anything if the model can read the code to ground them in. Run anywhere
+    /// else, a finding citing `src/protocol.rs` would be confident nonsense
+    /// about a file that is not there — so the prompt is told which world it is
+    /// in. Sniffed from the manifest the way [`crate::check::detect`] sniffs a
+    /// project, rather than from a flag nobody would remember to set.
+    fn in_harness_repo(&self) -> bool {
+        let Some(root) = self.sandbox.as_ref().map(|s| s.root()) else {
+            return false;
+        };
+        std::fs::read_to_string(root.join("Cargo.toml"))
+            .is_ok_and(|manifest| manifest.contains("name = \"ai-harness\""))
+    }
+
     fn memory_report(&mut self) {
         let Some(root) = self.sandbox.as_ref().map(|s| s.root().to_path_buf()) else {
             return self.push_notice("No memory directory without a sandbox root.");
@@ -2839,6 +2911,23 @@ impl App {
 
     /// Send `text` as a user query, bypassing slash-command parsing.
     pub fn send_prompt(&mut self, text: String) -> Option<Vec<Message>> {
+        self.start_prompt(text, true)
+    }
+
+    /// Send a prompt the *harness* composed rather than the user typing it.
+    ///
+    /// Identical in every way but one: it stays out of `Up`/`Down` recall. The
+    /// arrow keys are for re-sending something you wrote, and a generated block
+    /// of this session's metrics is never that — it would also be stale the
+    /// moment it was recalled, since the numbers it quotes have moved on.
+    ///
+    /// It still appears in the transcript as `Entry::User`, which is wanted:
+    /// the user should be able to see exactly what the model was handed.
+    fn send_composed_prompt(&mut self, text: String) -> Option<Vec<Message>> {
+        self.start_prompt(text, false)
+    }
+
+    fn start_prompt(&mut self, text: String, recall: bool) -> Option<Vec<Message>> {
         if self.is_busy() || text.trim().is_empty() {
             return None;
         }
@@ -2852,7 +2941,7 @@ impl App {
 
         // Record for Up/Down recall, de-duping an immediate repeat. Browsing
         // ends on submit.
-        if self.prompt_history.last() != Some(&text) {
+        if recall && self.prompt_history.last() != Some(&text) {
             self.prompt_history.push(text.clone());
         }
         self.history_index = None;
@@ -10142,6 +10231,217 @@ mod file_tests {
 }
 
 /// Plan mode: what it restricts, and how a finished plan becomes work.
+#[cfg(test)]
+mod evaluate_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// An app over a temp directory, with `manifest` as its `Cargo.toml` so the
+    /// harness-repo sniff can be driven either way.
+    fn app_in_temp(manifest: Option<&str>) -> (App, std::path::PathBuf) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let unique = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ai-harness-eval-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        if let Some(manifest) = manifest {
+            std::fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        }
+
+        let mut app = App::new("m".into(), None, 10, dir.join("sessions"));
+        app.sandbox = Some(Sandbox::for_tests(&dir));
+        app.refresh_contract();
+        (app, dir)
+    }
+
+    /// A session that has done some work, so there is something to report.
+    fn worked(app: &mut App) {
+        app.input.insert_str("do some work");
+        app.submit();
+        app.transcript
+            .push(Entry::ReadResult(crate::files::ReadOutcome::whole_file(
+                "src/app.rs",
+                "fn main() {}",
+            )));
+        app.transcript.push(Entry::Malformed {
+            reason: "reply was not a tag".into(),
+            raw: "sure, let me look".into(),
+            finish_reason: Some("stop".into()),
+        });
+        app.ledger.requests = 19;
+        app.ledger.prompt_tokens = 94_000;
+        app.ledger.completion_tokens = 7_000;
+        // `/evaluate` starts a turn of its own, so it is only reachable between
+        // turns — `runs_while_busy` is false, and `start_prompt` refuses while
+        // the session is busy. `submit` above left it waiting.
+        app.status = Status::Idle;
+    }
+
+    fn prompt_of(messages: &[Message]) -> String {
+        messages.last().expect("a prompt was sent").content.clone()
+    }
+
+    /// The command's whole job: the numbers the model cannot see from inside
+    /// the conversation have to reach it.
+    #[test]
+    fn the_prompt_carries_what_the_model_cannot_see() {
+        let (mut app, dir) = app_in_temp(None);
+        worked(&mut app);
+
+        let messages = app
+            .run_command(Command::Evaluate)
+            .expect("/evaluate starts a turn");
+        let prompt = prompt_of(&messages);
+
+        assert!(prompt.contains("round-trips:       19"), "{prompt}");
+        assert!(prompt.contains("94000 in / 7000 out"), "{prompt}");
+        assert!(
+            prompt.contains("reply was not a tag x1"),
+            "the parser's own reason, which the model has no memory of: {prompt}"
+        );
+        assert!(prompt.contains("reads 1"), "{prompt}");
+        assert!(app.is_waiting(), "and the turn is under way");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clean session should say so rather than inventing a tally.
+    #[test]
+    fn a_session_with_no_protocol_errors_says_none() {
+        let (mut app, dir) = app_in_temp(None);
+        app.input.insert_str("hello");
+        app.submit();
+        app.status = Status::Idle;
+
+        let prompt = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(prompt.contains("protocol errors:   none"), "{prompt}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The report's path is handed over whole, so the model never has to work
+    /// out the numbering — and the number advances past reports already there.
+    #[test]
+    fn the_path_is_named_and_numbered() {
+        let (mut app, dir) = app_in_temp(None);
+        worked(&mut app);
+
+        let prompt = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(prompt.contains("evaluation-001.md"), "{prompt}");
+
+        // The directory is made now rather than when the model's write lands,
+        // so an approved write cannot fail on a missing parent.
+        let folder = crate::session::dir(app.sessions_dir(), app.session_name()).expect("a folder");
+        assert!(folder.is_dir(), "the session directory exists up front");
+
+        std::fs::write(folder.join("evaluation-001.md"), "# first").unwrap();
+        app.status = Status::Idle;
+        let next = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(
+            next.contains("evaluation-002.md"),
+            "a second evaluation must not overwrite the first: {next}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Findings are only groundable where the harness's own source is readable.
+    /// Anywhere else, citing `src/protocol.rs` would be confident nonsense.
+    #[test]
+    fn it_knows_whether_it_can_read_its_own_source() {
+        let (mut app, dir) = app_in_temp(Some("[package]\nname = \"ai-harness\"\n"));
+        worked(&mut app);
+        let inside = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(inside.contains("cite `file:line`"), "{inside}");
+        assert!(inside.contains("TODO.md"), "{inside}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (mut other, dir) = app_in_temp(Some("[package]\nname = \"something-else\"\n"));
+        worked(&mut other);
+        let outside = prompt_of(&other.run_command(Command::Evaluate).expect("a turn"));
+        assert!(outside.contains("NOT readable from here"), "{outside}");
+        assert!(
+            !outside.contains("cite `file:line`"),
+            "it must not ask for citations it cannot support: {outside}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compacted session's early history is a summary, so the model has to be
+    /// told its view of itself is incomplete.
+    #[test]
+    fn a_compacted_session_is_told_its_memory_is_partial() {
+        let (mut app, dir) = app_in_temp(None);
+        worked(&mut app);
+        let folder = crate::session::ensure_folder(app.sessions_dir(), app.session_name()).unwrap();
+        std::fs::write(folder.join("compaction-001.json"), "{}").unwrap();
+
+        let prompt = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(prompt.contains("compactions:       1"), "{prompt}");
+        assert!(prompt.contains("has been compacted"), "{prompt}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two turns in, there is nothing to draw a conclusion from, and saying so
+    /// is better than manufacturing a finding.
+    #[test]
+    fn a_very_short_session_is_allowed_to_say_so() {
+        let (mut app, dir) = app_in_temp(None);
+        app.input.insert_str("hi");
+        app.submit();
+        app.status = Status::Idle;
+
+        let prompt = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(prompt.contains("very short"), "{prompt}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Print the prompt `/evaluate` sends, for reading with human eyes.
+    ///
+    /// Ignored by default because it asserts nothing. It is here because the
+    /// quality of this feature is the quality of its wording — the failure mode
+    /// is a model that produces a plausible wish list — and the fix for that is
+    /// always the prompt rather than more machinery. So there has to be a cheap
+    /// way to look at it:
+    ///
+    /// ```text
+    /// cargo test show_the_evaluation_prompt -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "prints for inspection; asserts nothing"]
+    fn show_the_evaluation_prompt() {
+        let (mut app, dir) = app_in_temp(Some("[package]\nname = \"ai-harness\"\n"));
+        worked(&mut app);
+        let messages = app.run_command(Command::Evaluate).expect("a turn");
+        println!("\n{}\n", prompt_of(&messages));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Up` is for re-sending something you typed. A generated block of metrics
+    /// is not that, and would be stale the moment it was recalled.
+    #[test]
+    fn the_composed_prompt_stays_out_of_recall() {
+        let (mut app, dir) = app_in_temp(None);
+        app.input.insert_str("a real prompt");
+        app.submit();
+        app.status = Status::Idle;
+        let before = app.prompt_history.clone();
+
+        app.run_command(Command::Evaluate).expect("a turn");
+        assert_eq!(
+            app.prompt_history, before,
+            "the metrics block must not land in Up/Down history"
+        );
+        // But the user can still see what the model was handed.
+        assert!(
+            app.transcript
+                .iter()
+                .any(|e| matches!(e, Entry::User(text) if text.contains("round-trips"))),
+            "the prompt is visible in the transcript"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod plan_tests {
     use super::tests::last_visible;

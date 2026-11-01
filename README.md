@@ -358,6 +358,7 @@ Commands are handled locally and never sent to the model.
 | `/memory` | List the project's notes and what the index made of them (see [Project memory](#project-memory)) |
 | `/jobs [kill <id>]` | List background jobs, or stop one (see [Background jobs](#background-jobs)) |
 | `/stats` | A page of what this session has done, including how memory was used |
+| `/evaluate` | Hand the session's own figures to the model and ask what the harness should have done better (see [Evaluating a session](#evaluating-a-session)) |
 | `/checkpoints [n]` | List what can be undone; with a number, keep only the last `n` turns |
 | `/save [name]` | Save the session now (auto-save is always on; this also names it) |
 | `/load [name]` | Load a saved session; `/load` with no name opens a picker modal |
@@ -644,6 +645,67 @@ Three things worth knowing:
 - **Memory is an injection surface.** Something the model read from a fetched
   page can end up in a file loaded into every later session. The approval modal
   is the check on that.
+
+## Evaluating a session
+
+`/stats` shows you what a session did. `/evaluate` shows the *model* the same
+figures and asks what the harness should have done better.
+
+That asymmetry was the gap. Everything needed to judge a run already existed —
+the action counts, the ledger, every protocol failure with the parser's reason
+for it — and all of it was only ever drawn on a page for a person. The model
+could not see what it had spent, how many round-trips it had taken, or that the
+parser had rejected it twice, so it was in no position to notice that it had
+spent eleven lookups on something one `<ai-harness-batch>` would have done.
+
+The command composes the numbers it cannot see from inside the conversation and
+sends them as a prompt:
+
+```
+  turns:             7
+  round-trips:       19
+  lookups:           11 (reads 8, searches 3, fetches 0)
+  shell commands:    4
+  writes landed:     3
+  denied:            1
+  protocol errors:   2 (reply was not a tag x2)
+  tokens:            94000 in / 7000 out
+```
+
+It is a prompt, not a mode. The instruction rides along with the figures, so
+there is nothing to toggle off afterwards and nothing kept between turns. The
+model then has the whole protocol: it can grep and read the harness's own
+source, batch its lookups, and ground each finding in a `file:line` — then it
+writes the report to `evaluation-001.md` in the session's folder, numbered
+beside any earlier ones, and ends with a sentence on the headline finding. The
+write goes through the approval modal like any other, so you see the report
+before it lands.
+
+Three things it is deliberately careful about, because a model grading its own
+work is the easiest thing in the world to get a plausible non-answer from:
+
+- **Counts, not ratios.** `bench/metrics.py` registers `lookup_ratio` as
+  lookups per round-trip, which *rises* when batching works — so a prompt that
+  praised a low ratio would be teaching the model to batch less. "11 of 19
+  round-trips produced a lookup" has no direction to optimise.
+- **Every finding has to name the moment that prompted it.** General advice
+  about agents is not a finding, and neither is restating what went fine. The
+  prompt says so, and says that admitting a turn went badly for its own reasons
+  rather than the harness's is the more useful of the two answers.
+- **It knows when it cannot see the code.** Suggestions about the harness are
+  only groundable in the harness's own tree, so the working directory's
+  `Cargo.toml` is sniffed the way the project check sniffs a project. Run
+  anywhere else, the prompt says the source is unreachable and asks for
+  behavioural findings instead of citations to files that are not there.
+
+A session two turns old is told it is too short to conclude anything from, and
+a compacted one is told its own early history is a summary rather than what was
+really said — so a finding that leans on something it can no longer see gets
+flagged instead of reconstructed.
+
+Evaluations accumulate per session, so one can be read against the last. The
+report lives under `.ai_harness/`, which the search walk skips, so reach for an
+earlier one by path rather than grepping for it.
 
 ## The project check
 

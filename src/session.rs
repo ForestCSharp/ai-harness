@@ -134,6 +134,15 @@ pub const PLAN_FILE: &str = "plan.md";
 /// Not appended to, because concatenated JSON documents do not parse.
 pub const ARCHIVE_PREFIX: &str = "compaction-";
 
+/// Prefix of the reports `/evaluate` writes — `evaluation-001.md`, and so on.
+///
+/// Numbered rather than overwritten for the reason the archives are, and the
+/// reason is stronger here: the point of evaluating a session is comparing what
+/// it says against what the last one said, and overwriting would leave nothing
+/// to compare against. Markdown because the transcript renders it and because a
+/// human is the intended second reader.
+pub const EVALUATION_PREFIX: &str = "evaluation-";
+
 /// Which sessions were open when the harness last quit, beside the session
 /// folders rather than inside one — it is a fact about the set, not about any
 /// member of it.
@@ -248,6 +257,36 @@ pub fn archive_file(root: &Path, name: &str, n: usize) -> Result<PathBuf> {
 /// in-memory counter would restart at 1 and overwrite the archives already
 /// there — which is exactly the file nothing else holds a copy of.
 pub fn next_archive_index(root: &Path, name: &str) -> usize {
+    next_index(root, name, ARCHIVE_PREFIX, ".json")
+}
+
+/// The `n`th evaluation file for `name`, whether or not it exists yet.
+pub fn evaluation_file(root: &Path, name: &str, n: usize) -> Result<PathBuf> {
+    Ok(dir(root, name)?.join(format!("{EVALUATION_PREFIX}{n:03}.md")))
+}
+
+/// The next unused evaluation number for `name`, counting from 1.
+pub fn next_evaluation_index(root: &Path, name: &str) -> usize {
+    next_index(root, name, EVALUATION_PREFIX, ".md")
+}
+
+/// How many numbered files with this prefix `name`'s folder already holds.
+///
+/// `next_index` minus one, named because "how many compactions has this session
+/// had" is a question worth asking directly rather than by doing that
+/// subtraction at the call site and hoping the reader follows.
+pub fn archives_written(root: &Path, name: &str) -> usize {
+    next_archive_index(root, name) - 1
+}
+
+/// The next unused number for the `prefix`/`suffix` family in `name`'s folder,
+/// counting from 1.
+///
+/// Read off the folder rather than counted in memory. A session loaded with
+/// `/load` has no idea how many times it was compacted — or evaluated — in an
+/// earlier run, and an in-memory counter would restart at 1 and overwrite the
+/// files already there, which for an archive is the only copy anything holds.
+fn next_index(root: &Path, name: &str, prefix: &str, suffix: &str) -> usize {
     let Ok(folder) = dir(root, name) else {
         return 1;
     };
@@ -259,8 +298,8 @@ pub fn next_archive_index(root: &Path, name: &str) -> usize {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
-            name.strip_prefix(ARCHIVE_PREFIX)?
-                .strip_suffix(".json")?
+            name.strip_prefix(prefix)?
+                .strip_suffix(suffix)?
                 .parse::<usize>()
                 .ok()
         })
