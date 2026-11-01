@@ -1695,6 +1695,12 @@ fn render_entry(
                 Action::Edit { .. } => ("edit", Color::Cyan),
                 Action::Options { .. } => ("question", Color::Yellow),
                 Action::Response(_) => ("response", Color::Green),
+                // Blue like the four actions it can hold, because that is what
+                // the colour means here: nothing in it reaches the modal.
+                Action::Batch(_) => ("batch", Color::Blue),
+                // Blue for the same reason: it can only look, and the user is
+                // never asked about it.
+                Action::Agent { .. } => ("subagent", Color::Blue),
             };
             let mut header = vec![Span::styled(
                 label,
@@ -1782,6 +1788,24 @@ fn render_entry(
                         None => CodeBody::Contents(new),
                     };
                     lines.extend(code_block(highlight::detect(path), body, width));
+                }
+                // One line per child, each reusing the label the same action
+                // gets on its own, so a batched read reads like a read. The
+                // results arrive below as their own rows, exactly as they would
+                // have one at a time.
+                Action::Batch(children) => {
+                    for child in children {
+                        lines.extend(body_lines(
+                            &crate::app::action_label(child),
+                            Style::default().fg(Color::Blue),
+                            width,
+                        ));
+                    }
+                }
+                // The question asked, which is the only part of a subagent the
+                // user sees until its report lands below as its own row.
+                Action::Agent { task } => {
+                    lines.extend(body_lines(task, Style::default().fg(Color::Blue), width))
                 }
             }
         }

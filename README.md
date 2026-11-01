@@ -46,6 +46,19 @@ The model must reply with exactly one of nine elements, and nothing else:
 ```
 
 ```xml
+<ai-harness-batch>
+<ai-harness-read>src/app.rs</ai-harness-read>
+<ai-harness-read offset=200 limit=100>src/ui.rs</ai-harness-read>
+<ai-harness-grep dir=src>fn parse_reply</ai-harness-grep>
+</ai-harness-batch>
+```
+
+```xml
+<ai-harness-agent>Which module owns session naming, and what makes a name
+valid? Name the files and the functions.</ai-harness-agent>
+```
+
+```xml
 <ai-harness-edit file=src/app.rs>
 <ai-harness-old>let x = 1;</ai-harness-old>
 <ai-harness-new>let x = 2;</ai-harness-new>
@@ -183,6 +196,58 @@ contract instead of having to remember a two-command pipeline, and that a
 refusal comes back as something it can act on rather than a shell exit code.
 The destination policy above is the price of that first property — take
 auto-approval away and most of it would be redundant with the modal.
+
+`<ai-harness-batch>` does several non-mutating actions in one reply. A reply is
+one action, and the whole conversation is re-sent on every one — so looking at
+four files cost four full re-sends of everything said so far. Measured across a
+benchmark sweep, **half of all round-trips were spent purely on lookups**, and
+the worst run spent 31 of 31 that way and never wrote a line.
+
+Its children are exactly the four auto-approved actions — read, grep, glob,
+fetch — and that boundary is the point rather than a convenience. A write or a
+shell command inside one would be approved as part of a group, so "one mutating
+action, one approval" is kept by the grammar rather than by a rule someone has
+to remember. Two to eight children; eight 64 KB reads is exactly the default
+`--max-turn-bytes`, so the cap lands on a guard that already existed.
+
+The children run **one at a time**, and the model is not asked again until the
+queue empties. That is deliberate: the saving is round-trips, not parallelism,
+so each child goes through the same code a lone action does — the same inline
+read, the same `spawn_blocking` walk, the same fetch task — and pushes its own
+result. Nothing downstream can tell a batched read from a solitary one, which is
+why `/stats`, compaction and the superseded-read rewrite needed no changes at
+all. `Esc` mid-batch abandons the rest, and the byte guard is re-checked between
+children, naming the ones it skipped so the model can ask again rather than
+silently losing them. Under `--confirm-reads` or `--confirm-fetch` a batch is
+refused with a reason: those flags mean "ask me about each one", and honouring
+both would mean several modals at once.
+
+`<ai-harness-agent>` hands a question to a **read-only subagent** — a child
+conversation that can only read, grep, glob and fetch, answers in its own
+context, and reports back in a paragraph.
+
+What it buys is context, not speed. Compaction's mechanical pass already turns a
+64 KB read result into a ~220-byte stub cheaply, so the expensive residue of a
+long search is not the file contents but the model's own *reasoning*: fifteen
+replies that survive that pass byte-for-byte and are compressed only by the
+lossy summarising one. A subagent spends its own window on those fifteen, and
+the parent pays for one paragraph.
+
+The restriction is enforced where plan mode's is, at **dispatch** rather than at
+the modal — so a write, an edit, a shell command or even an `<ai-harness-option>`
+comes straight back as a refusal. A question is included for the same reason as
+the rest: there is nobody in a child conversation to answer one. That also makes
+a child structurally unable to reach the approval state, rather than merely
+unlikely to. Subagents cannot nest, since a tree of them would be bounded by
+nothing, and a child gets its own smaller round-trip budget so one that loses its
+way cannot spend the turn the parent is still waiting on. Its tokens are real and
+land on the parent's ledger as side spend — counted, but not added to the
+parent's context reading, which is what the compaction trigger reads.
+
+A child is a conversation but **not a session**: it never appears in
+`Ctrl+Space`, never counts toward the eight-session cap, never adds to the
+"needs you" count, and is never written to the open-set record — which matters
+most of all, since a leak there would reopen it as a session on the next launch.
 
 `<ai-harness-edit>` changes part of a file by exact search-and-replace: the
 `<ai-harness-old>` text must appear **exactly once** in the file, and it is
@@ -621,6 +686,32 @@ cargo run -- --no-check
 ```
 
 `--no-check` wins over `--check`, which wins over what was inferred.
+
+### `--check-each-write` moves it earlier
+
+By default the check is the turn's **exit condition**: the model writes as many
+files as it likes and the check has the last word on the way out. That is the
+cheapest place to put one command, but it is the latest possible moment to learn
+the first of five edits was wrong — four more have been built on top of it before
+the news arrives.
+
+`--check-each-write` runs it after every landed write instead, so a failure
+reaches the model attached to the edit that caused it. The machinery is the same
+command, the same live window, the same `Esc`, the same result shape; only the
+trigger moves. A passing check mid-turn resumes rather than ending the turn,
+which is the one behaviour the turn-end version cannot express.
+
+It is **off by default** because it multiplies cost: three edits become three
+checks, and they serialise, since only one command runs at a time. Worth reaching
+for when the check is a second or two — `ruff check .`, `tsc --noEmit`, a lint
+script — and not when it is the `cargo check --all-targets` a Cargo project
+infers. A turn that writes once costs no more than it does today: verifying at
+the write disarms the turn-end check rather than adding to it.
+
+The check is never scoped to the file that changed, under either trigger. No
+inferred command takes a path: `cargo check` and `go build ./...` have no
+meaningful single-file mode, and `tsc --noEmit` on one file ignores its
+`tsconfig.json`.
 
 Any turn that **wrote a file** runs that command before it is allowed to end.
 You watch it in the same live window an approved command uses. If it passes, the

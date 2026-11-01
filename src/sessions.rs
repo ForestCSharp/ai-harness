@@ -67,6 +67,22 @@ pub struct Slot {
     /// conversation's wrapped rows, and rebuilding a long one on every switch is
     /// the cost it exists to avoid.
     pub cache: TranscriptCache,
+    /// The session that spawned this one as a read-only subagent, if any.
+    ///
+    /// A child is a *conversation*, which is why it is a slot at all — it needs
+    /// its own history, its own `InFlight` and its own place in `route`. But it
+    /// is not a *session*: nobody asked for it, nobody switches to it, and it
+    /// is gone within the turn. So it is hidden from everything the user sees or
+    /// that outlives the process — see [`Sessions::is_child`] for the list.
+    pub parent: Option<u64>,
+}
+
+/// A subagent that has finished, and whether its parent still wants the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledChild {
+    pub child: u64,
+    pub parent: u64,
+    pub wanted: bool,
 }
 
 /// What the view shows for one session.
@@ -136,6 +152,7 @@ impl Sessions {
                 app,
                 inflight: None,
                 cache: TranscriptCache::default(),
+                parent: None,
             }],
             current: 0,
             view: None,
@@ -213,12 +230,48 @@ impl Sessions {
             app,
             inflight: None,
             cache: TranscriptCache::default(),
+            parent: None,
         });
         self.current = self.slots.len() - 1;
     }
 
+    /// Open a read-only subagent for session `parent`, without focusing it.
+    ///
+    /// Deliberately not [`Sessions::spawn`]: that one focuses what it opens,
+    /// names it for the user and announces it, all of which are wrong for a
+    /// conversation the user did not ask for. Returns the child's id so the
+    /// parent can be told what to wait for.
+    pub fn spawn_child(&mut self, parent: u64, app: App) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.slots.push(Slot {
+            id,
+            app,
+            inflight: None,
+            cache: TranscriptCache::default(),
+            parent: Some(parent),
+        });
+        id
+    }
+
+    /// Whether slot `i` is a subagent rather than a session of the user's.
+    ///
+    /// The one predicate every hiding site shares, so "is this the user's?" is
+    /// answered in one place rather than by five `parent.is_none()` checks that
+    /// could drift apart.
+    fn is_child(&self, i: usize) -> bool {
+        self.slots[i].parent.is_some()
+    }
+
+    /// How many of the user's sessions are open.
+    ///
+    /// Children are left out: this is the number in the status bar and the
+    /// number the cap is measured against, and both are about sessions the user
+    /// opened. A subagent that counted would make spawning one able to refuse
+    /// the next `Ctrl+N` with "already running 8 sessions" — for something the
+    /// user never asked for.
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.slots.iter().filter(|s| s.parent.is_none()).count()
     }
 
     pub fn current(&self) -> &Slot {
@@ -270,10 +323,15 @@ impl Sessions {
     }
 
     /// How many sessions are waiting on a person rather than on time.
+    /// Children are left out, and structurally cannot be in: a read-only
+    /// subagent has every blocking action refused, so it can never reach an
+    /// approval or a question. The filter is here for the case where that stops
+    /// being true — a count that said "needs you" about a conversation the user
+    /// cannot switch to would be unanswerable.
     pub fn blocked(&self) -> usize {
         self.slots
             .iter()
-            .filter(|slot| Self::is_blocked(&slot.app))
+            .filter(|slot| slot.parent.is_none() && Self::is_blocked(&slot.app))
             .count()
     }
 
@@ -310,7 +368,7 @@ impl Sessions {
     /// so a session spawned from one running unattended is also unattended, and
     /// one spawned from a careful session also asks.
     pub fn spawn(&mut self) {
-        if self.slots.len() >= MAX_SESSIONS {
+        if self.len() >= MAX_SESSIONS {
             return self.app_mut().push_notice(format!(
                 "Already running {MAX_SESSIONS} sessions, the most at once. Shut one \
                  down first — Ctrl+Space, then x."
@@ -339,7 +397,7 @@ impl Sessions {
             self.switch(i);
             return;
         }
-        if self.slots.len() >= MAX_SESSIONS {
+        if self.len() >= MAX_SESSIONS {
             return self.app_mut().push_notice(format!(
                 "Already running {MAX_SESSIONS} sessions, the most at once. Shut one \
                  down first — Ctrl+Space, then x."
@@ -369,9 +427,15 @@ impl Sessions {
     }
 
     /// The names running right now, for the pickers to leave out.
+    ///
+    /// Children are not among them, which matters twice: a subagent is not a
+    /// session you could `/load` into, and this same list is what
+    /// [`Sessions::maybe_record_open`] writes to disk — so a child here would
+    /// be **reopened as a session** on the next launch.
     pub fn open_names(&self) -> Vec<String> {
         self.slots
             .iter()
+            .filter(|slot| slot.parent.is_none())
             .map(|slot| slot.app.session_name().to_string())
             .collect()
     }
@@ -396,10 +460,18 @@ impl Sessions {
 
     /// Write the open set when it has changed.
     fn maybe_record_open(&mut self, names: Vec<String>) {
+        // `current` indexes `names`, which leaves children out, so it has to be
+        // the focused session's position among the user's sessions rather than
+        // its slot index. A child sitting before the focus would otherwise
+        // shift the two apart and reopen on the wrong conversation.
+        let current = self.slots[..self.current]
+            .iter()
+            .filter(|slot| slot.parent.is_none())
+            .count();
         let open = OpenSet {
             version: crate::session::VERSION,
             root: self.root.clone(),
-            current: self.current,
+            current,
             names,
         };
         if self.recorded.as_ref() == Some(&open) {
@@ -437,6 +509,80 @@ impl Sessions {
             .map(|n| format!("{base}-{n}"))
             .find(|name| !taken(name))
             .unwrap_or(base)
+    }
+
+    /// Open a read-only subagent for session `parent` and start it on `task`.
+    ///
+    /// Returns the child's id and the messages its first request should carry,
+    /// or `None` if the parent has gone. Here rather than in the event loop
+    /// because naming and slot-making are both `Sessions`' business, and doing
+    /// it outside would mean borrowing the parent and the child at once.
+    ///
+    /// Not subject to `MAX_SESSIONS`: the cap is about how many conversations a
+    /// person can keep track of, and this is not one of those — the user did not
+    /// ask for it and cannot see it. `AGENT_ITERATIONS` is what bounds it.
+    pub fn open_agent(
+        &mut self,
+        parent: u64,
+        task: &str,
+    ) -> Option<(u64, Vec<crate::openrouter::Message>)> {
+        let name = self.unique_name();
+        let mut child = self.route(parent)?.app.spawn_agent(name);
+        child.share_catalog(self.catalog());
+        let messages = child.send_prompt(task.to_string())?;
+        Some((self.spawn_child(parent, child), messages))
+    }
+
+    /// Subagents that have run to a stop, each with its parent and whether that
+    /// parent is still waiting for the answer.
+    ///
+    /// The `wanted` flag is the one that matters. A parent may have given up —
+    /// `Esc`, or an error that ended the turn — and reporting to an idle
+    /// conversation would not merely waste the answer: it would push a result
+    /// in and start a turn the user deliberately stopped. So an unwanted child
+    /// is dropped silently, which is what cancelling asked for.
+    ///
+    /// Here rather than in the event loop so the decision can be tested without
+    /// a client, a runtime and a channel.
+    pub fn settled_children(&self) -> Vec<SettledChild> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.parent.is_some() && !slot.app.is_busy() && slot.inflight.is_none())
+            .map(|slot| {
+                let parent = slot.parent.expect("filtered to children");
+                SettledChild {
+                    child: slot.id,
+                    parent,
+                    wanted: self
+                        .slots
+                        .iter()
+                        .find(|s| s.id == parent)
+                        .is_some_and(|p| p.app.is_busy()),
+                }
+            })
+            .collect()
+    }
+
+    /// Shut down the subagent with this id, without saving it.
+    ///
+    /// A child is not a session: it was never announced, it cannot be reopened,
+    /// and its conversation is the thing the parent was asked to be spared. So
+    /// unlike [`Sessions::close`] this writes nothing to disk.
+    pub fn close_child(&mut self, id: u64) {
+        let Some(i) = self.slots.iter().position(|slot| slot.id == id) else {
+            return;
+        };
+        if self.slots[i].parent.is_none() {
+            return;
+        }
+        if let Some(inflight) = self.slots[i].inflight.take() {
+            let _ = inflight.cancel.send(());
+        }
+        self.slots.remove(i);
+        // A child is always appended after its parent, so removing one can only
+        // shift the focus down if it sat before it — which it cannot. Clamped
+        // anyway, because being wrong here would index out of bounds.
+        self.current = self.current.min(self.slots.len().saturating_sub(1));
     }
 
     /// Focus session `i`, if it exists.
@@ -568,8 +714,11 @@ impl Sessions {
             .split_whitespace()
             .map(str::to_lowercase)
             .collect();
+        // Children are filtered here rather than in `rows`, which is indexed by
+        // these very numbers: one filter hides them from the whole view, and
+        // row `i` still means slot `i` everywhere else.
         (0..self.slots.len())
-            .filter(|&i| self.matches(i, &terms))
+            .filter(|&i| !self.is_child(i) && self.matches(i, &terms))
             .collect()
     }
 
@@ -706,6 +855,155 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let app = App::new("m".into(), None, 10, dir.clone());
         (Sessions::new(app), dir)
+    }
+
+    /// A subagent is a conversation but not a session. The view is the place
+    /// that distinction is most visible: the user cannot switch to a child, so
+    /// showing one would offer a row that does nothing.
+    #[test]
+    fn a_subagent_is_not_in_the_view() {
+        let (mut sessions, dir) = sessions("hidden");
+        let parent = sessions.current().id;
+        sessions.open_agent(parent, "who owns naming?").unwrap();
+        sessions.open_view();
+
+        assert_eq!(sessions.view_matches(), vec![0], "only the real session");
+        assert_eq!(sessions.view_rows().len(), 1);
+        assert_eq!(sessions.len(), 1, "and it is not counted as one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawning a subagent must not be able to refuse the user's next `Ctrl+N`
+    /// with "already running 8 sessions" — for a conversation they never asked
+    /// for and cannot see.
+    #[test]
+    fn a_subagent_does_not_count_toward_the_cap() {
+        let (mut sessions, dir) = sessions("cap");
+        let parent = sessions.current().id;
+        for _ in 0..3 {
+            sessions.open_agent(parent, "look into it").unwrap();
+        }
+        assert_eq!(sessions.len(), 1);
+
+        for _ in 1..MAX_SESSIONS {
+            sessions.spawn();
+        }
+        assert_eq!(
+            sessions.len(),
+            MAX_SESSIONS,
+            "the user still gets every slot the cap promises"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The nastiest of the leaks: `open_names` feeds the on-disk open set, so a
+    /// child here would be **reopened as a session** on the next launch.
+    #[test]
+    fn a_subagent_is_not_in_the_open_set() {
+        let (mut sessions, dir) = sessions("openset");
+        let parent = sessions.current().id;
+        let child = sessions.open_agent(parent, "look into it").unwrap().0;
+        let child_name = sessions
+            .route(child)
+            .expect("just opened")
+            .app
+            .session_name()
+            .to_string();
+
+        sessions.sync_open_set();
+        let names = sessions.open_names();
+        assert_eq!(names.len(), 1, "one session is open, not two");
+        assert!(
+            !names.contains(&child_name),
+            "a subagent must never be recorded as a session to reopen"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing a child drops it rather than saving it: the conversation is the
+    /// very thing the parent was spared, and it cannot be reopened anyway.
+    #[test]
+    fn closing_a_subagent_leaves_nothing_behind() {
+        let (mut sessions, dir) = sessions("closechild");
+        let parent = sessions.current().id;
+        let child = sessions.open_agent(parent, "look into it").unwrap().0;
+        assert!(sessions.route(child).is_some());
+
+        sessions.close_child(child);
+        assert!(sessions.route(child).is_none(), "the slot is gone");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions.current().id,
+            parent,
+            "and the focus never moved off the parent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A parent that has given up — `Esc`, or an error that ended the turn —
+    /// must not be reported to. Pushing a result into an idle conversation would
+    /// start a turn the user deliberately stopped, which is worse than losing
+    /// the answer.
+    #[test]
+    fn a_subagent_whose_parent_gave_up_is_not_reported() {
+        let (mut sessions, dir) = sessions("orphan");
+        let parent = sessions.current().id;
+        let child = sessions.open_agent(parent, "look into it").unwrap().0;
+
+        // While the parent waits, the child is wanted.
+        sessions.route(parent).unwrap().app.status = Status::Running;
+        sessions.route(child).unwrap().app.status = Status::Idle;
+        assert_eq!(
+            sessions.settled_children(),
+            vec![SettledChild {
+                child,
+                parent,
+                wanted: true,
+            }]
+        );
+
+        // Once it has stopped waiting, the same finished child is unwanted.
+        sessions.route(parent).unwrap().app.status = Status::Idle;
+        let settled = sessions.settled_children();
+        assert_eq!(settled.len(), 1);
+        assert!(
+            !settled[0].wanted,
+            "an idle parent must not be handed a result"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child still working is not swept up by the retirement pass.
+    #[test]
+    fn a_subagent_still_working_is_not_retired() {
+        let (mut sessions, dir) = sessions("working");
+        let parent = sessions.current().id;
+        let child = sessions.open_agent(parent, "look into it").unwrap().0;
+        sessions.route(parent).unwrap().app.status = Status::Running;
+
+        // `open_agent` sends the prompt, so the child is already waiting.
+        assert!(sessions.route(child).unwrap().app.is_busy());
+        assert!(
+            sessions.settled_children().is_empty(),
+            "a busy child is not finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `close_child` is for children only. Pointing it at a real session would
+    /// drop a conversation without saving it.
+    #[test]
+    fn close_child_refuses_a_real_session() {
+        let (mut sessions, dir) = sessions("closereal");
+        sessions.spawn();
+        let real = sessions.current().id;
+
+        sessions.close_child(real);
+        assert!(
+            sessions.route(real).is_some(),
+            "a session the user opened is not a child and is not dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

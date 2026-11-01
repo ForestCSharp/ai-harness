@@ -15,15 +15,24 @@ have a section under step 4 of `docs/request-lifecycle.md`.
 
 [post]: https://lilianweng.github.io/posts/2026-07-04-harness/
 
--   **Read-only subagents.** `src/sessions.rs` already holds a `Slot` per running
-    conversation sharing one channel, which is most of the plumbing. The argument
-    for them is context isolation: compaction is currently the only defence
-    against growth and it is lossy for the whole conversation, where a subagent
-    spends its own context on a search and returns a paragraph. Restrict the
-    first version to read/grep/glob/fetch. A subagent that could write or shell
-    would break "one mutating action, one approval", and confining it to the
-    actions that never reach the modal preserves that invariant structurally
-    rather than by discipline.
+-   ~~**Read-only subagents.**~~ **Done**, as `<ai-harness-agent>`, and the entry
+    was right about where the plumbing already was: `Slot` needed one field
+    (`parent: Option<u64>`) and no new channel or `Update` variant at all.
+
+    Two things it did not anticipate. The restriction is enforced at **dispatch**
+    — the arm plan mode uses — and it has to include `<ai-harness-option>`, which
+    mutates nothing: there is no user in a child conversation to answer a
+    question, so a child that asked one would wait forever. And the slot list
+    *is* the UI list, derived fresh every frame, so hiding a child meant filtering
+    five separate readers. The one that would have hurt is `open_names`: it feeds
+    the on-disk open set, so a leak there reopens the subagent **as a session** on
+    the next launch.
+
+    The argument for them also needs sharpening. Compaction's mechanical pass
+    already stubs a 64 KB read result to ~220 bytes, so file contents were never
+    the expensive part. What a subagent actually saves is *reasoning*: fifteen
+    replies that survive the mechanical pass byte-for-byte and are compressed only
+    by the lossy model pass.
 
 -   **Tell the model its own history exists.** The post counts error traces and
     past trajectories as things that belong on disk. `compaction-NNN.json` and
@@ -73,11 +82,54 @@ stay a deliberate choice.
 
 -   more organized context management. Don't just keep appending, but store in a structured manner.
 
--   Batched non-mutating actions: one top-level batch element whose children are
-    read/fetch/grep only. Five reads is currently five round-trips, each re-sending
-    the entire conversation. Keeps the invariant that matters — one mutating action,
-    one approval — and the relaxation must not reach any other element, since strict
-    whole-reply parsing is the point of the protocol.
+---
+
+# Done since
+
+-   **Batched non-mutating actions**, as `<ai-harness-batch>`. The invariant held
+    as this entry required: children are exactly the four auto-approved actions,
+    and the relaxation reaches no other element.
+
+    The parser was the cheap half — an extraction of `text_action` out of
+    `parse_reply` so a batched read and a lone read cannot drift, plus a child
+    loop modelled on `parse_option_children`. The real cost was the dispatch, and
+    not where expected: `pending_fetch` and `pending_search` are single-slot
+    `Option`s and `main`'s ladder takes exactly one parked thing per pass, so the
+    children are drained **sequentially** through a `VecDeque`. That is not a
+    compromise — `lookup_ratio` counts round-trips, not I/O, so draining in order
+    collects the whole saving while leaving all three existing spawners untouched.
+
+    One consequence worth keeping in view: a batch is one reply, so `iterations`
+    no longer bounds filesystem work. `max_turn_bytes` is the only guard left,
+    and it had to start being checked *between* children rather than before the
+    action — it cannot stop a batch it has already waved through.
+
+-   **The project check can run per write**, as `--check-each-write`, off by
+    default. The turn-end trigger was already built; this moves it to the write
+    so a broken edit is caught at the edit. `finish_check` had to learn which
+    trigger fired, because a passing check mid-turn means *carry on* where a
+    passing check at the end means *stop*.
+
+    Per-file scoping was investigated and abandoned: no inferred command takes a
+    path, `cargo check` and `go build ./...` have no single-file mode, and
+    `tsc --noEmit` on one file ignores `tsconfig.json`.
+
+## Open question this raised
+
+`bench/metrics.py` pre-registers `lookup_ratio = lookups / iterations` as the
+PRIMARY metric, described as "the share of round-trips spent gathering" and
+"exactly what a batch element changes". It does change it — but **upward**.
+Batching holds the lookup count and cuts `iterations`, so four reads go from
+4/4 = 1.00 to 4/1 = 4.00. The baseline mean of 0.51 cannot be beaten downward
+by the feature it was registered for, and the GATE (`min >= 0.5`) becomes
+trivially satisfiable.
+
+Deliberately not changed here. That file states that the metrics are fixed in it
+"so a later run cannot quietly become a different experiment by picking a kinder
+number", and rewriting the primary metric in the same commit as the feature it
+judges is exactly that. `iterations_mean` is already computed and printed, moves
+in the right direction, and is the honest headline; deciding that is a call for
+whoever owns the registration.
 
 ---
 

@@ -71,6 +71,22 @@ impl Ledger {
         self.requests += 1;
     }
 
+    /// Fold in everything another conversation spent, as side spend.
+    ///
+    /// A whole ledger rather than one `Usage`, for a subagent: its entire run is
+    /// side spend from the parent's point of view. Real money, so it is counted
+    /// — but `last_prompt_tokens` is deliberately untouched for the reason
+    /// [`Ledger::record_side`] leaves it alone, and it matters more here. That
+    /// field means "how big is this conversation right now" and is what the
+    /// compaction trigger reads; a child's tokens would make the parent compact
+    /// a conversation that never grew.
+    pub fn absorb_side(&mut self, other: &Self) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.requests += other.requests;
+    }
+
     /// Share of prompt tokens served from cache, `None` if nothing was billed
     /// yet. Zero is a real answer — it means nothing is being cached.
     pub fn cache_hit_rate(&self) -> Option<f64> {
@@ -285,6 +301,30 @@ mod tests {
             completion_tokens: completion,
             prompt_tokens_details: None,
         }
+    }
+
+    /// A subagent's whole run is side spend from the parent's point of view:
+    /// real money, but not the parent's conversation. Moving
+    /// `last_prompt_tokens` would make the parent compact a conversation that
+    /// never grew.
+    #[test]
+    fn absorbing_a_subagent_bills_it_without_growing_the_parent() {
+        let mut parent = Ledger::default();
+        parent.record(&usage(1000, 50));
+
+        let mut child = Ledger::default();
+        child.record(&usage(400, 30));
+        child.record(&usage(600, 40));
+        assert_eq!(child.last_prompt_tokens, 600, "the child tracked its own");
+
+        parent.absorb_side(&child);
+        assert_eq!(
+            parent.last_prompt_tokens, 1000,
+            "the parent's conversation is unchanged by its child's"
+        );
+        assert_eq!(parent.prompt_tokens, 2000, "but every token is billed");
+        assert_eq!(parent.completion_tokens, 120);
+        assert_eq!(parent.requests, 3, "and every request is counted");
     }
 
     /// `last_prompt_tokens` is what the compaction trigger reads, so a side

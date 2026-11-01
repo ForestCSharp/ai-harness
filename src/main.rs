@@ -214,6 +214,7 @@ fn build_app(client: &Client, sandbox: &Sandbox, args: &Args, sessions_dir: Path
     // `App::check_flag`.
     app.check_flag = args.check.clone();
     app.no_check = args.no_check;
+    app.check_each_write = args.check_each_write;
     app.confirm_fetches = args.confirm_fetch;
     app.auto_approve = args.auto_approve;
     app.price_in = args.price_in;
@@ -390,6 +391,11 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
         while let Ok(tagged) = rx.try_recv() {
             route_update(tagged, &mut sessions, &ctx);
         }
+
+        // Subagents, opened and retired here because this is where `Sessions`
+        // itself is in hand. Before the autosave sweep, so a child that just
+        // finished is closed rather than saved as a session of its own.
+        pump_agents(&mut sessions, &ctx);
 
         // Persist a completed turn, in every session. A cheap no-op unless a
         // conversation just changed and settled back to idle — and a background
@@ -568,13 +574,13 @@ async fn run_headless(
             exit = headless::Exit::Error;
             break;
         }
-        if !slot.app.is_busy() && slot.inflight.is_none() {
+        if settled(&slot.app, &slot.inflight) {
             // `iterations` is reset per prompt and the turn stops when it
             // reaches the cap, so this distinguishes "the harness gave up" from
             // "the model finished". A turn that ends normally on exactly the
             // last iteration reports `budget`, which overstates the cap's role
             // in a rare case and never understates it.
-            exit = if slot.app.iterations >= slot.app.max_iterations {
+            exit = if slot.app.out_of_budget() {
                 headless::Exit::Budget
             } else {
                 headless::Exit::Complete
@@ -673,7 +679,11 @@ fn handle_update(
                 // An auto-approved fetch is parked rather than returned, since
                 // it is background work the app layer cannot start itself.
                 None => {
-                    if let Some(url) = app.take_pending_fetch() {
+                    // A batch runs its children without returning to the model
+                    // between them, so it is advanced here rather than resent.
+                    if app.has_batch() {
+                        resume_batch(id, app, ctx, inflight);
+                    } else if let Some(url) = app.take_pending_fetch() {
                         spawn_fetch(id, app, ctx, inflight, url);
                     } else if let Some(request) = app.take_pending_search() {
                         spawn_search(id, app, ctx, inflight, request);
@@ -737,7 +747,14 @@ fn handle_update(
         Update::Write(Ok(outcome)) => {
             *inflight = None;
             let messages = app.push_write_result(outcome);
-            spawn_request(id, app, ctx, inflight, messages);
+            // Under `--check-each-write` the write parked the check, and it runs
+            // before the model is handed the result — same parking rule as the
+            // arms in `ReplyEnd`, since the app layer cannot spawn.
+            if let Some(command) = app.take_pending_check() {
+                spawn_check(id, app, ctx, inflight, command);
+            } else {
+                spawn_request(id, app, ctx, inflight, messages);
+            }
         }
         Update::Write(Err(message)) => {
             *inflight = None;
@@ -748,14 +765,24 @@ fn handle_update(
         Update::Fetch(outcome) => {
             *inflight = None;
             let messages = app.push_fetch_result(*outcome);
-            spawn_request(id, app, ctx, inflight, messages);
+            // Mid-batch, this result is one of several the model will be shown
+            // together, so the batch carries on instead of resending now.
+            if app.has_batch() {
+                resume_batch(id, app, ctx, inflight);
+            } else {
+                spawn_request(id, app, ctx, inflight, messages);
+            }
         }
         // A search does the same: a bad pattern or an unreachable directory is
         // an outcome the model can act on, not a failed turn.
         Update::Search(outcome) => {
             *inflight = None;
             let messages = app.push_search_result(*outcome);
-            spawn_request(id, app, ctx, inflight, messages);
+            if app.has_batch() {
+                resume_batch(id, app, ctx, inflight);
+            } else {
+                spawn_request(id, app, ctx, inflight, messages);
+            }
         }
         // A summary either shortens the conversation or fails trying; both end
         // with a shorter history, and the overflow path resends on the spot.
@@ -1203,6 +1230,8 @@ fn allow(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
             | Action::Fetch { .. }
             | Action::Edit { .. }
             | Action::Options { .. }
+            | Action::Batch(_)
+            | Action::Agent { .. }
             | Action::Response(_) => return,
         };
         let _ = tx
@@ -1244,6 +1273,26 @@ fn spawn_check(
     command: String,
 ) {
     spawn_watched(id, app, ctx, inflight, command, Update::Check);
+}
+
+/// Carry an unfinished batch forward by one step.
+///
+/// [`App::advance_batch`] runs every child it can inline and parks the first it
+/// cannot — so this either sends the finished batch back to the model, or
+/// spawns the parked child and is called again when its result lands. The two
+/// spawners are the same ones a lone fetch or search uses: a batch changes when
+/// the model is asked again, not how any one lookup runs.
+fn resume_batch(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFlight>) {
+    match app.advance_batch() {
+        Some(messages) => spawn_request(id, app, ctx, inflight, messages),
+        None => {
+            if let Some(url) = app.take_pending_fetch() {
+                spawn_fetch(id, app, ctx, inflight, url);
+            } else if let Some(request) = app.take_pending_search() {
+                spawn_search(id, app, ctx, inflight, request);
+            }
+        }
+    }
 }
 
 /// Run a command, forwarding its output as it arrives.
@@ -1974,6 +2023,84 @@ fn pump_compaction(id: u64, app: &mut App, ctx: &Ctx, inflight: &mut Option<InFl
     if let Some(job) = app.take_pending_compaction() {
         spawn_summary(id, app, ctx, inflight, job);
     }
+}
+
+/// Open the subagents sessions have asked for, and retire the ones that are
+/// done.
+///
+/// Called from the loop rather than from `handle_update`, because it is the
+/// only place `Sessions` itself is reachable: `handle_update` holds one slot
+/// borrowed out of it, and opening or closing a slot needs the whole thing.
+/// That is the same reason `App` only ever *parks* a task.
+///
+/// Both halves are done by sweeping the slots rather than by hooking the places
+/// a child starts and finishes — the rule `sync_open_set` follows. One call site
+/// cannot be missed.
+fn pump_agents(sessions: &mut Sessions, ctx: &Ctx) {
+    // Opening. Collected first because spawning borrows `sessions` mutably.
+    let asked: Vec<(u64, String)> = sessions
+        .iter_mut()
+        .filter_map(|slot| slot.app.take_pending_agent().map(|task| (slot.id, task)))
+        .collect();
+    for (parent, task) in asked {
+        if let Some((child_id, messages)) = sessions.open_agent(parent, &task)
+            && let Some(slot) = sessions.route(child_id)
+        {
+            spawn_request(child_id, &mut slot.app, ctx, &mut slot.inflight, messages);
+        }
+    }
+
+    // Retiring. `Sessions` decides which children are done and which parents
+    // still want them — see `settled_children`, which is where that is tested.
+    for settled in sessions.settled_children() {
+        let (child_id, parent_id) = (settled.child, settled.parent);
+        if !settled.wanted {
+            sessions.close_child(child_id);
+            continue;
+        }
+        let Some(slot) = sessions.route(child_id) else {
+            continue;
+        };
+        let task = slot.app.turn_prompt_text().to_string();
+        let answer = slot.app.agent_answer().map(str::to_string);
+        let spent = slot.app.ledger.clone();
+        let spent_out = slot.app.out_of_budget();
+        sessions.close_child(child_id);
+
+        let Some(parent) = sessions.route(parent_id) else {
+            continue;
+        };
+        // The child's tokens were really bought, so they land on the parent's
+        // ledger — through `record_side`, which folds the spend without moving
+        // `last_prompt_tokens`. That field means "how big is this conversation
+        // now" and drives compaction; a child's spend must not move it.
+        parent.app.ledger.absorb_side(&spent);
+        let encoded = match answer {
+            Some(answer) => protocol::encode_agent_result(&task, &answer),
+            None if spent_out => protocol::encode_agent_failure(
+                &task,
+                "it used up its round-trips without reaching an answer",
+            ),
+            None => protocol::encode_agent_failure(&task, "it stopped without answering"),
+        };
+        let messages = parent.app.push_raw_result(encoded);
+        spawn_request(
+            parent_id,
+            &mut parent.app,
+            ctx,
+            &mut parent.inflight,
+            messages,
+        );
+    }
+}
+
+/// Whether a conversation has run to a stop: nothing in flight, and not busy.
+///
+/// Lifted out of `run_headless`, which needs exactly this to decide a run is
+/// over, so that a subagent and a headless run agree on what "finished" means
+/// rather than drifting apart — the reason `build_app` exists.
+fn settled(app: &App, inflight: &Option<InFlight>) -> bool {
+    !app.is_busy() && inflight.is_none()
 }
 
 /// Fetch the model catalog once, in the background, at startup.

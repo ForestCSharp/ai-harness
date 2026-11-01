@@ -88,6 +88,29 @@ pub struct Args {
     #[arg(long, env = "AI_HARNESS_NO_CHECK")]
     pub no_check: bool,
 
+    /// Run the check after every write, rather than once at the end of the turn.
+    ///
+    /// By default the check is the turn's exit condition: the model writes as
+    /// many files as it likes and the check has the last word on the way out.
+    /// That is the cheapest place to put one command, but it is the latest
+    /// possible moment to learn the first of five edits was wrong — the model
+    /// has to unwind four more before it can act on the news.
+    ///
+    /// With this on, each landed write is verified before the model sees its
+    /// result. A failure arrives attached to the edit that caused it, which is
+    /// the difference between fixing a mistake and diagnosing one.
+    ///
+    /// Off by default because it multiplies the cost: three edits become three
+    /// checks, and they serialise — only one command runs at a time. Worth it
+    /// for a check measured in a second or two (`ruff check .`,
+    /// `tsc --noEmit`, a lint script), not for `cargo check --all-targets`,
+    /// which is what a Cargo project infers.
+    ///
+    /// A turn that writes once costs no more than it does today: the per-write
+    /// check disarms the turn-end one rather than adding to it.
+    #[arg(long, env = "AI_HARNESS_CHECK_EACH_WRITE")]
+    pub check_each_write: bool,
+
     /// Seconds before a background job is killed, whatever it is doing.
     ///
     /// Not `--command-timeout`, which is an *idle* bound: a foreground command

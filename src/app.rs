@@ -172,6 +172,19 @@ const MAX_RUNNING_LINES: usize = 200;
 /// provider does. Adjustable with `--max-turn-bytes`.
 const DEFAULT_MAX_TURN_BYTES: usize = 512 * 1024;
 
+/// Round-trips a read-only subagent gets, at most.
+///
+/// Its own ceiling rather than the parent's, because the two bound different
+/// things. The parent's budget bounds a piece of *work*, which may legitimately
+/// take dozens of steps; a subagent answers one question that a batch or two
+/// and a few reads should settle. A child that wandered to the parent's limit
+/// would spend the parent's money on a paragraph — and the parent is still
+/// waiting, so it would spend its *turn* too.
+///
+/// A child never gets more than the parent has left to give: `spawn_agent`
+/// takes the smaller of the two.
+const AGENT_ITERATIONS: usize = 12;
+
 /// Fraction of the model's context window at which the conversation is
 /// compacted without being asked.
 pub const DEFAULT_COMPACT_AT: f64 = 0.8;
@@ -359,6 +372,11 @@ pub fn action_label(action: &Action) -> String {
         // A response is the answer rather than a step towards it, and a question
         // is shown in full where it is asked; neither is ever *refused*.
         Action::Options { .. } | Action::Response(_) => String::new(),
+        // A batch is named by what it holds. Its children are refused as a
+        // group or not at all — nothing in it can reach the modal — so the
+        // count is the useful thing to say, not one child's label.
+        Action::Batch(children) => format!("{} lookups", children.len()),
+        Action::Agent { task } => format!("subagent: {task}"),
     }
 }
 
@@ -712,6 +730,22 @@ pub struct App {
     /// new project should override).
     pub check_flag: Option<String>,
     pub no_check: bool,
+    /// Whether to check after each write instead of once at the end of the turn,
+    /// from `--check-each-write`.
+    pub check_each_write: bool,
+    /// Whether the check now in flight was parked by a write rather than by a
+    /// response.
+    ///
+    /// The two triggers want opposite things from a *passing* check. A turn-end
+    /// check that passes has nothing left to do, so the turn ends. A per-write
+    /// check that passes has verified a result the model has not been shown
+    /// yet, so the turn has to carry on and hand it over — see
+    /// [`App::finish_check`].
+    ///
+    /// A plain `bool` rather than a field on `pending_check` because it must
+    /// outlive the parking: `take_pending_check` clears the command when the
+    /// check is spawned, and this is not read until the outcome comes back.
+    checking_write: bool,
     /// Whether a file has been written since the check last ran.
     ///
     /// The loop guard, and the reason the check needs no retry counter of its
@@ -726,6 +760,32 @@ pub struct App {
     wrote_since_check: bool,
     /// The check parked for the event loop to spawn, like `pending_fetch`.
     pending_check: Option<String>,
+    /// Whether this conversation is a read-only subagent.
+    ///
+    /// The restriction is enforced at *dispatch* — see the refusal arm in
+    /// [`App::push_reply`] — which is the layer plan mode uses for the same job,
+    /// and for the same reason: refusing before the modal means the user is
+    /// never asked to approve something that was never going to run. Here it
+    /// also means a child cannot reach `AwaitingApproval` at all, so "one
+    /// mutating action, one approval" holds by construction rather than because
+    /// nobody is watching.
+    ///
+    /// The kernel cannot help: `Sandbox` has no read-only mode, only
+    /// `writes_limited_to` one path. So this is load-bearing on its own.
+    pub read_only: bool,
+    /// A subagent's task, parked for the event loop to open a child session for.
+    ///
+    /// Parked like a fetch, and for a stronger version of the same reason: a
+    /// session cannot start background work, and it certainly cannot open
+    /// another session.
+    pending_agent: Option<String>,
+    /// The children of a batch still to run, in the order the model wrote them.
+    ///
+    /// A queue rather than the single-slot `Option`s beside it, because that is
+    /// the whole feature: the model is asked again only once this empties, so
+    /// four lookups cost one round-trip instead of four. Drained by
+    /// [`App::advance_batch`].
+    pending_batch: std::collections::VecDeque<Action>,
     /// Jobs this session has going, for the status bar.
     ///
     /// The one job fact held in memory that is not a task handle, and it is a
@@ -878,8 +938,13 @@ impl App {
             check_command: None,
             check_flag: None,
             no_check: false,
+            check_each_write: false,
+            checking_write: false,
             wrote_since_check: false,
             pending_check: None,
+            read_only: false,
+            pending_agent: None,
+            pending_batch: std::collections::VecDeque::new(),
             live_jobs: 0,
             pending_compaction: None,
             overflow_compacted: false,
@@ -1055,11 +1120,20 @@ impl App {
         // is all that is needed; a spawned one is stopped by its cancel signal.
         self.pending_fetch = None;
         self.pending_search = None;
+        // The rest of a batch goes with the turn that asked for it. Its earlier
+        // children already have their results in `history`, which is correct:
+        // they ran.
+        self.pending_batch.clear();
+        // A parked subagent has not been opened yet, so dropping it is enough;
+        // one already running is closed by the loop when it sees the parent is
+        // no longer waiting.
+        self.pending_agent = None;
         // A parked check belongs to the turn being abandoned, so it goes with
         // it. `wrote_since_check` was already cleared when it was parked, so a
         // cancelled check does not re-arm on the next response either — the
         // turn simply ends unverified, which is what cancelling asked for.
         self.pending_check = None;
+        self.checking_write = false;
         // `pending_job_kill` is deliberately *not* cleared. Esc interrupts the
         // turn; a job is not part of one, and a user who typed `/jobs kill`
         // and then cancelled a request meant to stop the job either way.
@@ -1448,6 +1522,14 @@ impl App {
         {
             contract.push_str("\n\n");
             contract.push_str(&protocol::plan_contract(&path.to_string_lossy()));
+        }
+        // Last, so it has the final word on what this conversation may do. A
+        // subagent is never in plan mode — the two are not reachable together,
+        // since a child is spawned fresh and `spawn_sibling` does not inherit
+        // planning — but the order is what makes that obvious to read.
+        if self.read_only {
+            contract.push_str("\n\n");
+            contract.push_str(&protocol::agent_contract());
         }
         match self.history.first_mut() {
             Some(first) if first.role == crate::openrouter::Role::System => {
@@ -2442,6 +2524,7 @@ impl App {
         fresh.check_command = self.check_command.clone();
         fresh.check_flag = self.check_flag.clone();
         fresh.no_check = self.no_check;
+        fresh.check_each_write = self.check_each_write;
         fresh.price_in = self.price_in;
         fresh.price_out = self.price_out;
         // Plan mode is deliberately not inherited: it is a mode you are in for a
@@ -2790,6 +2873,9 @@ impl App {
         // whatever the last turn wrote has already been checked, and a new
         // prompt that writes nothing should not inherit a run it did not earn.
         self.wrote_since_check = false;
+        self.checking_write = false;
+        self.pending_batch.clear();
+        self.pending_agent = None;
         self.turn_start_bytes = self.history_bytes();
         // The turn this prompt opens. Counts prompts, not checkpoints, so a
         // checkpoint's number is the ordinal of the thing that was typed — which
@@ -3001,6 +3087,58 @@ impl App {
                 });
                 self.status = Status::Running;
                 self.follow = true;
+            }
+            // A subagent may only look. Refused here rather than at the modal
+            // for plan mode's reason — the user is never asked about something
+            // that was never going to run — and for one of its own: there is no
+            // user in a child conversation, so an approval or a question would
+            // wait forever. `Options` is included for exactly that reason, even
+            // though it mutates nothing.
+            //
+            // Nesting is refused with the rest: a subagent that could spawn
+            // subagents is an unbounded tree, and the budget that bounds one
+            // conversation would not bound it.
+            Action::Shell(_)
+            | Action::ShellBackground(_)
+            | Action::Write { .. }
+            | Action::Edit { .. }
+            | Action::Options { .. }
+            | Action::Agent { .. }
+                if self.read_only =>
+            {
+                return Some(
+                    self.push_raw_result(protocol::encode_read_only_refusal(&action_label(
+                        &action,
+                    ))),
+                );
+            }
+            // Hand a question to a child conversation. Parked for the event
+            // loop, which is the only thing that can open one.
+            Action::Agent { task } => {
+                self.pending_agent = Some(task);
+                self.status = Status::Running;
+                self.follow = true;
+            }
+            // Several lookups in one reply. Parked rather than run, like a
+            // search: the children are the same four actions, and two of the
+            // three ways of running one need the event loop.
+            //
+            // The saving is round-trips, not parallelism — the conversation is
+            // re-sent on every one — so the children are drained one at a time
+            // and the model is not asked again until the queue empties. See
+            // [`App::advance_batch`].
+            Action::Batch(children) if !self.confirm_reads && !self.confirm_fetches => {
+                self.pending_batch = children.into();
+                self.status = Status::Running;
+                self.follow = true;
+            }
+            // `--confirm-reads` and `--confirm-fetches` mean "ask me about each
+            // one", and a batch is a request not to be asked. Refusing it with
+            // a reason keeps the user's setting exactly, where honouring both
+            // would mean a modal per child — the interruption the batch exists
+            // to avoid, now arriving several at a time.
+            Action::Batch(_) => {
+                return Some(self.push_raw_result(protocol::encode_batch_refusal()));
             }
             // A question waits on a person. It is not an approval, so it does
             // not become a `Pending` and auto-approve cannot answer it — which
@@ -4063,6 +4201,150 @@ impl App {
         self.pending_check.take()
     }
 
+    /// Whether a batch still has children to run.
+    pub fn has_batch(&self) -> bool {
+        !self.pending_batch.is_empty()
+    }
+
+    /// Take the subagent task the dispatch parked, if there is one.
+    pub fn take_pending_agent(&mut self) -> Option<String> {
+        self.pending_agent.take()
+    }
+
+    /// The prompt this turn is answering. For a subagent, the question it was
+    /// given — which is what its report has to be labelled with.
+    pub fn turn_prompt_text(&self) -> &str {
+        &self.turn_prompt
+    }
+
+    /// Whether the loop budget is spent. The difference between a subagent that
+    /// ran out of room and one that stopped for some other reason.
+    pub fn out_of_budget(&self) -> bool {
+        self.iterations >= self.max_iterations
+    }
+
+    /// Build the read-only child that will answer `task`.
+    ///
+    /// Starts from [`App::spawn_sibling`], so the child inherits the sandbox,
+    /// the model, the catalog and the project's own guidance — it is reading the
+    /// same codebase, under the same confinement, and a child on a different
+    /// model would answer a different question. What it does *not* inherit is
+    /// the conversation: that is the entire point.
+    ///
+    /// Its budget is its own and smaller. A child that lost its way must not be
+    /// able to spend the parent's remaining round-trips, and a question worth
+    /// delegating is one a handful of lookups should settle.
+    pub fn spawn_agent(&self, name: String) -> Self {
+        let mut child = self.spawn_sibling(name);
+        child.read_only = true;
+        child.max_iterations = self.max_iterations.min(AGENT_ITERATIONS);
+        // Nothing about a child is the user's to answer, so it must never stop
+        // and wait for one. The refusal arm makes the modal unreachable; this
+        // makes the *absence* of a watcher consistent with it.
+        child.auto_approve = true;
+        child.refresh_contract();
+        child
+    }
+
+    /// The answer a finished subagent is handing back, if it reached one.
+    ///
+    /// `None` when it stopped some other way — budget spent, cancelled, an
+    /// error — which the parent is told about instead. Read from the transcript
+    /// rather than tracked as state: the final `Response` is already the last
+    /// thing there, and a second copy could disagree with it.
+    pub fn agent_answer(&self) -> Option<&str> {
+        match self.transcript.last() {
+            Some(Entry::Action {
+                action: Action::Response(text),
+                ..
+            }) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Run the batch's children until one needs the event loop, or until none
+    /// are left.
+    ///
+    /// `Some(messages)` means the batch is finished and the model should be
+    /// asked again. `None` means a child has been parked in `pending_fetch` or
+    /// `pending_search` and `main` must spawn it; this is called again when
+    /// that child's result lands. Reads need neither, so a batch of reads
+    /// finishes in one call.
+    ///
+    /// Every child goes through the *same* `perform_read` / `pending_fetch` /
+    /// `pending_search` path a lone action does, so each pushes its own
+    /// transcript `Entry` and its own history message. A batch is therefore
+    /// invisible to everything downstream — `/stats`, compaction, the
+    /// superseded-read rewrite — which is why none of them needed changing.
+    pub fn advance_batch(&mut self) -> Option<Vec<Message>> {
+        while let Some(child) = self.pending_batch.pop_front() {
+            // The byte guard, applied *between* children rather than before the
+            // batch. `max_iterations` no longer bounds this work — the whole
+            // point is that a batch is one round-trip — so this is the only
+            // thing standing between eight whole-file reads and a crowded-out
+            // context window, and it has to be able to stop partway.
+            if self.turn_bytes() >= self.max_turn_bytes {
+                let mut skipped: Vec<String> = vec![action_label(&child)];
+                skipped.extend(self.pending_batch.iter().map(action_label));
+                self.pending_batch.clear();
+                return Some(self.push_raw_result(protocol::encode_batch_truncated(
+                    &skipped,
+                    self.turn_bytes() / 1024,
+                )));
+            }
+
+            match child {
+                Action::Read {
+                    path,
+                    offset,
+                    limit,
+                } => {
+                    // Runs inline and its result is already in `history`; the
+                    // messages it returns are for a caller that is about to
+                    // resend, and this one is not — not until the queue empties.
+                    self.perform_read(&path, offset, limit);
+                }
+                Action::Fetch { url } => {
+                    self.pending_fetch = Some(url);
+                    self.status = Status::Running;
+                    self.follow = true;
+                    return None;
+                }
+                Action::Grep { pattern, dir, glob } => {
+                    self.pending_search = Some(crate::search::Request {
+                        kind: crate::search::SearchKind::Grep,
+                        pattern,
+                        dir,
+                        glob,
+                    });
+                    self.status = Status::Running;
+                    self.follow = true;
+                    return None;
+                }
+                Action::Glob { pattern, dir } => {
+                    self.pending_search = Some(crate::search::Request {
+                        kind: crate::search::SearchKind::Glob,
+                        pattern,
+                        dir,
+                        glob: None,
+                    });
+                    self.status = Status::Running;
+                    self.follow = true;
+                    return None;
+                }
+                // `parse_batch_children` admits only the four above, so there
+                // is no other child to handle. Dropping one rather than
+                // panicking: a hand-built batch is a bug in this crate, not a
+                // reason to take the user's session down.
+                _ => {}
+            }
+        }
+
+        self.status = Status::Waiting;
+        self.follow = true;
+        Some(self.history.clone())
+    }
+
     /// Fold in the check's outcome, and say whether the turn continues.
     ///
     /// `Some(messages)` means the check failed and the model is being asked to
@@ -4077,9 +4359,19 @@ impl App {
         self.running = None;
         let passed = output.succeeded();
         let summary = output.summary();
+        // Whichever way this goes, the next check is a fresh question.
+        let after_write = std::mem::take(&mut self.checking_write);
         self.transcript.push(Entry::CheckResult(Box::new(output)));
 
         if passed {
+            // A per-write check that passes has verified a write result the
+            // model has not seen yet, so the turn continues and that result is
+            // what it continues with. Only the turn-end check ends the turn.
+            if after_write {
+                self.status = Status::Waiting;
+                self.follow = true;
+                return Some(self.history.clone());
+            }
             self.status = Status::Idle;
             return None;
         }
@@ -4112,6 +4404,7 @@ impl App {
     /// user's configuration instead of its own work.
     pub fn check_failed_to_start(&mut self, message: String) {
         self.running = None;
+        self.checking_write = false;
         self.push_notice(format!(
             "The project check could not be run ({message}); this turn was not \
              verified. Check --check."
@@ -4428,6 +4721,22 @@ impl App {
         self.history.push(Message::user(encoded));
         self.status = Status::Waiting;
         self.follow = true;
+        // Under `--check-each-write`, verify before the model is shown the
+        // result rather than waiting for the response that ends the turn. The
+        // result is already in `history`, so there is nothing to hold back:
+        // `finish_check` hands the same conversation over once the check has
+        // had its say, with the failure attached when there is one.
+        //
+        // Clearing `wrote_since_check` here is what keeps the cost honest —
+        // the turn-end check reads it, so a write verified now is not verified
+        // again on the way out. Parking rather than running for the reason a
+        // fetch parks: a session cannot start work of its own.
+        if self.check_each_write && self.should_check() {
+            self.pending_check = self.check_command.clone();
+            self.wrote_since_check = false;
+            self.checking_write = true;
+            self.status = Status::Running;
+        }
         self.history.clone()
     }
 
@@ -7966,6 +8275,277 @@ mod file_tests {
         );
     }
 
+    fn batch_reply(children: &str) -> String {
+        format!("<ai-harness-batch>{children}</ai-harness-batch>")
+    }
+
+    /// Nothing that needs a person may run in a child conversation, because
+    /// there is no person in one. Refused at dispatch — before the modal — so a
+    /// child can never reach `AwaitingApproval` at all.
+    #[test]
+    fn a_subagent_refuses_everything_that_needs_a_person() {
+        for reply in [
+            "<ai-harness-shell>rm -rf /</ai-harness-shell>",
+            "<ai-harness-shell background=true>cargo build</ai-harness-shell>",
+            "<ai-harness-write file=x.txt>hi</ai-harness-write>",
+            "<ai-harness-edit file=a.txt><ai-harness-old>aaa</ai-harness-old>\
+             <ai-harness-new>bbb</ai-harness-new></ai-harness-edit>",
+            "<ai-harness-option><ai-harness-option-question>which?\
+             </ai-harness-option-question><ai-harness-option-choice>a\
+             </ai-harness-option-choice><ai-harness-option-choice>b\
+             </ai-harness-option-choice></ai-harness-option>",
+            // And it cannot spawn a subagent of its own: that would be an
+            // unbounded tree, bounded by nothing.
+            "<ai-harness-agent>look into it</ai-harness-agent>",
+        ] {
+            let (mut app, _dir) = app_with_files(&[("a.txt", "aaa\n")]);
+            app.read_only = true;
+
+            let messages = app
+                .push_response(reply.into(), None)
+                .expect("the child is told, and carries on");
+            assert!(
+                app.pending().is_none(),
+                "a child must never raise a modal: {reply}"
+            );
+            assert!(
+                !matches!(app.status, Status::AwaitingChoice(_)),
+                "nor wait on an answer nobody will give: {reply}"
+            );
+            let last = &messages.last().expect("a result").content;
+            assert!(
+                last.contains("not available to a subagent"),
+                "{reply} -> {last}"
+            );
+        }
+    }
+
+    /// The four lookups still work, which is the whole point of the child.
+    #[test]
+    fn a_subagent_can_still_look() {
+        let (mut app, _dir) = app_with_files(&[("a.txt", "aaa\n")]);
+        app.read_only = true;
+
+        let messages = app
+            .push_response(read_reply("a.txt"), None)
+            .expect("a read runs as it always does");
+        assert!(messages.iter().any(|m| m.content.contains("aaa")));
+    }
+
+    /// A child that lost its way must not be able to spend the parent's
+    /// remaining round-trips — the parent is still waiting on it.
+    #[test]
+    fn a_subagent_gets_its_own_smaller_budget() {
+        let (app, _dir) = app_with_files(&[]);
+        let big = App::new("m".into(), None, 500, app.sessions_dir().to_path_buf());
+        let child = big.spawn_agent("child".into());
+
+        assert!(child.read_only);
+        assert_eq!(child.max_iterations, AGENT_ITERATIONS, "its own ceiling");
+        assert!(
+            child.auto_approve,
+            "nothing in a child is the user's to answer"
+        );
+
+        // And never more than the parent has to give.
+        let small = App::new("m".into(), None, 3, app.sessions_dir().to_path_buf());
+        assert_eq!(small.spawn_agent("c".into()).max_iterations, 3);
+    }
+
+    /// The restriction is stated in the contract as well as enforced, so the
+    /// child does not spend a round-trip discovering it — and the parent's
+    /// contract is untouched, since it may do all of this.
+    #[test]
+    fn only_a_child_is_told_it_is_one() {
+        let (app, _dir) = app_with_files(&[]);
+        let parent_contract = app.history.first().expect("a contract").content.clone();
+        assert!(!parent_contract.contains("YOU ARE A SUBAGENT"));
+
+        let child = app.spawn_agent("child".into());
+        let child_contract = child.history.first().expect("a contract").content.clone();
+        assert!(
+            child_contract.contains("YOU ARE A SUBAGENT"),
+            "{child_contract}"
+        );
+    }
+
+    /// Parked rather than run, like every other thing the app layer cannot
+    /// start for itself — and opening a session is the strongest case of that.
+    #[test]
+    fn an_agent_task_is_parked_for_the_event_loop() {
+        let (mut app, _dir) = app_with_files(&[]);
+        assert!(
+            app.push_response(
+                "<ai-harness-agent>who owns naming?</ai-harness-agent>".into(),
+                None
+            )
+            .is_none(),
+            "no messages yet; the answer arrives when the child is done"
+        );
+        assert!(app.pending().is_none(), "and no modal");
+        assert_eq!(app.status, Status::Running);
+        assert_eq!(
+            app.take_pending_agent().as_deref(),
+            Some("who owns naming?")
+        );
+        assert!(
+            app.take_pending_agent().is_none(),
+            "a child is opened exactly once"
+        );
+    }
+
+    /// The sibling of `cancelling_drops_a_parked_search`.
+    #[test]
+    fn cancelling_drops_a_parked_agent() {
+        let (mut app, _dir) = app_with_files(&[]);
+        app.push_response(
+            "<ai-harness-agent>look into it</ai-harness-agent>".into(),
+            None,
+        );
+        app.cancel();
+        assert!(app.take_pending_agent().is_none());
+    }
+
+    /// The whole point of the element: several reads, one round-trip. Reads run
+    /// inline, so a batch of them finishes in a single `advance_batch` and comes
+    /// back with messages ready to resend.
+    #[test]
+    fn a_batch_of_reads_finishes_in_one_round_trip() {
+        let (mut app, _dir) = app_with_files(&[("a.txt", "aaa\n"), ("b.txt", "bbb\n")]);
+        let before = app.iterations;
+
+        assert!(
+            app.push_response(
+                batch_reply(&format!("{}{}", read_reply("a.txt"), read_reply("b.txt"))),
+                None
+            )
+            .is_none(),
+            "a parked batch returns no messages yet"
+        );
+        assert!(app.has_batch());
+        assert!(app.pending().is_none(), "a batch must not raise the modal");
+
+        let messages = app.advance_batch().expect("the batch finished");
+        assert!(!app.has_batch(), "nothing left to drain");
+        assert_eq!(
+            app.iterations,
+            before + 1,
+            "two lookups cost one round-trip, which is the entire feature"
+        );
+
+        // Both results are in the conversation, in the order they were asked
+        // for, each as its own message exactly as a lone read would be.
+        let bodies: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+        let a = bodies
+            .iter()
+            .position(|m| m.contains("aaa"))
+            .expect("a.txt");
+        let b = bodies
+            .iter()
+            .position(|m| m.contains("bbb"))
+            .expect("b.txt");
+        assert!(a < b, "results keep the order the model wrote them in");
+    }
+
+    /// A search cannot run inline, so the drain stops and parks it — and the
+    /// model is still not asked, because the batch is unfinished.
+    #[test]
+    fn a_batch_parks_a_search_and_keeps_the_rest() {
+        let (mut app, _dir) = app_with_files(&[("a.txt", "aaa\n")]);
+        app.push_response(
+            batch_reply(&format!(
+                "{}{}{}",
+                read_reply("a.txt"),
+                grep_reply("hello"),
+                read_reply("a.txt")
+            )),
+            None,
+        );
+
+        assert!(
+            app.advance_batch().is_none(),
+            "a parked child means the batch is not done"
+        );
+        assert_eq!(
+            app.take_pending_search(),
+            Some(crate::search::Request::grep("hello"))
+        );
+        assert!(app.has_batch(), "the third child is still queued");
+
+        // Once the search's result lands, the drain picks up where it left off.
+        let messages = app.advance_batch().expect("the batch finished");
+        assert!(!app.has_batch());
+        assert!(messages.iter().any(|m| m.content.contains("aaa")));
+    }
+
+    /// `max_iterations` no longer bounds this work — a batch is one round-trip —
+    /// so the byte guard is the only thing left, and it has to be able to stop
+    /// partway rather than only before the first child.
+    #[test]
+    fn the_byte_guard_stops_a_batch_partway() {
+        let (mut app, _dir) = app_with_files(&[("a.txt", "aaa\n"), ("b.txt", "bbb\n")]);
+        app.push_response(
+            batch_reply(&format!("{}{}", read_reply("a.txt"), read_reply("b.txt"))),
+            None,
+        );
+        // Set after parking, not before: the guard in `push_reply` would
+        // otherwise stop the batch before it was ever dispatched, which is the
+        // case that already worked. Leaving just enough room for one child is
+        // what exercises the check *between* them.
+        app.max_turn_bytes = app.turn_bytes() + 20;
+
+        let messages = app.advance_batch().expect("the model is told");
+        assert!(!app.has_batch(), "the rest is dropped, not left queued");
+
+        // The first child ran and its result stands.
+        assert!(
+            messages.iter().any(|m| m.content.contains("aaa")),
+            "what did run is kept"
+        );
+        let last = &messages.last().expect("a result").content;
+        assert!(last.contains("stopped partway"), "{last}");
+        assert!(
+            last.contains("b.txt"),
+            "it must name what did not run: {last}"
+        );
+    }
+
+    /// The sibling of `cancelling_drops_a_parked_search`. Children that already
+    /// ran keep their results — they did run — but the queue goes with the turn.
+    #[test]
+    fn cancelling_drops_the_rest_of_a_batch() {
+        let (mut app, _dir) = app_with_files(&[("a.txt", "aaa\n")]);
+        app.push_response(
+            batch_reply(&format!("{}{}", grep_reply("hello"), read_reply("a.txt"))),
+            None,
+        );
+        app.advance_batch();
+        app.cancel();
+
+        assert!(!app.has_batch(), "the queue is abandoned with the turn");
+        assert!(app.take_pending_search().is_none());
+    }
+
+    /// `--confirm-reads` means "ask me about each lookup", and a batch is a
+    /// request not to be asked. Honouring both would mean several modals at
+    /// once, so the batch is refused with a reason it can act on.
+    #[test]
+    fn confirm_reads_refuses_a_batch_rather_than_stacking_modals() {
+        let (mut app, _dir) = app_with_files(&[("a.txt", "aaa\n")]);
+        app.confirm_reads = true;
+
+        let messages = app
+            .push_response(
+                batch_reply(&format!("{}{}", read_reply("a.txt"), read_reply("a.txt"))),
+                None,
+            )
+            .expect("the model is told why, and can retry one at a time");
+        assert!(!app.has_batch());
+        assert!(app.pending().is_none(), "and no modal is raised");
+        let last = &messages.last().expect("a result").content;
+        assert!(last.contains("one at a time"), "{last}");
+    }
+
     /// The sibling of `cancelling_drops_a_parked_fetch`. Without the clear in
     /// `cancel`, a search parked before `Esc` would be spawned into a turn that
     /// no longer exists.
@@ -11099,6 +11679,134 @@ mod check_tests {
         // was already accounted for.
         respond(&mut app);
         assert!(app.take_pending_check().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--check-each-write` moves the trigger from the response to the write,
+    /// so the result the model is about to read has already been verified.
+    #[test]
+    fn a_write_runs_the_check_before_the_model_sees_the_result() {
+        let (mut app, dir) = app_in_temp();
+        app.check_each_write = true;
+        start_turn(&mut app);
+        wrote(&mut app);
+
+        assert_eq!(app.take_pending_check().as_deref(), Some("cargo check"));
+        assert_eq!(
+            app.status,
+            Status::Running,
+            "the write is not handed over yet"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Off, a write behaves exactly as it always did: the result goes straight
+    /// back and the check waits for the response that ends the turn.
+    #[test]
+    fn without_the_flag_a_write_does_not_run_the_check() {
+        let (mut app, dir) = app_in_temp();
+        start_turn(&mut app);
+        wrote(&mut app);
+
+        assert!(app.take_pending_check().is_none());
+        assert_eq!(app.status, Status::Waiting);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case the turn-end check cannot express: passing mid-turn means carry
+    /// on, not stop. The write result is already in `history`, so resuming is
+    /// handing the same conversation over.
+    #[test]
+    fn a_passing_per_write_check_resumes_the_turn() {
+        let (mut app, dir) = app_in_temp();
+        app.check_each_write = true;
+        start_turn(&mut app);
+        wrote(&mut app);
+        app.take_pending_check();
+
+        let messages = app
+            .finish_check("cargo check", passing())
+            .expect("the turn continues");
+        assert_eq!(app.status, Status::Waiting);
+        let last = messages.last().expect("a result to answer");
+        assert!(
+            last.content.contains("wrote 10 bytes"),
+            "the model is handed the write it has not seen: {}",
+            last.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failure arrives attached to the edit that caused it, which is the whole
+    /// point of the flag — the model gets the write result and the check that
+    /// contradicted it in one go.
+    #[test]
+    fn a_failing_per_write_check_goes_back_with_the_write() {
+        let (mut app, dir) = app_in_temp();
+        app.check_each_write = true;
+        start_turn(&mut app);
+        wrote(&mut app);
+        app.take_pending_check();
+
+        let messages = app
+            .finish_check("cargo check", failing())
+            .expect("the model answers for it");
+        assert_eq!(app.status, Status::Waiting);
+        let tail: String = messages
+            .iter()
+            .rev()
+            .take(2)
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(tail.contains("wrote 10 bytes"), "{tail}");
+        assert!(tail.contains("E0308"), "{tail}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cost argument for the flag being affordable at all: a one-write turn
+    /// pays for one check, not two. Verifying at the write disarms the
+    /// turn-end trigger rather than adding to it.
+    #[test]
+    fn a_write_checked_now_is_not_checked_again_at_the_end() {
+        let (mut app, dir) = app_in_temp();
+        app.check_each_write = true;
+        start_turn(&mut app);
+        wrote(&mut app);
+        app.take_pending_check();
+        app.finish_check("cargo check", passing());
+
+        respond(&mut app);
+        assert!(
+            app.take_pending_check().is_none(),
+            "the write it would check has already been checked"
+        );
+        assert_eq!(app.status, Status::Idle, "the turn ends on the response");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `checking_write` must not outlive its check, or the next turn-end check
+    /// would resume a turn that should have ended.
+    #[test]
+    fn a_later_turn_end_check_still_ends_the_turn() {
+        let (mut app, dir) = app_in_temp();
+        app.check_each_write = true;
+        start_turn(&mut app);
+        wrote(&mut app);
+        app.take_pending_check();
+        app.finish_check("cargo check", passing());
+
+        // A second write, this time reported with the flag off — the only way
+        // to reach the response arm with the check armed.
+        app.check_each_write = false;
+        wrote(&mut app);
+        respond(&mut app);
+        app.take_pending_check();
+
+        assert!(
+            app.finish_check("cargo check", passing()).is_none(),
+            "a turn-end check that passes ends the turn"
+        );
+        assert_eq!(app.status, Status::Idle);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

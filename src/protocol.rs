@@ -58,6 +58,32 @@ pub const NEW_TAG: &str = "ai-harness-new";
 /// A question for the user, with the answers to choose between. The only action
 /// whose outcome comes from a person rather than from the machine.
 pub const OPTION_TAG: &str = "ai-harness-option";
+/// Several non-mutating actions in one reply.
+///
+/// The only element that contains other elements rather than text. It exists
+/// because a reply is one action and the conversation is re-sent on every
+/// round-trip, so looking at four files cost four full re-sends of everything
+/// said so far — measured at half of all round-trips in a benchmark sweep.
+///
+/// Its children are exactly [`BATCH_CHILD_TAGS`]: the actions that never reach
+/// the approval modal. Letting a write or a shell command in would break "one
+/// mutating action, one approval", and confining the relaxation to the actions
+/// that were already auto-approved keeps that invariant structural rather than
+/// a rule to remember.
+pub const BATCH_TAG: &str = "ai-harness-batch";
+/// A read-only subagent: a child conversation that searches and reads, then
+/// reports back in a paragraph.
+///
+/// What it buys is **context**, not parallelism. Compaction's mechanical pass
+/// already stubs tool output cheaply, so the expensive residue of a long search
+/// is the model's own *reasoning* — fifteen replies that survive that pass
+/// byte-for-byte and are only compressed by the lossy summarising one. A child
+/// spends its own window on those fifteen and hands back a paragraph.
+///
+/// Confined to [`BATCH_CHILD_TAGS`] by the same argument a batch is: a child
+/// that could write would be approving its own work, since the user is not
+/// watching a conversation they never asked for.
+pub const AGENT_TAG: &str = "ai-harness-agent";
 /// What is being asked. A child of [`OPTION_TAG`].
 pub const OPTION_QUESTION_TAG: &str = "ai-harness-option-question";
 /// One answer to choose between. A child of [`OPTION_TAG`], repeated.
@@ -113,6 +139,8 @@ pub const GLOB_RESULT_TAG: &str = "ai-harness-glob-result";
 pub const FETCH_RESULT_TAG: &str = "ai-harness-fetch-result";
 /// Harness → model only. Carries the user's answer to an option; never parsed.
 pub const OPTION_RESULT_TAG: &str = "ai-harness-option-result";
+/// Harness → model only. Carries a subagent's report; never parsed.
+pub const AGENT_RESULT_TAG: &str = "ai-harness-agent-result";
 /// Harness → model only. Carries the summary of a stretch of conversation that
 /// was compacted away to fit the context window; never parsed.
 pub const COMPACTION_TAG: &str = "ai-harness-compaction";
@@ -121,7 +149,7 @@ pub const COMPACTION_TAG: &str = "ai-harness-compaction";
 /// children ([`OLD_TAG`], [`NEW_TAG`], and the option children) are not here:
 /// they are only valid nested inside their parent, so at the top level they are
 /// correctly rejected as unknown.
-const REPLY_TAGS: [&str; 9] = [
+const REPLY_TAGS: [&str; 11] = [
     READ_TAG,
     GREP_TAG,
     GLOB_TAG,
@@ -131,7 +159,29 @@ const REPLY_TAGS: [&str; 9] = [
     EDIT_TAG,
     OPTION_TAG,
     RESPONSE_TAG,
+    BATCH_TAG,
+    AGENT_TAG,
 ];
+
+/// What a [`BATCH_TAG`] may contain: the four actions that run without the
+/// approval modal.
+///
+/// Declared as a table beside [`REPLY_TAGS`] so the two cannot disagree, and so
+/// the one question a batch child raises — "could this one have needed
+/// approval?" — is answered by a list rather than by reading the parser.
+pub const BATCH_CHILD_TAGS: [&str; 4] = [READ_TAG, GREP_TAG, GLOB_TAG, FETCH_TAG];
+
+/// Fewer than this and the element is not doing anything a plain action would
+/// not do, so it is a mistake worth naming rather than a batch of one.
+const MIN_BATCH_CHILDREN: usize = 2;
+
+/// The ceiling on children, chosen against the guard that already exists:
+/// `MAX_READ_BYTES` is 64 KB and the default `--max-turn-bytes` is 512 KB, so
+/// eight whole-file reads is exactly one turn's worth. More than that cannot
+/// fit whatever the batch does, and the drain stops early on the byte guard
+/// anyway — this only makes the refusal arrive before the work instead of
+/// partway through it.
+const MAX_BATCH_CHILDREN: usize = 8;
 
 /// Tags only the harness may write. A model that emits one has invented the
 /// outcome of an action that never ran, which is a different failure from an
@@ -140,7 +190,7 @@ const REPLY_TAGS: [&str; 9] = [
 /// [`OPTION_RESULT_TAG`] belongs here most of all: it is the one result whose
 /// content comes from a person, so a model writing its own would not be
 /// inventing a machine's output but putting words in the user's mouth.
-const RESULT_TAGS: [&str; 8] = [
+const RESULT_TAGS: [&str; 9] = [
     RESULT_TAG,
     WRITE_RESULT_TAG,
     READ_RESULT_TAG,
@@ -148,6 +198,7 @@ const RESULT_TAGS: [&str; 8] = [
     GLOB_RESULT_TAG,
     FETCH_RESULT_TAG,
     OPTION_RESULT_TAG,
+    AGENT_RESULT_TAG,
     COMPACTION_TAG,
 ];
 
@@ -245,6 +296,20 @@ pub enum Action {
         question: String,
         choices: Vec<String>,
     },
+    /// Several non-mutating actions to run before the model is asked again.
+    ///
+    /// A new *variant* rather than a field on the others, which is what keeps
+    /// saved sessions loading: an old `session.json` can never contain this, and
+    /// `Action` is serialised into every one of them — the rule
+    /// [`Action::ShellBackground`] records.
+    ///
+    /// Children are guaranteed by the parser to be drawn from
+    /// [`BATCH_CHILD_TAGS`], so nothing downstream has to re-check that a batch
+    /// cannot write.
+    Batch(Vec<Action>),
+    /// A question to hand to a read-only subagent, which answers it in its own
+    /// conversation. A new variant for the reason [`Action::Batch`] is one.
+    Agent { task: String },
     /// A terminating answer for the user.
     Response(String),
 }
@@ -261,6 +326,11 @@ impl Action {
             Self::Write { contents, .. } => contents,
             Self::Edit { old, .. } => old,
             Self::Options { question, .. } => question,
+            // A batch has no text of its own; its children carry it. The first
+            // child is what a one-line label should name, and an empty batch
+            // cannot be parsed, so this is only reached for a hand-built one.
+            Self::Batch(children) => children.first().map_or("", Self::body),
+            Self::Agent { task } => task,
         }
     }
 }
@@ -500,6 +570,36 @@ pub enum ProtocolError {
     NotEnoughChoices {
         found: usize,
     },
+    /// A batch contained an element that is not one of its four permitted
+    /// children. Named separately from [`Self::UnknownTag`] because the tag may
+    /// be perfectly valid on its own — a write is the likely case — and the
+    /// correction is to send it as its own reply, not to spell it differently.
+    BatchChildNotAllowed {
+        tag: String,
+    },
+    /// Content sat between or after a batch's children where none is allowed.
+    /// The batch's own version of [`Self::UnexpectedChildContent`], whose
+    /// message names an edit's children.
+    BatchChildContent {
+        found: String,
+    },
+    /// A batch of one. Not wrong so much as pointless, and silently accepting it
+    /// would teach the shape without the benefit.
+    BatchTooSmall {
+        found: usize,
+    },
+    /// More children than one turn's bytes can hold.
+    BatchTooLarge {
+        found: usize,
+    },
+    /// A memory note rode on a batch's child rather than on the batch.
+    ///
+    /// At most one note is kept per reply ([`crate::app::App`] writes it once),
+    /// so several children each carrying one would silently drop all but one.
+    /// Refusing says where the note goes instead.
+    NoteOnBatchChild {
+        tag: String,
+    },
 }
 
 /// Fewest answers an option may offer. One choice is an approval, not a
@@ -619,8 +719,45 @@ impl fmt::Display for ProtocolError {
                  needs at least {MIN_CHOICES}. To ask for approval of one thing, propose the \
                  action itself; to say something without asking, use <{RESPONSE_TAG}>"
             ),
+            Self::BatchChildNotAllowed { tag } => write!(
+                f,
+                "<{BATCH_TAG}> may contain only {}; <{tag}> is not one of them. Anything that \
+                 changes the workspace needs its own reply, because it has to be approved on \
+                 its own",
+                child_tag_list()
+            ),
+            Self::BatchChildContent { found } => write!(
+                f,
+                "<{BATCH_TAG}> may contain only its child elements, with nothing between them, \
+                 but also had: {}",
+                snippet(found)
+            ),
+            Self::BatchTooSmall { found } => write!(
+                f,
+                "<{BATCH_TAG}> held {found} element(s); it is for {MIN_BATCH_CHILDREN} or more. \
+                 One action on its own does not need wrapping — send it as the whole reply"
+            ),
+            Self::BatchTooLarge { found } => write!(
+                f,
+                "<{BATCH_TAG}> held {found} elements; at most {MAX_BATCH_CHILDREN} fit in one \
+                 turn. Send the most useful {MAX_BATCH_CHILDREN} and ask again for the rest"
+            ),
+            Self::NoteOnBatchChild { tag } => write!(
+                f,
+                "a <{MEMORY_TAG}> rode on the <{tag}> inside <{BATCH_TAG}>. One note is kept \
+                 per reply: put it at the start or end of the <{BATCH_TAG}> body instead"
+            ),
         }
     }
+}
+
+/// The permitted batch children, for a correction the model can act on.
+fn child_tag_list() -> String {
+    BATCH_CHILD_TAGS
+        .iter()
+        .map(|tag| format!("<{tag}>"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl std::error::Error for ProtocolError {}
@@ -762,6 +899,68 @@ pub fn encode_check_result(command: &str, output: &CommandOutput) -> String {
          response with no further changes ends the turn.\n",
     );
     format!("<{RESULT_TAG}>\n{body}</{RESULT_TAG}>")
+}
+
+/// Tell a subagent an action is not available to it.
+///
+/// A result rather than a protocol error, on the same grounds as a denied
+/// write: the element was well-formed, and what the model should do instead —
+/// report what it has — is a move it can make immediately. A protocol error
+/// would spend a retry teaching it a shape that was never the problem.
+pub fn encode_read_only_refusal(what: &str) -> String {
+    format!(
+        "<{RESULT_TAG}>\n\
+         status: not run — `{what}` is not available to a subagent. You can only \
+         look: {}, and <{BATCH_TAG}>.\n\
+         note: there is no user here to approve an action or answer a question, \
+         and nothing you do can change the workspace. Finish with \
+         <{RESPONSE_TAG}>, reporting what you found and saying plainly what you \
+         could not determine.\n\
+         </{RESULT_TAG}>",
+        child_tag_list()
+    )
+}
+
+/// Tell the model a batch was refused because the user asked to be consulted
+/// about each lookup.
+///
+/// An ordinary `<{RESULT_TAG}>`, for the reason [`encode_check_result`] is one.
+/// A result rather than a protocol error: the element was well-formed and the
+/// model did nothing wrong — the configuration simply rules it out, and the
+/// move it should make instead is one it can take immediately.
+pub fn encode_batch_refusal() -> String {
+    format!(
+        "<{RESULT_TAG}>\n\
+         status: not run — this session asks the user about each lookup, so a \
+         batch cannot run without putting several approvals in front of them at \
+         once\n\
+         note: send the actions one at a time instead. Nothing else about them \
+         changes.\n\
+         </{RESULT_TAG}>"
+    )
+}
+
+/// Tell the model a batch stopped partway because the turn had grown too large.
+///
+/// Names the children that did not run, which is the difference between a model
+/// that asks again for what it is missing and one that cannot tell what it
+/// never received. The ones that *did* run are already in the conversation
+/// above as their own results.
+pub fn encode_batch_truncated(skipped: &[String], kilobytes: usize) -> String {
+    let list = skipped
+        .iter()
+        .map(|label| format!("  - {label}\n"))
+        .collect::<String>();
+    format!(
+        "<{RESULT_TAG}>\n\
+         status: the batch stopped partway — this turn has added {kilobytes} KB \
+         to the conversation, enough to crowd out the context window\n\
+         note: the results above are complete and correct. These did not run:\n\
+         {list}\
+         Ask again for whichever of them you still need, narrowing the reads \
+         with offset= and limit= where you can.\n\
+         </{RESULT_TAG}>"
+    )
 }
 
 /// Tell the model a job could not be started because too many are running.
@@ -1484,6 +1683,35 @@ pub fn parse_reply(raw: &str) -> Result<Reply, ProtocolError> {
         });
     }
 
+    if tag == BATCH_TAG {
+        return Ok(Reply {
+            action: Action::Batch(parse_batch_children(body)?),
+            memory,
+        });
+    }
+
+    let action = text_action(tag, body, &pairs, read_window, scope)?;
+    Ok(Reply { action, memory })
+}
+
+/// The `Action` for an element whose body is plain text rather than children:
+/// shell and the four non-mutating actions.
+///
+/// Extracted from [`parse_reply`] so a batched read and a lone read are built
+/// by the same code — a batch that parsed its children even slightly
+/// differently would be a second grammar wearing the first one's tags.
+///
+/// The already-parsed attributes come in rather than being read here, so both
+/// callers keep [`parse_reply`]'s order: every attribute is named and checked,
+/// and a read's window is validated, *before* the body is framed. Reading them
+/// here instead would change which error a doubly-wrong element reports.
+fn text_action(
+    tag: &str,
+    body: &str,
+    pairs: &[(String, String)],
+    read_window: (Option<usize>, Option<usize>),
+    scope: (Option<String>, Option<String>),
+) -> Result<Action, ProtocolError> {
     let body = body.trim();
     if body.is_empty() {
         return Err(ProtocolError::EmptyBody {
@@ -1491,41 +1719,132 @@ pub fn parse_reply(raw: &str) -> Result<Reply, ProtocolError> {
         });
     }
 
-    let action = match tag {
-        SHELL_TAG if parse_background(&pairs)? => Action::ShellBackground(body.to_string()),
-        SHELL_TAG => Action::Shell(body.to_string()),
+    match tag {
+        SHELL_TAG if parse_background(pairs)? => Ok(Action::ShellBackground(body.to_string())),
+        SHELL_TAG => Ok(Action::Shell(body.to_string())),
         READ_TAG => {
             let (offset, limit) = read_window;
-            Action::Read {
+            Ok(Action::Read {
                 path: body.to_string(),
                 offset,
                 limit,
-            }
+            })
         }
         GREP_TAG => {
             let (dir, glob) = scope;
-            Action::Grep {
+            Ok(Action::Grep {
                 pattern: body.to_string(),
                 dir,
                 glob,
-            }
+            })
         }
-        GLOB_TAG => Action::Glob {
+        GLOB_TAG => Ok(Action::Glob {
             pattern: body.to_string(),
             dir: scope.0,
-        },
-        FETCH_TAG => Action::Fetch {
+        }),
+        FETCH_TAG => Ok(Action::Fetch {
             url: body.to_string(),
-        },
-        // Every tag in `REPLY_TAGS` is handled above or here; a response is
-        // taken by its own arm, since it is the one with children.
-        other => {
-            return Err(ProtocolError::UnknownTag {
-                tag: other.to_string(),
+        }),
+        AGENT_TAG => Ok(Action::Agent {
+            task: body.to_string(),
+        }),
+        // Every tag in `REPLY_TAGS` is handled above or here; the ones with
+        // children are taken by their own arms in `parse_reply`.
+        other => Err(ProtocolError::UnknownTag {
+            tag: other.to_string(),
+        }),
+    }
+}
+
+/// The children of a [`BATCH_TAG`], in the order they were written.
+///
+/// Modelled on [`parse_option_children`]: repeated children, and nothing but
+/// whitespace permitted between them. It cannot use `expect_child`, which
+/// matches a bare `<tag>` and so would reject
+/// `<ai-harness-read offset=200>` as a missing child; it reframes each element
+/// the way [`parse_reply`] does instead, and hands the pieces to
+/// [`text_action`].
+fn parse_batch_children(body: &str) -> Result<Vec<Action>, ProtocolError> {
+    let mut rest = body.trim();
+    let mut children = Vec::new();
+
+    while !rest.is_empty() {
+        if !rest.starts_with('<') {
+            return Err(ProtocolError::BatchChildContent {
+                found: rest.to_string(),
             });
         }
-    };
-    Ok(Reply { action, memory })
+
+        let close_bracket = rest.find('>').ok_or(ProtocolError::UnterminatedOpenTag)?;
+        let head = &rest[1..close_bracket];
+        let (tag, attrs) = match head.find(char::is_whitespace) {
+            Some(i) => (&head[..i], head[i..].trim()),
+            None => (head, ""),
+        };
+
+        // A result tag inside a batch is the same fiction it is at the top
+        // level, and is worth the same specific complaint.
+        if RESULT_TAGS.contains(&tag) {
+            return Err(ProtocolError::FabricatedResult {
+                tag: tag.to_string(),
+            });
+        }
+        if !BATCH_CHILD_TAGS.contains(&tag) {
+            return Err(ProtocolError::BatchChildNotAllowed {
+                tag: tag.to_string(),
+            });
+        }
+
+        let pairs = attributes(tag, attrs)?;
+        let allowed = allowed_attrs(tag);
+        if let Some((attr, _)) = pairs
+            .iter()
+            .find(|(name, _)| !allowed.contains(&name.as_str()))
+        {
+            return Err(rejected_attribute(tag, attr));
+        }
+        let read_window = if tag == READ_TAG {
+            parse_read_window(&pairs)?
+        } else {
+            (None, None)
+        };
+        let scope = parse_search_scope(tag, &pairs);
+
+        let closing = format!("</{tag}>");
+        let after_open = &rest[close_bracket + 1..];
+        let closing_at =
+            after_open
+                .find(&closing)
+                .ok_or_else(|| ProtocolError::MissingClosingTag {
+                    tag: tag.to_string(),
+                })?;
+        let child_body = &after_open[..closing_at];
+
+        // A note belongs to the reply, not to one action within it, and only
+        // one is kept per reply. `take_memory` would quietly lift a second one
+        // and the first would be lost, so this says so instead.
+        if take_memory(child_body)?.1 != Attached::Absent {
+            return Err(ProtocolError::NoteOnBatchChild {
+                tag: tag.to_string(),
+            });
+        }
+
+        children.push(text_action(tag, child_body, &pairs, read_window, scope)?);
+        rest = after_open[closing_at + closing.len()..].trim_start();
+
+        if children.len() > MAX_BATCH_CHILDREN {
+            return Err(ProtocolError::BatchTooLarge {
+                found: children.len() + rest.matches("</").count(),
+            });
+        }
+    }
+
+    if children.len() < MIN_BATCH_CHILDREN {
+        return Err(ProtocolError::BatchTooSmall {
+            found: children.len(),
+        });
+    }
+    Ok(children)
 }
 
 /// Which attributes an element accepts. Empty for the elements that take none.
@@ -1973,6 +2292,7 @@ fn expect_child<'a>(
 /// The protocol contract sent as the system prompt. `extra` appends any
 /// operator-supplied guidance after the rules.
 pub fn system_prompt(extra: Option<&str>) -> String {
+    let batch_children = child_tag_list();
     let mut prompt = format!(
         "You are the reasoning engine of a terminal agent called ai-harness.
 
@@ -2018,6 +2338,51 @@ segment, `**` across segments, `?` is one character:
 rather than raw HTML, and needs no approval:
 
 <{FETCH_TAG}>https://example.com/docs</{FETCH_TAG}>
+
+4b. Do several of the four above in ONE reply. This is the single most valuable \
+thing you can do for your own speed and cost:
+
+<{BATCH_TAG}>
+<{READ_TAG}>src/app.rs</{READ_TAG}>
+<{READ_TAG} {OFFSET_ATTR}=200 {LIMIT_ATTR}=100>src/ui.rs</{READ_TAG}>
+<{GREP_TAG} {DIR_ATTR}=src>fn parse_reply</{GREP_TAG}>
+</{BATCH_TAG}>
+
+Every reply you send costs a re-send of this entire conversation, so four \
+separate reads cost four times what one batch of four does. Reach for a batch \
+whenever you want more than one lookup and do not need the first result to \
+decide what the second should be — reading the three files a function touches, \
+grepping two patterns, checking a file and the docs for the crate it uses.
+
+It holds only {MIN_BATCH_CHILDREN} to {MAX_BATCH_CHILDREN} of these four \
+elements: {batch_children}. Nothing that changes the workspace — a write, an edit, a shell \
+command — may go in one, because each of those is approved on its own. The \
+results come back in order, one per element, exactly as they would have one at \
+a time. If a note belongs with the work, put <{MEMORY_TAG}> at the start or end \
+of the <{BATCH_TAG}> body, not inside a child.
+
+4c. Hand a question you would have to go and research to a subagent, which \
+looks into it in a conversation of its own and reports back:
+
+<{AGENT_TAG}>Which module owns session naming, and what are the rules for a \
+valid name? Name the files and the functions.</{AGENT_TAG}>
+
+Use this when finding out would take you many lookups and you only need the \
+conclusion — tracing how something works across unfamiliar files, locating \
+every caller of a pattern, working out which of several modules is responsible. \
+The subagent can only read, grep, glob and fetch; it cannot change anything.
+
+What it saves is your own context. A fifteen-lookup search leaves fifteen \
+replies in this conversation forever; the subagent spends its context on those \
+and you get back a paragraph. So the question has to be *self-contained* — it \
+cannot see this conversation, so say which directory, which names, what you \
+already know. And ask for a conclusion, not a dump.
+
+Do NOT use it for something you can answer in one or two lookups: the subagent \
+costs its own round-trips, so for anything small it is slower and dearer than \
+looking yourself. It also cannot decide anything, write anything, or ask the \
+user — if the real question is which of two designs to use, that is \
+<{OPTION_TAG}>.
 
 5. Run a shell command. Use this to gather information or take action:
 
@@ -2294,6 +2659,73 @@ error, so follow them exactly."
         }
     }
     prompt
+}
+
+/// The subagent section of the contract, appended after [`system_prompt`] for a
+/// child conversation.
+///
+/// Appended rather than replacing the element list, for two reasons. The
+/// construction in [`crate::app::App::refresh_contract`] is additive and every
+/// section so far has been — a reduced contract would be the first subtractive
+/// case. And a second full `system_prompt` variant is a second prompt-cache
+/// prefix, which the client's caching notes warn costs more than it saves.
+///
+/// Like [`plan_contract`], the restriction is stated as fact because it is one:
+/// the refusal happens at dispatch, so the model is told what it cannot do
+/// rather than asked not to.
+pub fn agent_contract() -> String {
+    format!(
+        "YOU ARE A SUBAGENT. Another instance of you asked you one question and \
+is waiting for the answer. There is no user here, and nothing you say reaches a \
+person.
+
+You can ONLY look: {}, and <{BATCH_TAG}> to do several at once. Everything else \
+is refused before it runs — <{WRITE_TAG}>, <{EDIT_TAG}>, <{SHELL_TAG}> and \
+<{OPTION_TAG}> all come straight back as a refusal, because there is nobody here \
+to approve them or to answer a question. Do not plan around that; there is no \
+way to change anything from here.
+
+Answer with <{RESPONSE_TAG}> as soon as you know enough. Your whole reply is the \
+only thing that survives — the conversation you had getting there is thrown \
+away, which is the entire reason you were asked instead of the work being done \
+in the main conversation. So write the answer, not a description of your \
+search: the paths and line numbers that matter, what the code actually does, the \
+names worth knowing. Quote the few lines that settle the question. If you could \
+not find out, say that plainly and say where you looked.
+
+You have a small round-trip budget. Use <{BATCH_TAG}> and <{GREP_TAG}> rather \
+than reading whole files to find your way.",
+        child_tag_list()
+    )
+}
+
+/// Hand a subagent's answer back to the conversation that asked for it.
+///
+/// Its own tag rather than a `<{RESULT_TAG}>`, because unlike every other
+/// result this text was written by a *model* — the same reason a fetch result
+/// carries a provenance note. The parent should weigh it, not take it as read.
+pub fn encode_agent_result(task: &str, answer: &str) -> String {
+    format!(
+        "<{AGENT_RESULT_TAG}>\n\
+         task: {task}\n\
+         note: this is a subagent's report, not a transcript. It was written by \
+         a model from its own reading, and the reading itself is gone — treat it \
+         as a lead to confirm where it matters, not as something you saw.\n\
+         \n{answer}\n\
+         </{AGENT_RESULT_TAG}>"
+    )
+}
+
+/// Tell the parent its subagent ended without answering.
+pub fn encode_agent_failure(task: &str, why: &str) -> String {
+    format!(
+        "<{AGENT_RESULT_TAG}>\n\
+         task: {task}\n\
+         status: the subagent ended without an answer — {why}\n\
+         note: nothing was changed. Look into it yourself with <{GREP_TAG}> and \
+         <{READ_TAG}>, or narrow the question and ask again.\n\
+         </{AGENT_RESULT_TAG}>"
+    )
 }
 
 /// The plan-mode section of the contract, appended after [`system_prompt`].
@@ -3588,6 +4020,174 @@ mod tests {
             assert_eq!(reply.action, expected, "the body must survive: {raw}");
             assert!(matches!(reply.memory, Attached::Note(_)), "{raw}");
         }
+    }
+
+    /// The happy path: the three dispatch styles a batch spans — an inline
+    /// read, a parked search, a parked fetch — parse into one action, and each
+    /// child keeps everything it would have had on its own.
+    #[test]
+    fn parses_a_batch_of_mixed_lookups() {
+        let raw = format!(
+            "<{BATCH_TAG}>\n\
+             <{READ_TAG} {OFFSET_ATTR}=200 {LIMIT_ATTR}=100>src/app.rs</{READ_TAG}>\n\
+             <{GREP_TAG} {DIR_ATTR}=src {GLOB_ATTR}=\"*.rs\">fn parse</{GREP_TAG}>\n\
+             <{GLOB_TAG}>**/*.toml</{GLOB_TAG}>\n\
+             <{FETCH_TAG}>https://example.com/d</{FETCH_TAG}>\n\
+             </{BATCH_TAG}>"
+        );
+        assert_eq!(
+            action(&raw).unwrap(),
+            Action::Batch(vec![
+                Action::Read {
+                    path: "src/app.rs".into(),
+                    offset: Some(200),
+                    limit: Some(100),
+                },
+                Action::Grep {
+                    pattern: "fn parse".into(),
+                    dir: Some("src".into()),
+                    glob: Some("*.rs".into()),
+                },
+                Action::Glob {
+                    pattern: "**/*.toml".into(),
+                    dir: None,
+                },
+                Action::Fetch {
+                    url: "https://example.com/d".into(),
+                },
+            ])
+        );
+    }
+
+    /// The invariant the whole element is confined by: one mutating action, one
+    /// approval. A write inside a batch would be approved as part of a group,
+    /// so it is refused at the parser rather than guarded downstream.
+    #[test]
+    fn a_batch_refuses_anything_that_would_need_approval() {
+        for child in [
+            format!("<{WRITE_TAG} {FILE_ATTR}=x>hi</{WRITE_TAG}>"),
+            format!("<{SHELL_TAG}>rm -rf /</{SHELL_TAG}>"),
+            format!(
+                "<{EDIT_TAG} {FILE_ATTR}=x><{OLD_TAG}>a</{OLD_TAG}><{NEW_TAG}>b</{NEW_TAG}></{EDIT_TAG}>"
+            ),
+            format!("<{RESPONSE_TAG}>done</{RESPONSE_TAG}>"),
+        ] {
+            let raw = format!("<{BATCH_TAG}><{READ_TAG}>a.rs</{READ_TAG}>{child}</{BATCH_TAG}>");
+            assert!(
+                matches!(
+                    action(&raw),
+                    Err(ProtocolError::BatchChildNotAllowed { .. })
+                ),
+                "must not be batchable: {child}"
+            );
+        }
+    }
+
+    /// A batch inside a batch is refused, but not by the child allow-list: the
+    /// whole-reply framing closes the outer element on the *first*
+    /// `</ai-harness-batch>` it finds, which is the inner one's, so this is
+    /// caught as a delimiter in the body before any child is looked at.
+    ///
+    /// Pinned because the refusal matters more than which error carries it, and
+    /// because a reader reasoning only from `BATCH_CHILD_TAGS` would expect the
+    /// other one.
+    #[test]
+    fn a_batch_cannot_nest() {
+        let raw = format!(
+            "<{BATCH_TAG}><{READ_TAG}>a.rs</{READ_TAG}>\
+             <{BATCH_TAG}><{READ_TAG}>b.rs</{READ_TAG}></{BATCH_TAG}></{BATCH_TAG}>"
+        );
+        assert!(action(&raw).is_err(), "nesting must not parse");
+    }
+
+    /// Only one note is kept per reply, so a note on a child would be silently
+    /// dropped when a second child carried one. Saying where it goes instead is
+    /// cheaper than the bug.
+    #[test]
+    fn a_batch_refuses_a_note_on_a_child() {
+        let note = format!(
+            "<{MEMORY_TAG} {NAME_ATTR}=n {DESCRIPTION_ATTR}=\"when\">learned</{MEMORY_TAG}>"
+        );
+        let raw = format!(
+            "<{BATCH_TAG}><{READ_TAG}>{note}a.rs</{READ_TAG}>\
+             <{READ_TAG}>b.rs</{READ_TAG}></{BATCH_TAG}>"
+        );
+        assert!(matches!(
+            action(&raw),
+            Err(ProtocolError::NoteOnBatchChild { .. })
+        ));
+    }
+
+    /// The note rides on the batch itself, where `take_memory` already looks —
+    /// the same front-or-back rule every other element follows.
+    #[test]
+    fn a_batch_may_carry_a_note_itself() {
+        let note = format!(
+            "<{MEMORY_TAG} {NAME_ATTR}=n {DESCRIPTION_ATTR}=\"when\">learned</{MEMORY_TAG}>"
+        );
+        let raw = format!(
+            "<{BATCH_TAG}>{note}<{READ_TAG}>a.rs</{READ_TAG}>\
+             <{READ_TAG}>b.rs</{READ_TAG}></{BATCH_TAG}>"
+        );
+        let reply = parse_reply(&raw).unwrap();
+        assert!(matches!(reply.memory, Attached::Note(_)));
+        assert!(matches!(reply.action, Action::Batch(ref c) if c.len() == 2));
+    }
+
+    /// A batch of one buys nothing and teaching the shape without the benefit is
+    /// worse than naming it.
+    #[test]
+    fn a_batch_needs_more_than_one_child() {
+        let raw = format!("<{BATCH_TAG}><{READ_TAG}>a.rs</{READ_TAG}></{BATCH_TAG}>");
+        assert!(matches!(
+            action(&raw),
+            Err(ProtocolError::BatchTooSmall { found: 1 })
+        ));
+    }
+
+    /// Past the cap the batch cannot fit in one turn's bytes whatever it holds,
+    /// so the refusal arrives before the work rather than partway through it.
+    #[test]
+    fn a_batch_over_the_cap_is_refused() {
+        let children = (0..MAX_BATCH_CHILDREN + 2)
+            .map(|i| format!("<{READ_TAG}>f{i}.rs</{READ_TAG}>"))
+            .collect::<String>();
+        assert!(
+            matches!(
+                action(&format!("<{BATCH_TAG}>{children}</{BATCH_TAG}>")),
+                Err(ProtocolError::BatchTooLarge { .. })
+            ),
+            "the cap is {MAX_BATCH_CHILDREN}"
+        );
+    }
+
+    /// Prose between children is the same mistake as prose around a reply, and
+    /// it gets a message that names the batch rather than an edit's children.
+    #[test]
+    fn a_batch_refuses_content_between_its_children() {
+        let raw = format!(
+            "<{BATCH_TAG}><{READ_TAG}>a.rs</{READ_TAG}>and now the other one\
+             <{READ_TAG}>b.rs</{READ_TAG}></{BATCH_TAG}>"
+        );
+        assert!(matches!(
+            action(&raw),
+            Err(ProtocolError::BatchChildContent { .. })
+        ));
+    }
+
+    /// A model that invents a result inside a batch has fabricated an outcome
+    /// exactly as it would at the top level, and the complaint should say so
+    /// rather than reporting a disallowed child.
+    #[test]
+    fn a_fabricated_result_inside_a_batch_is_named_as_one() {
+        let raw = format!(
+            "<{BATCH_TAG}><{READ_TAG}>a.rs</{READ_TAG}>\
+             <{READ_RESULT_TAG}>fn main() {{}}</{READ_RESULT_TAG}></{BATCH_TAG}>"
+        );
+        assert!(matches!(
+            action(&raw),
+            Err(ProtocolError::FabricatedResult { .. })
+        ));
     }
 
     /// A write's body is file bytes preserved byte-for-byte. Carving an element

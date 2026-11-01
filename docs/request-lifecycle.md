@@ -352,6 +352,50 @@ The converse case is not data at all. A `<ai-harness-fetch-result>` the *model*
 wrote is not a refusal to react to, it is a page that was never fetched, and it
 is elided rather than answered — see the fabrication paragraph in **(a)** above.
 
+**(g) `<ai-harness-batch>`** — several of (d), (e) and (f) in one reply. The
+three above have three different dispatch styles, and the batch does not unify
+them: it queues the children in `App.pending_batch` and `App::advance_batch`
+runs each through the path it already had — inline for a read, parked for a
+search or a fetch. The model is asked again only when the queue empties, which
+is the entire saving, since each round-trip re-sends the whole conversation.
+
+`resume_batch` in `main` is the loop side: `advance_batch` either returns
+messages (the batch finished) or `None` (a child is parked, spawn it and come
+back). The `Update::Fetch` and `Update::Search` arms consult `has_batch()`
+before resending for the same reason, so a mid-batch result continues the drain
+instead of ending it.
+
+Two things fall out of a batch being *one reply*. `iterations` increments once,
+which is the point — but it means the loop budget no longer bounds filesystem
+work, so `max_turn_bytes` is the only guard left and it is now checked **between
+children**. The pre-action version at the top of the dispatch cannot stop a
+batch it has already admitted. And a note rides on the batch, never on a child:
+`take_memory` runs once on the parent body before any child is parsed, and
+`keep_note` writes one note per reply, so a second would be silently dropped —
+`parse_batch_children` refuses it instead.
+
+**(h) `<ai-harness-agent>`** — a read-only subagent. Parked in
+`App.pending_agent`, and taken not by `handle_update` but by `pump_agents` in
+the loop body, because opening a slot needs `Sessions` itself and
+`handle_update` holds one slot borrowed out of it. The same function retires
+finished children, both halves by sweeping the slots rather than hooking the
+places a child starts and stops — the rule `sync_open_set` follows.
+
+The child is a full `Slot` with its own `App`, `InFlight` and generation, so
+`route_update` needed nothing. What marks it is `Slot.parent`, and what
+restricts it is `App.read_only`: a refusal arm in `push_reply` that matches
+every mutating action **plus `Action::Options`**, because a question in a child
+conversation would wait on a user who is not there. Refusing at dispatch is
+plan mode's layer, and here it also means a child can never reach
+`AwaitingApproval` at all.
+
+When the child settles — `settled()`, shared with `run_headless` so the two
+cannot drift — its final `Response` becomes an `<ai-harness-agent-result>` on the
+parent and the slot is dropped without being saved. Its ledger folds into the
+parent's through `absorb_side`, which bills the tokens without moving
+`last_prompt_tokens`: that field is what the compaction trigger reads, and a
+child's spend must not make the parent compact a conversation that never grew.
+
 ## 4. If it's a command, write, or edit: approval → execution → back to the model
 
 With the modal up, the keyboard is rerouted ([src/main.rs:210](../src/main.rs),
@@ -483,6 +527,24 @@ One thing it does not cover, deliberately: the trigger is a `WriteResult`, so a
 turn that changes files *through a shell command* — `sed -i`, `cargo fix` — does
 not fire it. Including `Action::Shell` would fire it after `ls` and after every
 other read-only command, which is most turns.
+
+**`--check-each-write` moves the trigger from the response to the write.**
+`push_write_result` parks `pending_check` itself, and the `Update::Write` arm
+drains it before `spawn_request` — the same ladder shape, one step earlier. The
+write result is *already in `history`* by then, so nothing has to be held back:
+`finish_check` hands the same conversation over once the check has had its say.
+
+What that forced is the one real change to `finish_check`. A passing turn-end
+check means the turn is over; a passing per-write check means the opposite —
+carry on, with a result the model has not been shown yet. `App.checking_write`
+records which trigger fired, and is `mem::take`n on the way out so it cannot
+outlive its check and resume a turn that should have ended.
+
+The cost argument stays honest because parking the check clears
+`wrote_since_check`, so a write verified at the write is not verified again on
+the way out: a one-write turn still pays for one check. A three-write turn pays
+for three, which is why the flag is off by default and its doc comment points at
+checks measured in seconds rather than at `cargo check --all-targets`.
 
 ### A background job: approved the same way, but the turn does not wait
 
