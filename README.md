@@ -681,31 +681,41 @@ beside any earlier ones, and ends with a sentence on the headline finding. The
 write goes through the approval modal like any other, so you see the report
 before it lands.
 
-Three things it is deliberately careful about, because a model grading its own
+Four things it is deliberately careful about, because a model grading its own
 work is the easiest thing in the world to get a plausible non-answer from:
 
+- **At most three findings, best first.** The cap is the whole discipline of
+  the exercise. Without a number, "rank by what is worth fixing" invites an
+  exhaustive list, and the fourth-best thing a model noticed is usually the
+  first one it invented.
+- **Two answers are explicitly sanctioned**, because a self-assessment will not
+  reach for either on its own: *nothing worth fixing*, and *it was me, not the
+  harness*. The second is usually the more useful of the two, and a prompt that
+  only asks what the harness did wrong will never get it.
 - **Counts, not ratios.** `bench/metrics.py` registers `lookup_ratio` as
   lookups per round-trip, which *rises* when batching works — so a prompt that
   praised a low ratio would be teaching the model to batch less. "11 of 19
   round-trips produced a lookup" has no direction to optimise.
-- **Every finding has to name the moment that prompted it.** General advice
-  about agents is not a finding, and neither is restating what went fine. The
-  prompt says so, and says that admitting a turn went badly for its own reasons
-  rather than the harness's is the more useful of the two answers.
 - **It knows when it cannot see the code.** Suggestions about the harness are
   only groundable in the harness's own tree, so the working directory's
   `Cargo.toml` is sniffed the way the project check sniffs a project. Run
   anywhere else, the prompt says the source is unreachable and asks for
   behavioural findings instead of citations to files that are not there.
 
+Each finding has to carry two things or it is not one: the moment in the
+session that prompted it, and a specific change. "Improve the contract" is not
+a change.
+
 A session two turns old is told it is too short to conclude anything from, and
 a compacted one is told its own early history is a summary rather than what was
 really said — so a finding that leans on something it can no longer see gets
 flagged instead of reconstructed.
 
-Evaluations accumulate per session, so one can be read against the last. The
-report lives under `.ai_harness/`, which the search walk skips, so reach for an
-earlier one by path rather than grepping for it.
+Evaluations accumulate per session, so one can be read against the last. Where
+an earlier report exists its path is handed over outright, with instructions to
+read it first and not repeat what is already written down: the report lives
+under `.ai_harness/`, which the search walk skips, so a hint to go looking for
+one would send the model after a file it cannot find.
 
 ## The project check
 

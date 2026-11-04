@@ -1708,6 +1708,43 @@ impl App {
             }
         };
 
+        // The prompt the next step sends commands a write to `path`, and a
+        // session that has `cd`'d into a subdirectory has its sandbox rooted
+        // there while `sessions_dir` stays at the project root — so the path
+        // can fall outside what the sandbox will allow. Refuse here, before
+        // the model is handed a task it cannot perform, the same way plan mode
+        // warns about a sessions dir outside the working tree.
+        if let Some(sandbox) = &self.sandbox
+            && !path.starts_with(sandbox.root())
+        {
+            self.push_notice(format!(
+                "The evaluation report would be written to {}, which is outside \
+                 this session's sandbox root at {}. Run /evaluate from the \
+                 project root, or /cd back there first.",
+                path.display(),
+                sandbox.root().display()
+            ));
+            return None;
+        }
+
+        // The one before this, if the session has been evaluated already.
+        // Resolved here rather than left for the model to guess at, and only
+        // when it exists — `.ai_harness/` is skipped by the search walk, so an
+        // invitation to go looking for one would send it hunting for a file it
+        // cannot find.
+        let previous = (index > 1)
+            .then(|| {
+                crate::session::evaluation_file(
+                    &self.sessions_dir,
+                    &self.current_session,
+                    index - 1,
+                )
+                .ok()
+            })
+            .flatten()
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned());
+
         let errors = crate::headless::protocol_errors(&self.transcript);
         let performance = protocol::Performance {
             turns: self.turn_number,
@@ -1728,6 +1765,7 @@ impl App {
                 .filter(|e| matches!(e, Entry::CheckResult(_)))
                 .count(),
             path: &path.to_string_lossy(),
+            previous: previous.as_deref(),
             source_readable: self.in_harness_repo(),
         };
         let prompt = protocol::evaluation_prompt(&performance);
@@ -10236,6 +10274,8 @@ mod evaluate_tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use super::tests::last_visible;
+
     /// An app over a temp directory, with `manifest` as its `Cargo.toml` so the
     /// harness-repo sniff can be driven either way.
     fn app_in_temp(manifest: Option<&str>) -> (App, std::path::PathBuf) {
@@ -10298,11 +10338,70 @@ mod evaluate_tests {
         assert!(prompt.contains("round-trips:       19"), "{prompt}");
         assert!(prompt.contains("94000 in / 7000 out"), "{prompt}");
         assert!(
-            prompt.contains("reply was not a tag x1"),
-            "the parser's own reason, which the model has no memory of: {prompt}"
+            prompt.contains("protocol errors:   1 (reply was not a tag)"),
+            "the parser's own reason, which the model has no memory of — and no \
+             `x1`, which would be the same fact twice: {prompt}"
         );
         assert!(prompt.contains("reads 1"), "{prompt}");
         assert!(app.is_waiting(), "and the turn is under way");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Failing the same way nine times is a different problem from failing nine
+    /// ways once, so the count is kept where it says something.
+    #[test]
+    fn a_repeated_protocol_error_keeps_its_count() {
+        let (mut app, dir) = app_in_temp(None);
+        worked(&mut app);
+        for _ in 0..2 {
+            app.transcript.push(Entry::Malformed {
+                reason: "reply was not a tag".into(),
+                raw: "sure".into(),
+                finish_reason: None,
+            });
+        }
+
+        let prompt = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(prompt.contains("reply was not a tag x3"), "{prompt}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An earlier report is named outright. Repeating a finding already written
+    /// down wastes the one that could have been found instead — and
+    /// `.ai_harness/` is skipped by the search walk, so a hint to go looking
+    /// would send the model after a file it cannot find.
+    #[test]
+    fn an_earlier_report_is_named_and_a_first_one_is_not_hinted_at() {
+        let (mut app, dir) = app_in_temp(None);
+        worked(&mut app);
+
+        let first = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(
+            !first.contains("last evaluation"),
+            "nothing to point at yet, so the subject goes unmentioned: {first}"
+        );
+
+        let folder = crate::session::dir(app.sessions_dir(), app.session_name()).expect("a folder");
+        std::fs::write(folder.join("evaluation-001.md"), "# first").unwrap();
+        app.status = Status::Idle;
+
+        let second = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(second.contains("evaluation-001.md"), "{second}");
+        assert!(second.contains("Read it first"), "{second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cap is the whole discipline of the exercise: a ranked three is
+    /// useful where an exhaustive list is padding.
+    #[test]
+    fn the_prompt_caps_the_findings_and_sanctions_finding_nothing() {
+        let (mut app, dir) = app_in_temp(None);
+        worked(&mut app);
+
+        let prompt = prompt_of(&app.run_command(Command::Evaluate).expect("a turn"));
+        assert!(prompt.contains("at most three findings"), "{prompt}");
+        assert!(prompt.contains("Nothing worth fixing"), "{prompt}");
+        assert!(prompt.contains("It was you, not the harness"), "{prompt}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10341,6 +10440,39 @@ mod evaluate_tests {
             next.contains("evaluation-002.md"),
             "a second evaluation must not overwrite the first: {next}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session that has `cd`'d into a subdirectory still has its sessions
+    /// folder at the project root, so the report path falls outside the moved
+    /// sandbox. Refuse before the model is handed a write it cannot perform.
+    #[test]
+    fn an_out_of_root_report_path_refuses_before_the_prompt() {
+        let (mut app, dir) = app_in_temp(None);
+        worked(&mut app);
+
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let moved = app
+            .sandbox
+            .clone()
+            .unwrap()
+            .rooted_at(&sub)
+            .expect("a directory");
+        app.sandbox = Some(moved);
+
+        let messages = app.run_command(Command::Evaluate);
+        assert!(
+            messages.is_none(),
+            "no prompt is composed for a doomed path"
+        );
+        match last_visible(&app) {
+            Entry::Notice(text) => assert!(
+                text.contains("outside this session's sandbox root"),
+                "the refusal names the cause: {text}"
+            ),
+            other => panic!("expected a notice, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

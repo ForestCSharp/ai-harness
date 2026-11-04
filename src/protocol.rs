@@ -2682,6 +2682,14 @@ pub struct Performance<'a> {
     /// Where the report goes, named in full so the model does not have to
     /// construct it and get the numbering wrong.
     pub path: &'a str,
+    /// The most recent earlier report, when there is one.
+    ///
+    /// Named rather than hinted at. "Previous evaluations, if any, are numbered
+    /// beside it" costs the model a guess and a lookup to act on; a path it can
+    /// read costs it neither, and when there is no earlier report the whole
+    /// subject goes unmentioned instead of inviting a search that would find
+    /// nothing — `.ai_harness/` is skipped by the search walk.
+    pub previous: Option<&'a str>,
     /// Whether the harness's own source is readable from here. False in any
     /// other project, where a finding citing `src/protocol.rs` would be
     /// confident nonsense.
@@ -2717,6 +2725,7 @@ pub fn evaluation_prompt(p: &Performance) -> String {
         compactions,
         checks,
         path,
+        previous,
         source_readable,
     } = p;
     let lookups = actions.reads + actions.searches + actions.fetches;
@@ -2727,7 +2736,15 @@ pub fn evaluation_prompt(p: &Performance) -> String {
         let by_reason = protocol_errors
             .by_reason
             .iter()
-            .map(|(reason, n)| format!("{reason} x{n}"))
+            // `xN` only where it says something. "not a tag x1" beside a total
+            // of 1 is the same fact twice.
+            .map(|(reason, n)| {
+                if *n == 1 {
+                    reason.clone()
+                } else {
+                    format!("{reason} x{n}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("; ");
         format!(
@@ -2746,7 +2763,9 @@ pub fn evaluation_prompt(p: &Performance) -> String {
         "Evaluate your own performance in this session, then write up what the \
 harness could do better.
 
-Here is what you cannot see from inside the conversation:
+What this session cost, counted by the harness. Some of it you could work out \
+by reading back; the spend and the protocol errors you could not, because the \
+rejected replies were taken out of your context when they were retried.
 
   turns:             {turns}
   round-trips:       {requests}
@@ -2777,33 +2796,43 @@ something you can no longer see, instead of reconstructing it.\n",
 
     if turns <= &2 {
         prompt.push_str(
-            "\nThis session is very short. If there is genuinely not enough here to draw a \
-conclusion from, say that and stop — an invented finding is worse than none.\n",
+            "\nThis session is very short, so there may well be nothing here to conclude \
+anything from. Saying so is a complete answer.\n",
         );
     }
 
     prompt.push_str(
-        "\nWhat to look for, roughly in order of how much it would be worth fixing:
+        "\nWhere the waste usually is:
 
 - Round-trips that bought nothing. A file read twice, a read of something a \
 grep would have found, several lookups that could have been one \
 <ai-harness-batch>, a command whose output you did not use.
-- Anything you got wrong because the contract did not tell you something, or \
-told you in a way you did not act on. A protocol error above is the clearest \
-case, but so is a thing you had to discover by failing.
-- Work the user had to do that the harness could have done, and approvals you \
-asked for that turned out to be unnecessary.
-- Where you guessed instead of looking, and what would have made looking cheaper.
+- Things you got wrong because the contract did not tell you, or told you in a \
+way you did not act on. A protocol error above is the clearest case; so is \
+anything you had to discover by failing.
+- Work the user did that the harness could have done, and approvals you asked \
+for that turned out not to need asking.
 
-Rules for the write-up, because a self-assessment is easy to pad:
+**Give at most three findings, best first.** This is the whole discipline of \
+the exercise: a ranked three is useful and an exhaustive list is not, because \
+the fourth-best thing you noticed is usually the first one that is invented. \
+One excellent finding beats three padded ones.
 
-- Every finding names the moment in this session that prompted it. No general \
-advice about agents, no restating things that went fine.
-- Rank by what it would be worth fixing, and say when something is small.
-- Be specific about the fix. \"Improve the contract\" is not a finding; \"the \
-read result says a window was cut short but not that offset= continues it\" is.
-- If the honest answer is that a turn went badly because of your own choices and \
-not the harness, say that. It is the more useful finding of the two.
+Each one needs two things or it is not a finding: the moment in this session \
+that prompted it, and a specific change. \"Improve the contract\" is not a \
+change; \"the read result says a window was cut short but does not say that \
+offset= continues it\" is.
+
+And the two answers that are always available, which you should take when they \
+are true:
+
+- **Nothing worth fixing.** If this session ran cleanly, say so and stop. An \
+invented finding is worse than none — it costs someone a reading and may cost \
+them a change.
+- **It was you, not the harness.** If a turn went badly because of what you \
+chose to do and the harness offered everything it should have, say that. It is \
+usually the more useful of the two answers, and it is the one a self-assessment \
+is least likely to reach for.
 ",
     );
 
@@ -2823,17 +2852,24 @@ line numbers you cannot see.\n",
         );
     }
 
+    if let Some(previous) = previous {
+        prompt.push_str(&format!(
+            "\nThe last evaluation of this session is at {previous}. Read it first: \
+repeating a finding that is already written down wastes the one you could have \
+found instead. If it said something that has since been fixed, or that you now \
+think was wrong, that is worth saying.\n"
+        ));
+    }
+
     prompt.push_str(&format!(
-        "\nFinish by writing the report to exactly this path, with \
-<{WRITE_TAG} {FILE_ATTR}={path}>:
+        "\nWrite the report in markdown to exactly this path, and nowhere else:
 
-{path}
+<{WRITE_TAG} {FILE_ATTR}={path}>
 
-Markdown. Previous evaluations, if any, are numbered beside it — read one first \
-if you want to know what has already been said. Note that this directory is \
-skipped by <{GREP_TAG}> and <{GLOB_TAG}>, so reach for a past report by path \
-rather than searching for it. Then end the turn with <{RESPONSE_TAG}> saying \
-what the headline finding was, in a sentence or two.\n"
+A person reads it and decides what to do, so write for someone who was not \
+here: say what happened before you say what to change. Then end the turn with \
+<{RESPONSE_TAG}> giving the headline finding in a sentence or two — or saying \
+you found nothing worth changing, if that is the answer.\n"
     ));
     prompt
 }
