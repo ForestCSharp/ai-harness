@@ -36,7 +36,7 @@ pub fn init() -> Result<Tui> {
     .context("initialising terminal")?;
 
     // Optional: without it Shift+Enter is indistinguishable from Enter, which
-    // is why Alt+Enter is the documented way to insert a newline.
+    // is why Alt+Enter is the fallback way to insert a newline.
     if supports_keyboard_enhancement().unwrap_or(false)
         && execute!(
             stdout(),

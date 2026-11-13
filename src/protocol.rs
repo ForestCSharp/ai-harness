@@ -823,6 +823,11 @@ pub fn encode_shell_result(output: &CommandOutput) -> String {
 
     if output.timed_out {
         body.push_str("status: timed out and was killed\n");
+        body.push_str(
+            "note: if this is a long-running process, start it with \
+             <ai-harness-shell background=true> instead and read its job's \
+             stdout and stderr files.\n",
+        );
     } else {
         match output.exit_code {
             Some(code) => body.push_str(&format!("exit code: {code}\n")),

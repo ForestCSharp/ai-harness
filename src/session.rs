@@ -15,6 +15,7 @@
 //! a directory up front means those follow a [`rename`] for free, rather than
 //! each needing to be moved by name.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -165,6 +166,22 @@ pub struct OpenSet {
     /// Index into `names` of the session that had focus.
     pub current: usize,
     pub names: Vec<String>,
+    /// Which of `names` are Claude sessions. They have no folder here, so this
+    /// is all there is to reopen them from.
+    #[serde(default)]
+    pub claude: BTreeMap<String, ClaudeRecord>,
+}
+
+/// What it takes to reopen a Claude session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeRecord {
+    /// shortcut: the id it was started under, so `/clear` or `/resume` inside
+    /// claude moves it to a conversation this does not follow; upgrade by
+    /// asking claude for its current id if that starts to matter.
+    pub id: String,
+    /// Where it ran. Claude Code files conversations by directory, so one is
+    /// only found again from the directory it started in.
+    pub cwd: PathBuf,
 }
 
 /// Read the open set, or `None` when there is not a usable one.
@@ -543,7 +560,7 @@ pub fn rename(dir_: &Path, old: &str, new: &str) -> Result<PathBuf> {
 /// Reject a name that could escape the sessions directory. A session name is
 /// user-typed and becomes a path, so this is a small security boundary: refuse
 /// separators and parent traversal outright rather than trying to normalise.
-fn sanitize(name: &str) -> Result<&str> {
+pub(crate) fn sanitize(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() {
         bail!("session name must not be empty");
@@ -717,6 +734,7 @@ mod tests {
             root: PathBuf::from(root),
             current,
             names: names.iter().map(|n| (*n).to_string()).collect(),
+            claude: Default::default(),
         }
     }
 

@@ -247,6 +247,19 @@ pub struct Args {
     #[arg(long, env = "AI_HARNESS_NO_RESTORE")]
     pub no_restore: bool,
 
+    /// Permission mode handed to `claude` when a Claude Code session is started
+    /// with `Ctrl+N`.
+    ///
+    /// Unset, nothing is passed and Claude Code uses its own default, which is
+    /// to ask — in its own pane, since that is where it is drawing. This is the
+    /// only thing the harness decides for it: the sandbox that confines the
+    /// harness's own actions does not reach a Claude session, so its permission
+    /// mode is the whole of what limits it. Takes what `claude
+    /// --permission-mode` takes: `acceptEdits`, `auto`, `default`, `plan`,
+    /// `bypassPermissions`.
+    #[arg(long, env = "AI_HARNESS_CLAUDE_PERMISSION_MODE")]
+    pub claude_permission_mode: Option<String>,
+
     /// Directory holding session folders.
     ///
     /// Defaults to `.ai_harness/sessions` under the sandbox root, so sessions

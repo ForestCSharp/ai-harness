@@ -215,7 +215,14 @@ pub async fn run_streaming(
     tokio::pin!(idle);
     tokio::pin!(cancel);
 
-    let finished = loop {
+    enum Stop {
+        Cancelled,
+        IdleTimeout,
+        HardTimeout,
+        Exited(std::process::ExitStatus),
+    }
+
+    let stopped = loop {
         tokio::select! {
             // Cancel and the deadlines are checked first so a command that
             // floods its pipes cannot starve them.
@@ -223,35 +230,17 @@ pub async fn run_streaming(
 
             _ = &mut cancel => {
                 kill_group(pid);
-                return Ok(CommandOutput {
-                    stderr: "command cancelled".to_string(),
-                    cancelled: true,
-                    ..empty(script)
-                });
+                break Some(Stop::Cancelled);
             }
 
             _ = &mut idle => {
                 kill_group(pid);
-                return Ok(CommandOutput {
-                    stderr: format!(
-                        "command produced nothing for {}s and was killed",
-                        timeout.as_secs()
-                    ),
-                    timed_out: true,
-                    ..empty(script)
-                });
+                break Some(Stop::IdleTimeout);
             }
 
             _ = tokio::time::sleep_until(hard_deadline) => {
                 kill_group(pid);
-                return Ok(CommandOutput {
-                    stderr: format!(
-                        "command ran longer than the {}s ceiling and was killed",
-                        (timeout * HARD_TIMEOUT_MULTIPLE).as_secs()
-                    ),
-                    timed_out: true,
-                    ..empty(script)
-                });
+                break Some(Stop::HardTimeout);
             }
 
             read = stdout_pipe.read(&mut out_buf), if !out_done => {
@@ -276,12 +265,18 @@ pub async fn run_streaming(
                 }
             }
 
-            status = child.wait() => break status.context("waiting for sandboxed command")?,
+            status = child.wait() => {
+                let status = status.context("waiting for sandboxed command")?;
+                break Some(Stop::Exited(status));
+            }
         }
     };
 
-    // The child is gone, but its pipes may still hold buffered output. Drain
-    // what is left, or the last lines of a fast command would be lost.
+    // The child is gone — including after a timeout or cancel killed its
+    // process group — but its pipes may still hold buffered output. Drain what
+    // is left and preserve everything captured before then. Those diagnostics
+    // are most valuable on an abnormal exit; replacing them with an empty
+    // result would leave the model with only "timed out" to work from.
     if !out_done {
         truncated |= drain(&mut stdout_pipe, &mut out, &output, Stream::Stdout).await?;
     }
@@ -289,28 +284,47 @@ pub async fn run_streaming(
         truncated |= drain(&mut stderr_pipe, &mut err, &output, Stream::Stderr).await?;
     }
 
-    Ok(CommandOutput {
+    let mut result = CommandOutput {
         command: script.to_string(),
-        exit_code: finished.code(),
+        exit_code: None,
         stdout: String::from_utf8_lossy(&out).into_owned(),
         stderr: String::from_utf8_lossy(&err).into_owned(),
         truncated,
         timed_out: false,
         cancelled: false,
-    })
-}
-
-/// A `CommandOutput` for a run that produced nothing usable.
-fn empty(script: &str) -> CommandOutput {
-    CommandOutput {
-        command: script.to_string(),
-        exit_code: None,
-        stdout: String::new(),
-        stderr: String::new(),
-        truncated: false,
-        timed_out: false,
-        cancelled: false,
+    };
+    let diagnostic = match stopped {
+        Some(Stop::Cancelled) => {
+            result.cancelled = true;
+            Some("command cancelled".to_string())
+        }
+        Some(Stop::IdleTimeout) => {
+            result.timed_out = true;
+            Some(format!(
+                "command produced nothing for {}s and was killed",
+                timeout.as_secs()
+            ))
+        }
+        Some(Stop::HardTimeout) => {
+            result.timed_out = true;
+            Some(format!(
+                "command ran longer than the {}s ceiling and was killed",
+                (timeout * HARD_TIMEOUT_MULTIPLE).as_secs()
+            ))
+        }
+        Some(Stop::Exited(status)) => {
+            result.exit_code = status.code();
+            None
+        }
+        None => None,
+    };
+    if let Some(diagnostic) = diagnostic {
+        if !result.stderr.is_empty() {
+            result.stderr.push('\n');
+        }
+        result.stderr.push_str(&diagnostic);
     }
+    Ok(result)
 }
 
 /// Append to the capped buffer. Returns whether anything was dropped.
@@ -901,6 +915,54 @@ mod tests {
             started.elapsed() < secs(10),
             "timeout did not fire promptly"
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_output_captured_before_the_kill() {
+        let (sandbox, _dir) = sandbox_in("timeout-output");
+        let out = run(
+            &sandbox,
+            "printf 'loading complete\\n'; printf 'renderer started\\n' >&2; sleep 60",
+            Duration::from_millis(800),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.timed_out, "{out:?}");
+        assert_eq!(out.stdout, "loading complete\n");
+        assert!(
+            out.stderr.starts_with("renderer started\n"),
+            "captured stderr was lost: {out:?}"
+        );
+        assert!(
+            out.stderr.contains("produced nothing"),
+            "timeout diagnostic is missing: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_preserves_output_captured_before_the_kill() {
+        let (sandbox, _dir) = sandbox_in("cancel-output");
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = cancel_tx.send(());
+        });
+
+        let out = run_cancellable(
+            &sandbox,
+            "printf 'partial output\\n'; sleep 60",
+            secs(60),
+            async {
+                let _ = cancel_rx.await;
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(out.cancelled, "{out:?}");
+        assert_eq!(out.stdout, "partial output\n");
+        assert!(out.stderr.ends_with("command cancelled"), "{out:?}");
     }
 
     #[tokio::test]

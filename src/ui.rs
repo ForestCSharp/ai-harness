@@ -24,6 +24,14 @@ const MIN_TRANSCRIPT_ROWS: u16 = 6;
 const MIN_PANEL_ROWS: u16 = 4;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
+/// Narrowest the session pane goes: two borders and ten columns of name, which
+/// is where a `session-<timestamp>` stops saying anything at all.
+const PANE_MIN: u16 = 12;
+
+/// Narrowest the transcript is left when the divider is dragged right. Below
+/// this the thing you are reading is thinner than the list beside it.
+const TRANSCRIPT_MIN: u16 = 30;
+
 /// The highlight on a selected row, wherever there is a list to select in.
 ///
 /// One style rather than one per list. It is the same idea every time — "this is
@@ -88,6 +96,20 @@ pub struct Metrics {
     /// the same reason `picker_rows` is a table.
     pub sessions_list: Option<Rect>,
     pub sessions_rows: Vec<usize>,
+    /// The divider between the session pane and the transcript: the two border
+    /// columns that sit side by side there — the pane's right-hand one and the
+    /// transcript's left-hand one — full height. The handle a press grabs to
+    /// resize the split, and both columns grab because to the eye they are one
+    /// seam. `None` with the pane hidden.
+    pub pane_divider: Option<Rect>,
+    /// The pane's rows, inside its border. One screen row is one session, in
+    /// the order [`crate::sessions::Sessions::pane_rows`] gives them, so a
+    /// click maps back by subtracting the top — no row table needed, unlike the
+    /// view, whose entries are several rows tall.
+    pub pane_list: Option<Rect>,
+    /// Where a hosted program's screen was drawn, so the event loop can resize
+    /// the pty to match. `None` for every session of the harness's own.
+    pub pty_area: Option<Rect>,
 }
 
 /// Did `(column, row)` land inside `area`?
@@ -110,13 +132,52 @@ impl Metrics {
 /// `sessions` is `(how many, how many waiting on a person)`, for the status bar:
 /// the other conversations are invisible from here, and a reply waiting in one
 /// of them should not be discovered by chance.
+/// What the harness draws around a conversation, as against what the
+/// conversation draws for itself.
+///
+/// One parameter rather than three because all three come from `Sessions` and
+/// none of them means anything to the `App` being drawn — and because `draw`
+/// was already at the width where a fourth positional `Option` stops being
+/// readable at the call site.
+#[derive(Default, Clone, Copy)]
+pub struct Harness<'a> {
+    /// The session pane's rows while that view mode is on, and `None` when the
+    /// transcript has the whole screen. Taken here rather than drawn around
+    /// `draw` because every rect it reports back is measured from the area it
+    /// lays out in — splitting outside it would leave the metrics pointing at
+    /// the wrong columns.
+    pub pane: Option<&'a [crate::sessions::Row]>,
+    pub pane_cols: Option<u16>,
+    /// The harness' own modal, over everything else.
+    pub ask: Option<&'a crate::sessions::Ask>,
+}
+
 pub fn draw(
     frame: &mut Frame,
     app: &mut App,
     cache: &mut TranscriptCache,
     sessions: (usize, usize),
+    harness: Harness<'_>,
 ) -> Metrics {
-    let area = frame.area();
+    let full = frame.area();
+    let (pane_area, area) = match harness.pane {
+        Some(rows) => {
+            // An eighth of the screen until the divider is dragged, and
+            // wherever it was dragged to after that — clamped here, where the
+            // terminal's width is known, so a drag off either end lands at the
+            // last width that leaves both halves usable. Below about 96
+            // columns an eighth is under the floor, so the floor is what a
+            // narrow terminal starts at.
+            let cols = harness.pane_cols.unwrap_or(full.width / 8).clamp(
+                PANE_MIN,
+                full.width.saturating_sub(TRANSCRIPT_MIN).max(PANE_MIN),
+            );
+            let [left, right] =
+                Layout::horizontal([Constraint::Length(cols), Constraint::Min(0)]).areas(full);
+            (Some((left, rows)), right)
+        }
+        None => (None, full),
+    };
 
     // Lay the prompt out first so we know how tall it needs to be.
     // -2 for the box borders, -2 for the "> " gutter.
@@ -165,7 +226,270 @@ pub fn draw(
         Some(panel) => draw_prepared_panel(frame, app, panel, panel_area, &mut metrics),
         None => draw_input(frame, panel_area, &input_layout, input_rows),
     }
+    if let Some((pane_area, rows)) = pane_area {
+        draw_session_pane(frame, pane_area, rows, app.tick);
+        metrics.pane_divider = Some(Rect {
+            x: pane_area.right().saturating_sub(1),
+            // Clamped, because at the ceiling the transcript's border is still
+            // on screen but a column past it would not be.
+            width: 2.min(full.right().saturating_sub(pane_area.right()) + 1),
+            ..pane_area
+        });
+        metrics.pane_list = Some(pane_block().inner(pane_area));
+    }
+    // Last, over everything including the pane: it is the only thing on screen
+    // the keyboard is talking to while it is up.
+    if let Some(ask) = harness.ask {
+        draw_ask(frame, full, ask);
+    }
     metrics
+}
+
+/// Draw the harness' modal: a new session's name, or a shutdown to confirm.
+///
+/// Centred over whichever view is up, rather than in the prompt's slot where
+/// the conversation's own panels go. It is not about the conversation, and in
+/// the sessions view there is no prompt slot to take.
+fn draw_ask(frame: &mut Frame, area: Rect, ask: &crate::sessions::Ask) {
+    use crate::sessions::Ask;
+
+    let (title, colour, body, hint) = match ask {
+        Ask::New { name, kind } => (
+            " new session ",
+            Color::Blue,
+            vec![
+                Line::from(Span::styled(
+                    "Name for the new session:",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("  > ", Style::default().fg(Color::Blue)),
+                    Span::styled(name.text().to_string(), Style::default().bold()),
+                ]),
+                Line::default(),
+                // Both kinds on one row with the chosen one barred, rather than
+                // a list: there are two, and which is selected is the only
+                // thing worth saying about them.
+                Line::from(vec![
+                    Span::styled("  agent: ", Style::default().fg(Color::Gray)),
+                    kind_choice(crate::sessions::SessionKind::Harness, *kind),
+                    Span::raw(" "),
+                    kind_choice(crate::sessions::SessionKind::Claude, *kind),
+                ]),
+            ],
+            "Enter creates it · Tab switches agent · Esc cancels",
+        ),
+        Ask::Close { name, .. } => (
+            " shut down ",
+            Color::Yellow,
+            vec![
+                Line::from(vec![
+                    Span::styled("Shut down ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{name:?}"), Style::default().bold()),
+                    Span::styled("?", Style::default().fg(Color::Gray)),
+                ]),
+                Line::default(),
+                Line::from(Span::styled(
+                    "It is saved, and /load brings it back.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+            "Enter shuts it down · any other key cancels",
+        ),
+    };
+
+    // Wide enough for the hint, and never wider than the screen.
+    let width = (hint.chars().count() as u16 + 6).min(area.width.max(1));
+    let height = body.len() as u16 + 4;
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height: height.min(area.height.max(1)),
+    };
+
+    frame.render_widget(Clear, box_area);
+    let block = Block::bordered()
+        .title(Line::from(title).bold())
+        .border_style(Style::default().fg(colour));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    let [body_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(Text::from(body)), body_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        hint_area,
+    );
+
+    // The cursor belongs in the name, and only there: the other question is not
+    // typed into, and a cursor parked in it would say it was.
+    if let Ask::New { name, .. } = ask {
+        let col = name.layout(inner.width.saturating_sub(4).max(1)).cursor.1;
+        // Row 2 of the body is the one with the `>` on it. Counted from the
+        // top, not the bottom: the agent row sits below the name now.
+        frame.set_cursor_position(Position::new(inner.x + 4 + col, body_area.y + 2));
+    }
+}
+
+/// Draw the session pane: which conversations are open, and which are working.
+///
+/// Names and a mark, and nothing else. The full-screen view exists for the
+/// question "which of these do I want"; this answers the narrower one you have
+/// while reading a transcript — is anything else still going? — so it stays
+/// thin enough to be worth the sliver of screen it costs.
+fn draw_session_pane(frame: &mut Frame, area: Rect, rows: &[crate::sessions::Row], tick: usize) {
+    let block = pane_block();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let lines: Vec<Line<'static>> = rows
+        .iter()
+        .map(|row| {
+            // The same three states the view marks, by the same marks: a
+            // spinner means come back later, a `!` means come now.
+            // One cell each, so the names line up whatever each session is
+            // doing.
+            let (mark, style) = if row.blocked {
+                ("!", Style::default().fg(Color::Yellow))
+            } else if row.busy {
+                (
+                    SPINNER[(tick / 2) % SPINNER.len()],
+                    Style::default().fg(Color::Gray),
+                )
+            } else {
+                (" ", Style::default().fg(Color::DarkGray))
+            };
+            // The session you are in takes the bar every other list in the
+            // harness gives the row it is on — the `!` included, which the mark
+            // beside the name is already saying.
+            let style = if row.focused { selected_row() } else { style };
+            let room = width.saturating_sub(3).max(1);
+            let text = format!("{mark} {}", truncate(&row.name, room));
+            // Out to the full width, or the highlight stops at the end of the
+            // name and reads as a ragged stripe rather than as a selected row.
+            let pad = width.saturating_sub(text.chars().count());
+            Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Draw a session whose agent is a hosted program: the pane, that program's
+/// own screen, and one line of ours.
+///
+/// The third draw path, beside [`draw`] and [`draw_sessions`]. Deliberately
+/// not a branch inside `draw`: there is no transcript here, no prompt, no
+/// panel and no completion menu, so everything that function lays out is
+/// absent, and the one thing it would keep — the split with the pane — is four
+/// lines of layout. What this shares with `draw` it shares by calling the same
+/// helpers, so the divider is grabbable and the pane is clickable at exactly
+/// the same columns in both.
+pub fn draw_claude(
+    frame: &mut Frame,
+    screen: &vt100::Screen,
+    harness: Harness<'_>,
+    label: &str,
+    quit_armed: bool,
+) -> Metrics {
+    let full = frame.area();
+    let (pane_area, area) = match harness.pane {
+        Some(rows) => {
+            let cols = harness.pane_cols.unwrap_or(full.width / 8).clamp(
+                PANE_MIN,
+                full.width.saturating_sub(TRANSCRIPT_MIN).max(PANE_MIN),
+            );
+            let [left, right] =
+                Layout::horizontal([Constraint::Length(cols), Constraint::Min(0)]).areas(full);
+            (Some((left, rows)), right)
+        }
+        None => (None, full),
+    };
+
+    // One row kept for ourselves. The hosted program is a whole interface and
+    // would happily take the screen, but then nothing on it would say which
+    // session you are in or how to get out — and that is the one thing the
+    // harness has to keep saying.
+    let [term_area, status_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+
+    frame.render_widget(tui_term::widget::PseudoTerminal::new(screen), term_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {label} "),
+                Style::default().fg(Color::Black).bg(Color::Magenta).bold(),
+            ),
+            if quit_armed {
+                Span::styled(
+                    "  Press Ctrl+C again to quit",
+                    Style::default().fg(Color::Yellow).bold(),
+                )
+            } else {
+                Span::styled(
+                    "  Ctrl+Space sessions · Ctrl+J/K switch · Ctrl+N new · Ctrl+D shut down · \
+                     Ctrl+C quit · other keys go to claude",
+                    Style::default().fg(Color::DarkGray),
+                )
+            },
+        ])),
+        status_area,
+    );
+
+    let mut metrics = Metrics {
+        // The area the child believes it has, so the event loop can tell it
+        // when that changes — which is every divider drag.
+        pty_area: Some(term_area),
+        ..Metrics::default()
+    };
+    if let Some((pane_area, rows)) = pane_area {
+        draw_session_pane(frame, pane_area, rows, 0);
+        metrics.pane_divider = Some(Rect {
+            x: pane_area.right().saturating_sub(1),
+            width: 2.min(full.right().saturating_sub(pane_area.right()) + 1),
+            ..pane_area
+        });
+        metrics.pane_list = Some(pane_block().inner(pane_area));
+    }
+    if let Some(ask) = harness.ask {
+        draw_ask(frame, full, ask);
+    }
+    metrics
+}
+
+/// One of the two agents in the new-session modal, barred when it is the one
+/// that would be created.
+fn kind_choice(
+    kind: crate::sessions::SessionKind,
+    selected: crate::sessions::SessionKind,
+) -> Span<'static> {
+    let style = if kind == selected {
+        selected_row()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Span::styled(format!(" {} ", kind.label()), style)
+}
+
+/// The pane's frame. Shared, so the rect a click is tested against is measured
+/// from the same border the names are drawn inside.
+fn pane_block() -> Block<'static> {
+    Block::bordered()
+        .title(Line::from(" sessions ").bold())
+        // The key is on the frame because nothing else here would mention it:
+        // the pane is on by default, so its own hint is the only place someone
+        // finds out it can be turned off.
+        .title_bottom(Line::from(Span::styled(
+            " ^Y ",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .border_style(Style::default().fg(Color::Blue))
 }
 
 /// Which panel is showing, for the geometry each one reports back.
@@ -1440,7 +1764,7 @@ fn tail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
     if app.transcript.is_empty() {
         lines.extend(body_lines(
-            "Type a prompt and press Enter. Alt+Enter inserts a newline; Ctrl+C twice quits.",
+            "Type a prompt and press Enter. Shift+Enter inserts a newline; Ctrl+C twice quits.",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -2429,6 +2753,7 @@ pub fn draw_sessions(
     rows: &[crate::sessions::Row],
     tick: usize,
     quit_armed: bool,
+    ask: Option<&crate::sessions::Ask>,
 ) -> Metrics {
     let area = frame.area();
     let block = Block::bordered()
@@ -2524,6 +2849,10 @@ pub fn draw_sessions(
         Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
     };
     frame.render_widget(Paragraph::new(footer_line), footer);
+
+    if let Some(ask) = ask {
+        draw_ask(frame, area, ask);
+    }
 
     Metrics {
         sessions_list: Some(list),
@@ -2742,7 +3071,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, sessions: (usize, usize
     } else {
         // `/clear` where `Ctrl+L` used to be: the hint advertised clearing, and
         // the command is now the only way to do it.
-        "  Enter send · Alt+Enter newline · /clear · Ctrl+C quit"
+        "  Enter send · Shift+Enter newline · /clear · Ctrl+C quit"
     };
     // An armed Ctrl+C replaces every other hint and is the one thing on this bar
     // that is not dim: it is a question with a deadline, and a hint nobody
@@ -2831,7 +3160,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut metrics = Metrics::default();
         terminal
-            .draw(|frame| metrics = draw_sessions(frame, view, rows, 0, false))
+            .draw(|frame| metrics = draw_sessions(frame, view, rows, 0, false, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows = (0..buffer.area.height)
@@ -2903,7 +3232,7 @@ mod tests {
         let mut cache = TranscriptCache::default();
         terminal
             .draw(|frame| {
-                draw(frame, &mut app, &mut cache, (1, 0));
+                draw(frame, &mut app, &mut cache, (1, 0), Harness::default());
             })
             .unwrap();
         for (y, n) in highlighted_rows(terminal.backend().buffer()) {
@@ -2918,7 +3247,7 @@ mod tests {
         let mut cache = TranscriptCache::default();
         terminal
             .draw(|frame| {
-                draw(frame, &mut app, &mut cache, (1, 0));
+                draw(frame, &mut app, &mut cache, (1, 0), Harness::default());
             })
             .unwrap();
         for (y, n) in highlighted_rows(terminal.backend().buffer()) {
@@ -2940,7 +3269,7 @@ mod tests {
         };
         terminal
             .draw(|frame| {
-                draw_sessions(frame, &view, &rows, 0, false);
+                draw_sessions(frame, &view, &rows, 0, false, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -3299,7 +3628,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(78, 10)).unwrap();
         terminal
             .draw(|frame| {
-                draw_sessions(frame, &view, &rows, 0, true);
+                draw_sessions(frame, &view, &rows, 0, true, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -3320,6 +3649,179 @@ mod tests {
         );
     }
 
+    pub(super) fn pane_row(name: &str, busy: bool) -> crate::sessions::Row {
+        crate::sessions::Row {
+            id: 1,
+            name: name.into(),
+            model: "test/model".into(),
+            status: "ready",
+            blocked: false,
+            busy,
+            turns: 0,
+            focused: true,
+            cwd: String::new(),
+            activity: Vec::new(),
+        }
+    }
+
+    /// The pane takes its slice off the left and the transcript lays out in
+    /// what is left — so a name shows in the pane's columns, and with no pane
+    /// those columns are the transcript's again.
+    #[test]
+    fn the_session_pane_takes_a_slice_off_the_left() {
+        let screen = |pane: Option<&[crate::sessions::Row]>| {
+            let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            let mut cache = TranscriptCache::default();
+            terminal
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        &mut app,
+                        &mut cache,
+                        (1, 0),
+                        Harness {
+                            pane,
+                            ..Harness::default()
+                        },
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| (0..20).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+
+        let rows = [pane_row("alpha", true)];
+        let with = screen(Some(&rows));
+        assert!(
+            with.iter().any(|r| r.contains("alpha")),
+            "the session's name belongs in the pane: {with:#?}"
+        );
+        // The pane is 12 columns at this width, so the transcript's own border
+        // starts outside the slice we read — nothing of the pane's width is
+        // the transcript's.
+        let without = screen(None);
+        assert!(
+            !without.iter().any(|r| r.contains("alpha")),
+            "with no pane those columns are the transcript's: {without:#?}"
+        );
+    }
+
+    /// The session you are in takes the white bar, out to the pane's full
+    /// width, and the others do not.
+    #[test]
+    fn the_pane_puts_the_bar_on_the_session_you_are_in() {
+        let rows = [
+            pane_row("alpha", false),
+            crate::sessions::Row {
+                focused: false,
+                ..pane_row("beta", false)
+            },
+        ];
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut cache = TranscriptCache::default();
+        let mut metrics = Metrics::default();
+        terminal
+            .draw(|frame| {
+                metrics = draw(
+                    frame,
+                    &mut app,
+                    &mut cache,
+                    (2, 0),
+                    Harness {
+                        pane: Some(&rows),
+                        ..Harness::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        let list = metrics.pane_list.expect("the pane is showing");
+        let buffer = terminal.backend().buffer();
+        let bar: Vec<(u16, u16)> = (list.y..list.y + 2)
+            .flat_map(|y| (list.x..list.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].bg == Color::White)
+            .collect();
+        assert_eq!(
+            bar.len(),
+            list.width as usize,
+            "exactly the focused row, all the way across: {bar:?}"
+        );
+        assert!(bar.iter().all(|&(_, y)| y == list.y), "and it is the first");
+    }
+
+    /// A drag puts the divider under the pointer, and the clamp keeps both
+    /// halves usable however far the pointer goes.
+    #[test]
+    fn the_divider_follows_the_drag_and_stops_at_both_ends() {
+        let rows = [pane_row("alpha", false)];
+        // The divider is the pane's last column, so a pane `n` wide reports it
+        // at `n - 1` — which is the column the pointer was at.
+        let divider = |cols: Option<u16>| {
+            let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            let mut cache = TranscriptCache::default();
+            let mut metrics = Metrics::default();
+            terminal
+                .draw(|frame| {
+                    metrics = draw(
+                        frame,
+                        &mut app,
+                        &mut cache,
+                        (1, 0),
+                        Harness {
+                            pane: Some(&rows),
+                            pane_cols: cols,
+                            ..Harness::default()
+                        },
+                    );
+                })
+                .unwrap();
+            metrics.pane_divider.expect("the pane is showing").x
+        };
+        let width = |cols: Option<u16>| {
+            let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            let mut cache = TranscriptCache::default();
+            let mut metrics = Metrics::default();
+            terminal
+                .draw(|frame| {
+                    metrics = draw(
+                        frame,
+                        &mut app,
+                        &mut cache,
+                        (1, 0),
+                        Harness {
+                            pane: Some(&rows),
+                            pane_cols: cols,
+                            ..Harness::default()
+                        },
+                    );
+                })
+                .unwrap();
+            metrics.pane_divider.expect("the pane is showing").width
+        };
+
+        // An eighth of 80 is 10, under the floor, so 80 columns start at the
+        // floor's 12 — the divider on the last of them.
+        assert_eq!(divider(None), PANE_MIN - 1, "the floor at this width");
+        assert_eq!(
+            width(None),
+            2,
+            "and both border columns at the seam grab it"
+        );
+        assert_eq!(divider(Some(35)), 34, "dragged, it sits under the pointer");
+        assert_eq!(divider(Some(2)), PANE_MIN - 1, "and stops short of nothing");
+        assert_eq!(
+            divider(Some(79)),
+            80 - TRANSCRIPT_MIN - 1,
+            "and short of swallowing the transcript"
+        );
+    }
+
     /// The prompt is usable with a turn in flight, so it has to look usable:
     /// a live border, a real cursor, and a hint that says what it is for.
     #[test]
@@ -3334,7 +3836,7 @@ mod tests {
         let mut cache = TranscriptCache::default();
         terminal
             .draw(|frame| {
-                draw(frame, &mut app, &mut cache, (1, 0));
+                draw(frame, &mut app, &mut cache, (1, 0), Harness::default());
             })
             .unwrap();
 
@@ -3377,7 +3879,7 @@ mod tests {
         let mut metrics = Metrics::default();
         let mut cache = TranscriptCache::default();
         terminal
-            .draw(|frame| metrics = draw(frame, app, &mut cache, sessions))
+            .draw(|frame| metrics = draw(frame, app, &mut cache, sessions, Harness::default()))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows = (0..buffer.area.height)
@@ -3403,7 +3905,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut metrics = Metrics::default();
         terminal
-            .draw(|frame| metrics = draw(frame, app, cache, (1, 0)))
+            .draw(|frame| metrics = draw(frame, app, cache, (1, 0), Harness::default()))
             .unwrap();
 
         let buffer = terminal.backend().buffer().clone();
@@ -5853,7 +6355,7 @@ mod tests {
         let mut cache = TranscriptCache::default();
         terminal
             .draw(|frame| {
-                draw(frame, &mut app, &mut cache, (1, 0));
+                draw(frame, &mut app, &mut cache, (1, 0), Harness::default());
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -6208,6 +6710,86 @@ mod tests {
         assert!(
             screen.contains("waiting"),
             "expected waiting status:\n{screen}"
+        );
+    }
+}
+
+/// What a drag across the divider costs, since it is the one gesture that can
+/// outrun the screen.
+///
+/// Ignored by default: it measures rather than asserts, and the numbers depend
+/// on the machine. Run it with `cargo test --bin ai-harness redraw_cost --
+/// --ignored --nocapture` before and after touching the transcript cache or the
+/// event loop's batching. The figure that matters is the gap between the two
+/// lines it prints: a redraw at an unchanged width reuses the cache, and one at
+/// a new width rebuilds every wrapped row in the conversation.
+#[cfg(test)]
+mod redraw_cost {
+    use super::*;
+    use crate::app::App;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    #[ignore]
+    fn a_drag_rebuilds_the_wrapped_transcript_each_event() {
+        let mut app = App::new("test/model".into(), None, 10, std::env::temp_dir());
+        for i in 0..400 {
+            app.push_response(
+                format!(
+                    "Reply {i}: {}",
+                    "some fairly ordinary sentence of model output that wraps. ".repeat(6)
+                ),
+                None,
+            );
+        }
+        let rows: Vec<crate::sessions::Row> = (0..6)
+            .map(|_| super::tests::pane_row("session-1788025967", false))
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        let mut cache = TranscriptCache::default();
+
+        // Warm, then sweep the divider the way a drag does: a new width each event.
+        let mut draw_at = |cols: u16, cache: &mut TranscriptCache| {
+            let t = std::time::Instant::now();
+            terminal
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        &mut app,
+                        cache,
+                        (6, 0),
+                        Harness {
+                            pane: Some(&rows),
+                            pane_cols: Some(cols),
+                            ask: None,
+                        },
+                    );
+                })
+                .unwrap();
+            t.elapsed()
+        };
+
+        draw_at(40, &mut cache);
+        let same = draw_at(40, &mut cache);
+        let mut total = std::time::Duration::ZERO;
+        let mut worst = std::time::Duration::ZERO;
+        for cols in 20..60u16 {
+            let d = draw_at(cols, &mut cache);
+            total += d;
+            worst = worst.max(d);
+        }
+        println!(
+            "transcript entries: {}  cached rows: {}",
+            app.transcript.len(),
+            cache.lines.len()
+        );
+        println!("redraw, width unchanged: {same:?}");
+        println!(
+            "redraw, width changed:   mean {:?}  worst {:?}  over 40 events: {:?}",
+            total / 40,
+            worst,
+            total
         );
     }
 }

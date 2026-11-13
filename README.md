@@ -915,6 +915,30 @@ Four things worth knowing:
 
 ## Sessions
 
+By default an eighth of the screen down the left — never narrower than 12
+columns — is the **session pane**: every
+conversation open, and a spinner or a `!` saying which are working and which
+want you. It is names and marks only — what each session is *doing* is what the
+full-screen view below is for. `Ctrl+Y` hides it and gives the transcript the
+whole width back; `Ctrl+Y` again brings it back. **Drag the border between the
+two** to resize the split. The seam is two columns — the pane's right border and
+the transcript's left one, side by side — and pressing on either grabs it, from
+wherever you took hold rather than snapping. It stops at 12 columns of pane one
+way and 30 columns of transcript the other. Neither the width nor the mode is remembered across runs.
+
+The session you are in takes a white bar, the same one every list in the harness
+puts on the row it is on, and **clicking a name switches to it**.
+
+`Ctrl+J` and `Ctrl+K` move down and up through the running sessions from either
+view: with the pane up they switch the conversation outright, and in the
+full-screen view they move the highlight. `Ctrl+N` asks for a name and starts a
+session under it — an empty name takes the timestamp the harness would have
+picked. `Ctrl+D` asks whether to shut the selected session down, which is the one
+you are in, or the highlighted one while the view is up. Both questions are small
+modals over whichever view is up: `Enter` answers them, `Esc` cancels, and the
+shutdown question is cancelled by **any** key that is not `Enter` — it is the one
+of the two that costs something.
+
 `Ctrl+Space` — or `/sessions` — opens a list of every conversation the harness is
 running. **`Ctrl+T` opens it too**, and is worth knowing about: macOS binds
 `Ctrl+Space` to "select the previous input source" for anyone with more than one
@@ -1019,6 +1043,82 @@ picker is the one place that answers "where is that session", whether the answer
 is "loading it" or "over there". The footer says which of the two `Enter` will
 do, because that differs per row.
 
+### Claude Code sessions
+
+A session's agent does not have to be this harness. `Ctrl+N` asks for a name and
+**which agent**, and `Tab` switches between them:
+
+```
+┌ new session ──────────────────────────────────────────┐
+│Name for the new session:                              │
+│                                                       │
+│  > inner                                              │
+│                                                       │
+│  agent:  harness   claude code                        │
+│                                                       │
+│Enter creates it · Tab switches agent · Esc cancels    │
+└───────────────────────────────────────────────────────┘
+```
+
+Pick `claude code` and the session runs the real `claude` from your `PATH` on a
+pseudo-terminal, drawing **its own interface** where the transcript would be —
+its prompt, its tool output, its permission dialogs. It is a session like any
+other: named in the pane, marked with a spinner while it is drawing, listed in
+the sessions view, reachable by `Ctrl+J`/`Ctrl+K` or by clicking its row, and
+shut down with `Ctrl+D`.
+
+```
+┌ sessions ───┐
+│  session-1… │ ▐▛███▛█   Claude Code v2.1.308
+│⠋ inner      │▝▜██████▀  Opus 5.5 · API Usage Billing
+│             │ ▝▝   ▝▝   ~/Desktop/ai_harness
+│             │
+│             │❯ what changed in src/pty.rs?
+└ ^Y ─────────┘ inner · claude   Ctrl+Space sessions · Ctrl+J/K switch · Ctrl+N new · Ctrl+D shut down · Ctrl+C quit · other keys go to claude
+```
+
+**A few keys are the harness's, and the rest are Claude Code's.** `Ctrl+Space`
+(or `Ctrl+T`) opens the sessions view, `Ctrl+J`/`Ctrl+K` switch sessions, `Ctrl+N`
+asks for a name and starts a new session, `Ctrl+D` asks about shutting the session
+down and `Ctrl+C` twice quits the harness, the same as anywhere else. Everything
+else goes through, including `Shift+Tab`, which cycles its modes, and `Esc`, which
+is how to interrupt it. `Ctrl+Y` is the last of the harness's own keys, and is a
+chord away in the view — these shadow Claude Code's own bindings, so a newline in
+its prompt is `Alt+Enter` (or `Shift+Enter` on a terminal with the kitty keyboard
+protocol).
+
+**Claude sessions reopen with the others.** Each one is started under an id of the
+harness's choosing, recorded with its directory in `open.json`, and relaunched
+with `claude --resume`. One that was never typed into has nothing to resume and
+starts fresh. The record holds the id it started under, so after `/clear` or
+`/resume` inside it, the conversation that comes back is the original one.
+
+Dragging the divider resizes the split and the child reflows with it; the mouse
+does nothing *inside* its screen, so clicks and the wheel there are dropped.
+
+**Permissions are Claude Code's own.** `--claude-permission-mode` is passed
+straight to `claude --permission-mode` (`acceptEdits`, `auto`, `default`, `plan`,
+`bypassPermissions`); unset, nothing is passed and Claude Code uses its own
+default, which is to ask — in its own pane, where it is drawing.
+
+> **The sandbox does not reach a Claude session.** Everything the harness itself
+> runs goes through `sandbox-exec` on macOS or Landlock on Linux (see
+> [Sandboxing](#sandboxing)). A Claude session is a program with its own
+> permission system, and wrapping it in that confinement would break it, so it is
+> not wrapped: **its permission mode is the whole of what limits it.** The
+> harness's checkpoints do not cover it either — `/undo` and `/rewind` record
+> what the harness approved, and edits Claude Code makes are not among them.
+>
+> One thing to know if you launch the harness from inside another Claude Code
+> session: the child inherits that session's environment, `CLAUDE_CODE_*`
+> variables included, which can change how it behaves — including its permission
+> mode. Launch from a plain shell to be sure of what it is doing.
+
+Claude sessions are **not restored** across launches. Nothing writes a session
+folder for one, so they are deliberately left out of `open.json` rather than
+coming back next launch as "could not reopen"; the conversation itself is in
+Claude Code's own history, reachable with its `--resume`.
+
 ### Picking up where you left off
 
 The set of sessions you had open is recorded in
@@ -1027,12 +1127,11 @@ already auto-saves, so what this adds is only the *set* — which was the tediou
 half of starting again, since rebuilding it by hand meant `/load` once per
 session.
 
-When anything was reopened, the harness **starts on the sessions view** rather
-than on a conversation, highlighting the one you were last in. Resuming work
-begins with choosing which work, and dropping straight into whichever session had
-focus would hide that there are others — which is what the view exists to show.
-`Enter` takes the highlight and `Esc` closes it. A launch with nothing to reopen
-starts at the prompt, as it always has.
+A reopened launch **starts in the conversation you left**, with the others listed
+in the session pane beside it. It used to start on the sessions view instead, so
+that a restored session could not hide that there were others; the pane says that
+without taking the screen, which is why it is the default. `Ctrl+Y` hides it if
+you would rather have the full width.
 
 The record names the project it belongs to, so pointing `--sessions-dir` at a
 directory two projects share never reopens the other one's work. A session
@@ -1485,13 +1584,18 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | Key | Action |
 | --- | --- |
 | `Enter` | Send the prompt |
-| `Alt+Enter` | Insert a newline (also `Shift+Enter` on terminals supporting the kitty keyboard protocol) |
+| `Shift+Enter` | Insert a newline (on terminals supporting the kitty keyboard protocol; `Alt+Enter` works everywhere) |
 | `Esc` | Interrupt the in-flight reply or running command (while busy) |
 | `↑` / `↓` | Recall previous / next prompt (on an empty prompt) |
 | `Ctrl+Space` | Open the sessions view (see [Sessions](#sessions)); `Ctrl+T` does the same |
+| `Ctrl+Y` | Show or hide the session pane down the left of the transcript (shown by default) |
+| drag the divider | Resize the split between the session pane and the transcript |
+| click a name in the pane | Switch to that session |
 | `l` (in the sessions view) | Open a saved session beside the running ones |
+| `Ctrl+J` / `Ctrl+K` | Move down / up through the running sessions — the focus with the pane up, the highlight in the sessions view |
+| `Ctrl+N` | New session: asks for a name and which agent, `Tab` switches agent, `Enter` creates it, `Esc` cancels — works inside a Claude session too |
+| `Ctrl+D` | Shut down the selected session (the one you are in, or the highlight in the view): `Enter` confirms, any other key cancels |
 | `Ctrl+C` | Quit — **twice within a second**; one press arms it and the status bar says so |
-| `Ctrl+D` | Quit when the prompt is empty |
 | `PageUp` / `PageDown` | Scroll the transcript |
 | `Ctrl+↑` / `Ctrl+↓` | Scroll one line |
 | `End` | Jump back to the newest message when scrolled up |
@@ -1499,7 +1603,6 @@ variable (`AI_HARNESS_AUTO_APPROVE`, and so on).
 | `Ctrl+W` / `Ctrl+Backspace` | Delete the previous word (also `Alt+Backspace`) |
 | `Ctrl+Delete` | Delete the next word (also `Alt+Delete`) |
 | `Ctrl+U` | Delete to the start of the line |
-| `Ctrl+K` | Clear the prompt |
 | `Ctrl+A` / `Ctrl+E` | Start / end of line |
 | `Ctrl+Home` / `Ctrl+End` | Start / end of the prompt |
 
@@ -1513,7 +1616,7 @@ moves in one moves in all of them:
 | --- | --- |
 | `j` / `k` | Down / up, beside `↓` / `↑` |
 | `g` / `G` | First / last, beside `Home` / `End` |
-| `Ctrl+D` / `Ctrl+U` | Half a page down / up |
+| `Ctrl+U` | Half a page up (`Ctrl+D` belongs to the harness — it asks about shutting a session down) |
 | `PageDown` / `PageUp` | A page |
 | `h` / `l` | Move between the two buttons on an approval, `/plan` or `/undo` panel |
 | `Enter` | Take the highlighted one |
@@ -1727,8 +1830,9 @@ adds that every session closes. The offer lapses after a second, so a `Ctrl+C`
 you thought better of is not left waiting to be completed by an unrelated one
 later.
 
-`/quit` and `Ctrl+D` on an empty prompt are unchanged and quit outright: both are
-already deliberate in a way a reflexive `Ctrl+C` is not.
+`/quit` is unchanged and quits outright: it is already deliberate in a way a
+reflexive `Ctrl+C` is not. `Ctrl+D` no longer quits — it asks about shutting the
+current session down.
 
 ## Saving and loading sessions
 

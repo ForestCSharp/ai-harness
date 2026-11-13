@@ -2866,6 +2866,24 @@ impl App {
         }
     }
 
+    /// Whether a panel of this conversation's owns the keyboard.
+    ///
+    /// The list is the chain of early returns in the event loop's key handler,
+    /// in one place so that the harness' own keys — which are checked ahead of
+    /// the session — can stand down while one of these is up. `Ctrl+D` pages a
+    /// long list inside several of them, and a harness modal over a modal is
+    /// nobody's idea of an answer. A panel added to that chain belongs here too.
+    pub fn panel_open(&self) -> bool {
+        self.pending().is_some()
+            || self.executing().is_some()
+            || self.pending_undo().is_some()
+            || self.question().is_some()
+            || self.rewind().is_some()
+            || self.picker().is_some()
+            || self.model_picker().is_some()
+            || self.stats_open()
+    }
+
     /// The highlighted button while the execute-the-plan panel is up.
     pub fn executing(&self) -> Option<Choice> {
         match &self.status {

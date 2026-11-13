@@ -12,11 +12,13 @@ mod headless;
 mod highlight;
 mod input;
 mod jobs;
+mod keys;
 mod ledger;
 mod markdown;
 mod memory;
 mod openrouter;
 mod protocol;
+mod pty;
 mod sandbox;
 mod search;
 mod session;
@@ -37,7 +39,7 @@ use clap::Parser;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use app::{App, Choice};
@@ -85,6 +87,12 @@ enum Update {
     /// A background job finished. Like the catalog, this belongs to no turn —
     /// see the generation note in [`route_update`].
     Job { id: String, state: jobs::State },
+    /// A session hosting another program redrew. Payload-free on purpose: the
+    /// bytes are already in that session's emulator, and all this says is that
+    /// the screen is not what was last drawn. Belongs to no turn, like `Job`.
+    Pty,
+    /// The hosted program exited, with its status if we could collect one.
+    PtyExit(Option<portable_pty::ExitStatus>),
     /// The model catalog arrived, or the reason it did not. Unlike every other
     /// update this belongs to no turn — see [`handle_update`].
     Models(Result<Vec<openrouter::ModelInfo>, String>),
@@ -280,6 +288,9 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
     } else {
         Sessions::restore(app, &sessions_dir, &sandbox_root)
     };
+    // What a session needs to host a program of its own: somewhere to say its
+    // screen changed, and the permission mode to start `claude` under.
+    sessions.attach(ctx.tx.clone(), args.claude_permission_mode.clone());
     let mut ticker = tokio::time::interval(TICK);
     let mut metrics = ui::Metrics::default();
 
@@ -300,14 +311,47 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                 let view = sessions.view().cloned().unwrap_or_default();
                 let tick = sessions.app().tick;
                 let armed = sessions.app().quit_armed();
-                terminal
-                    .draw(|frame| metrics = ui::draw_sessions(frame, &view, &rows, tick, armed))?;
+                let ask = sessions.ask().cloned();
+                terminal.draw(|frame| {
+                    metrics = ui::draw_sessions(frame, &view, &rows, tick, armed, ask.as_ref())
+                })?;
             } else {
                 let counts = (sessions.len(), sessions.blocked());
+                let pane = sessions.sidebar().then(|| sessions.pane_rows());
+                let pane_cols = sessions.pane_cols();
+                let ask = sessions.ask().cloned();
+                let harness = ui::Harness {
+                    pane: pane.as_deref(),
+                    pane_cols,
+                    ask: ask.as_ref(),
+                };
+                let armed = sessions.app().quit_armed();
                 let slot = sessions.current_mut();
-                terminal.draw(|frame| {
-                    metrics = ui::draw(frame, &mut slot.app, &mut slot.cache, counts)
-                })?;
+                // A session hosting a program draws that program's screen in
+                // place of a transcript. `ui::draw` is never called for one:
+                // there is nothing of a conversation to draw.
+                match &slot.claude {
+                    Some(claude) => {
+                        let label = format!("{} · claude", slot.app.session_name());
+                        let parser = claude.parser();
+                        terminal.draw(|frame| {
+                            metrics =
+                                ui::draw_claude(frame, parser.screen(), harness, &label, armed)
+                        })?;
+                        // The lock is let go before the resize, which takes it
+                        // again to keep the emulator's grid in step.
+                        drop(parser);
+                        if let Some(area) = metrics.pty_area {
+                            claude.resize(area.height, area.width);
+                        }
+                    }
+                    None => {
+                        terminal.draw(|frame| {
+                            metrics =
+                                ui::draw(frame, &mut slot.app, &mut slot.cache, counts, harness)
+                        })?;
+                    }
+                }
             }
             dirty = false;
         }
@@ -325,11 +369,39 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
                         app.should_quit = true;
                     }
                 }
+                // A drag floods the loop: a pointer crossing twenty columns is
+                // twenty events, and every one of them changes the transcript's
+                // width — the one change that rebuilds all of its wrapped rows
+                // rather than extending them. At a long conversation that is
+                // tens of milliseconds an event, so handling them one redraw
+                // apiece leaves the divider seconds behind the pointer.
+                //
+                // So take whatever has already arrived before drawing, and draw
+                // the last of it: the divider then keeps up at whatever frame
+                // rate the rewrap allows instead of falling behind at one
+                // frame per event. The same batching the updates below get, for
+                // the same reason. Only while the divider is held, because that
+                // is the only gesture that can outrun the screen — and because
+                // the parked work under this comment is per-event.
+                while sessions.pane_dragging() {
+                    match events.next().now_or_never() {
+                        Some(Some(Ok(event))) => {
+                            handle_event(event, &mut sessions, &ctx, &metrics)
+                        }
+                        // Nothing waiting, the stream ended, or a read error —
+                        // the error is reported on the next pass through the
+                        // arm above rather than handled twice here.
+                        _ => break,
+                    }
+                }
                 // A key can park a compaction — `/compact`, or a prompt whose
                 // turn ends over the threshold. Both converge here rather than
-                // in each handler, so there is one place that starts one.
+                // in each handler, so there is one place that starts one. A
+                // hosted session has no conversation to compact.
                 let slot = sessions.current_mut();
-                pump_compaction(slot.id, &mut slot.app, &ctx, &mut slot.inflight);
+                if slot.claude.is_none() {
+                    pump_compaction(slot.id, &mut slot.app, &ctx, &mut slot.inflight);
+                }
                 // `/sessions` parks a request rather than opening the view, for
                 // the reason given where it is parked.
                 if sessions.app_mut().take_sessions_request() {
@@ -424,6 +496,9 @@ async fn run(mut terminal: tui::Tui, client: Client, sandbox: Sandbox, args: Arg
             for slot in sessions.iter_mut() {
                 if let Some(inflight) = slot.inflight.take() {
                     let _ = inflight.cancel.send(());
+                }
+                if let Some(claude) = &slot.claude {
+                    claude.kill();
                 }
                 slot.app.cancel();
                 slot.app.maybe_autosave();
@@ -632,6 +707,27 @@ fn route_update(tagged: Tagged, sessions: &mut Sessions, ctx: &Ctx) {
     let Some(slot) = sessions.route(tagged.session) else {
         return;
     };
+    // A hosted program's screen belongs to the slot rather than to its `App`,
+    // and it is answered by the redraw the event loop does anyway — so these
+    // two stop here, before the dispatch that only knows about conversations.
+    match &tagged.update {
+        Update::Pty => return,
+        Update::PtyExit(status) => {
+            // Said in the session's own name, since the screen it leaves
+            // behind says nothing about why it went.
+            let how = match status {
+                Some(status) if status.success() => "exited".to_string(),
+                Some(status) => format!("exited with {status:?}"),
+                None => "exited".to_string(),
+            };
+            let name = slot.app.session_name().to_string();
+            slot.app.push_notice(format!(
+                "claude in {name:?} {how}. Ctrl+D shuts the session down."
+            ));
+            return;
+        }
+        _ => {}
+    }
     // A job outlives the turn that started it, so the generation it was born
     // under says nothing about whether its result still matters — and every
     // `Esc` between then and now bumped that counter. Checking it here would
@@ -654,8 +750,9 @@ fn handle_update(
     inflight: &mut Option<InFlight>,
 ) {
     match tagged.update {
-        // Routed away above; the arm exists to keep the match exhaustive.
-        Update::Models(_) => {}
+        // All three are routed away above; the arms exist to keep the match
+        // exhaustive.
+        Update::Models(_) | Update::Pty | Update::PtyExit(_) => {}
         // A job ended. Said in the transcript and nowhere else: the model is
         // told by the contract on its next prompt, and pushing a result here
         // would restart a turn the user has already watched end — possibly
@@ -803,6 +900,66 @@ fn handle_update(
 /// panel, and nothing behind it should be typed into by accident. Otherwise the
 /// focused session gets it, exactly as it did when there was only one.
 fn handle_event(event: Event, sessions: &mut Sessions, ctx: &Ctx, metrics: &ui::Metrics) {
+    // The harness' modal owns the keyboard outright while it is up — it is the
+    // only thing on screen that is being talked to.
+    if let Event::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && sessions.ask().is_some()
+    {
+        return handle_ask_key(*key, sessions);
+    }
+    // Then the harness' own keys, ahead of both screens — but standing down for
+    // a panel of the conversation's, which owns the keyboard the same way, and
+    // for a session hosting a program, whose keys are all its own (see below).
+    if let Event::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && (sessions.view_open()
+            || (!sessions.app().panel_open() && sessions.current().claude.is_none()))
+        && harness_key(key, sessions)
+    {
+        return;
+    }
+    // A session hosting a program: every key but the harness's own goes through
+    // to that program as the bytes a terminal would have sent.
+    //
+    // `Ctrl+Space` (and its `Ctrl+T` alias) is kept, because the harness needs
+    // one way out, and so are `Ctrl+J`/`Ctrl+K`, or stepping into a hosted
+    // session would be a one-way trip. `Ctrl+C`, `Ctrl+D` and `Ctrl+N` mean here
+    // what they mean everywhere else in the harness — see `hosted_key`.
+    // Everything else belongs to the program, and `Esc` is what interrupts it.
+    //
+    // Ahead of the view and the chord check below, because this *is* the chord
+    // check for a hosted session; mouse events fall through on purpose, so the
+    // divider and the pane rows still answer to the harness.
+    if sessions.current().claude.is_some() && !sessions.view_open() {
+        match &event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if sessions_chord(key) {
+                    return sessions.open_view();
+                }
+                if let Some(delta) = step_chord(key) {
+                    return sessions.step(delta);
+                }
+                if hosted_key(key, sessions) {
+                    return;
+                }
+                if let Some(bytes) = keys::encode(key)
+                    && let Some(claude) = &sessions.current().claude
+                {
+                    claude.write(&bytes);
+                }
+                return;
+            }
+            Event::Paste(text) => {
+                let bytes = keys::encode_paste(text);
+                if let Some(claude) = &sessions.current().claude {
+                    claude.write(&bytes);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
     if sessions.view_open() {
         return handle_sessions_event(event, sessions, metrics);
     }
@@ -813,6 +970,51 @@ fn handle_event(event: Event, sessions: &mut Sessions, ctx: &Ctx, metrics: &ui::
         && sessions_chord(key)
     {
         return sessions.open_view();
+    }
+    // Dragging the divider between the pane and the transcript, and clicking a
+    // session in the pane. Checked ahead of the session for the reason the
+    // pane's keys are: the gesture is about the layout or the set, not about
+    // the conversation under it — and a press on the divider must not also land
+    // on whatever is drawn at that column.
+    //
+    // Nothing here while the harness' modal is up: it is in front, and a click
+    // that reached through it would act on what the modal is covering.
+    if let Event::Mouse(mouse) = &event
+        && sessions.ask().is_none()
+    {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if ui::hit(metrics.pane_divider, mouse.column, mouse.row) =>
+            {
+                // Which of the divider's two columns was pressed, so the drag
+                // moves the split from where it was taken hold of.
+                let left = metrics.pane_divider.map_or(0, |d| d.x);
+                return sessions.grab_divider(mouse.column.saturating_sub(left));
+            }
+            // A click on a name in the pane goes to that session. Tested after
+            // the divider, which is the border rather than a row, so the two
+            // cannot both match — but the order says which wins if the border
+            // ever moves inside.
+            MouseEventKind::Down(MouseButton::Left)
+                if ui::hit(metrics.pane_list, mouse.column, mouse.row) =>
+            {
+                let top = metrics.pane_list.map_or(0, |list| list.y);
+                sessions.pane_select(mouse.row.saturating_sub(top) as usize);
+                return;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if sessions.pane_dragging() => {
+                return sessions.drag_divider(mouse.column);
+            }
+            MouseEventKind::Up(MouseButton::Left) if sessions.pane_dragging() => {
+                return sessions.release_divider();
+            }
+            _ => {}
+        }
+    }
+    // Whatever is left — a mouse event outside the pane — has nowhere to go in
+    // a hosted session: its `App` holds no conversation.
+    if sessions.current().claude.is_some() {
+        return;
     }
     let slot = sessions.current_mut();
     handle_session_event(
@@ -841,6 +1043,84 @@ fn handle_event(event: Event, sessions: &mut Sessions, ctx: &Ctx, metrics: &ui::
 fn sessions_chord(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('t'))
+}
+
+/// The chord that steps to the next or previous session from a hosted one.
+fn step_chord(key: &KeyEvent) -> Option<isize> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('j') => Some(1),
+        KeyCode::Char('k') => Some(-1),
+        _ => None,
+    }
+}
+
+/// `Ctrl+C`, `Ctrl+D` and `Ctrl+N` from a hosted session: quit, shut down and
+/// start a new session, the same as from any other. Returns whether the key was
+/// one of them.
+fn hosted_key(key: &KeyEvent, sessions: &mut Sessions) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('c') => sessions.app_mut().request_quit(),
+        KeyCode::Char('d') => sessions.ask_close(),
+        KeyCode::Char('n') => sessions.ask_new(),
+        _ => return false,
+    }
+    true
+}
+
+/// The keys that belong to the harness rather than to a conversation: moving
+/// between sessions, and the two questions about the set of them.
+///
+/// Checked ahead of both screens, and answered the same way from either — which
+/// is the point. `Ctrl+J`/`Ctrl+K` move the highlight while the view is up and
+/// switch sessions outright when it is not: in the view you are choosing, and
+/// with the pane beside you there is nothing to choose, only somewhere to be.
+///
+/// Returns whether the key was one of them.
+fn harness_key(key: &KeyEvent, sessions: &mut Sessions) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    let view = sessions.view_open();
+    match key.code {
+        KeyCode::Char('y') => sessions.toggle_sidebar(),
+        KeyCode::Char('j') if view => sessions.view_move(1),
+        KeyCode::Char('k') if view => sessions.view_move(-1),
+        KeyCode::Char('j') => sessions.step(1),
+        KeyCode::Char('k') => sessions.step(-1),
+        KeyCode::Char('n') => sessions.ask_new(),
+        KeyCode::Char('d') => sessions.ask_close(),
+        _ => return false,
+    }
+    true
+}
+
+/// Keys while the harness' modal is up.
+///
+/// The shutdown question takes a yes or a no and nothing else, so anything but
+/// Enter is a no: it is the one of the two that loses something, and a stray
+/// keypress should not be able to spend it. Naming a new session has to be
+/// typed into, so there the no is `Esc` and the letters are the name.
+fn handle_ask_key(key: KeyEvent, sessions: &mut Sessions) {
+    let naming = matches!(sessions.ask(), Some(sessions::Ask::New { .. }));
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Enter => sessions.ask_confirm(),
+        KeyCode::Esc => sessions.ask_cancel(),
+        // Ctrl+C quits from here too, as it does from everywhere.
+        KeyCode::Char('c') if ctrl => sessions.app_mut().request_quit(),
+        // Which agent, while naming one. Tab rather than the arrows, which
+        // belong to the name being typed beside it.
+        KeyCode::Tab | KeyCode::BackTab if naming => sessions.ask_toggle_kind(),
+        _ if !naming => sessions.ask_cancel(),
+        _ => picker_edit(key, alt, ctrl, |edit| sessions.ask_input(edit)),
+    }
 }
 
 /// Keys and clicks while the sessions view is up.
@@ -1535,7 +1815,6 @@ fn list_motion(key: &KeyEvent, page: usize) -> Option<isize> {
         KeyCode::PageUp => -page,
         KeyCode::PageDown => page,
         KeyCode::Char('u') if ctrl => -((page / 2).max(1)),
-        KeyCode::Char('d') if ctrl => (page / 2).max(1),
         KeyCode::Char('g') => isize::MIN / 2,
         KeyCode::Char('G') => isize::MAX / 2,
         KeyCode::Home => isize::MIN / 2,
@@ -1821,7 +2100,6 @@ fn handle_key(
 
     match key.code {
         // --- Global ---
-        KeyCode::Char('d') if ctrl && app.input.is_blank() => app.should_quit = true,
 
         // --- Scrolling ---
         KeyCode::PageUp => app.scroll_up(page),
@@ -1830,8 +2108,9 @@ fn handle_key(
         KeyCode::Down if ctrl || alt => app.scroll_down(1, max_scroll),
 
         // --- Submit / newline ---
-        // Alt+Enter always works. Shift+Enter only reaches us on terminals that
-        // support the kitty keyboard protocol, so it is a bonus, not the path.
+        // Shift+Enter is the newline; Alt+Enter is the fallback. Shift reaches
+        // us only on terminals supporting the kitty keyboard protocol (see
+        // `tui::init`); elsewhere it is indistinguishable from a bare Enter.
         KeyCode::Enter if alt || shift => app.input.insert_char('\n'),
         // --- Completion menu ---
         // These only bind while the menu is open, so Tab still indents and
@@ -1869,7 +2148,6 @@ fn handle_key(
         KeyCode::Char('h') if ctrl => app.input.delete_word_before(),
         KeyCode::Char('a') if ctrl => app.input.move_to_line_start(),
         KeyCode::Char('e') if ctrl => app.input.move_to_line_end(),
-        KeyCode::Char('k') if ctrl => app.input.clear(),
         KeyCode::Backspace if alt || ctrl => app.input.delete_word_before(),
         KeyCode::Backspace => app.input.backspace(),
         KeyCode::Delete if alt || ctrl => app.input.delete_word_after(),
@@ -2251,6 +2529,60 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    fn prompt_ctx() -> (Ctx, mpsc::Receiver<Tagged>) {
+        let (tx, rx) = mpsc::channel(8);
+        let root = std::env::temp_dir();
+        let ctx = Ctx {
+            client: Client::new(String::new(), "m".into()).unwrap(),
+            sandbox: Sandbox::for_tests(&root),
+            fetcher: Fetcher::new(fetch::Policy::strict(Duration::from_secs(5))).unwrap(),
+            timeout: Duration::from_secs(5),
+            job_ceiling: Duration::from_secs(5),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            tx,
+        };
+        (ctx, rx)
+    }
+
+    /// Shift+Enter grows the prompt rather than sending it. Alt+Enter is the
+    /// fallback for terminals that cannot tell Shift+Enter from Enter.
+    #[tokio::test]
+    async fn shift_enter_inserts_a_newline_instead_of_submitting() {
+        let root = std::env::temp_dir();
+        let mut app = App::new("m".into(), None, 10, root);
+        app.input.insert_str("first line");
+        let (ctx, mut rx) = prompt_ctx();
+        let mut inflight = None;
+        let metrics = ui::Metrics::default();
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+
+        handle_key(shift_enter, 1, &mut app, &ctx, &mut inflight, &metrics);
+
+        assert_eq!(app.input.text(), "first line\n");
+        assert!(inflight.is_none(), "a newline must not start a request");
+        assert!(rx.try_recv().is_err(), "a newline must not reach the model");
+
+        app.input.insert_str("second line");
+        handle_key(
+            key(KeyCode::Enter),
+            1,
+            &mut app,
+            &ctx,
+            &mut inflight,
+            &metrics,
+        );
+
+        assert_eq!(app.input.text(), "", "Enter still sends the whole prompt");
+        assert!(inflight.is_some());
+        assert!(
+            app.transcript
+                .iter()
+                .any(|e| matches!(e, app::Entry::User(text) if text == "first line\nsecond line")),
+            "both lines are sent as one prompt: {:?}",
+            app.transcript
+        );
+    }
+
     /// Which sandbox an action runs under, once `/cd` means a session can be
     /// somewhere other than where the harness was launched. The session's own
     /// answer has to win, or a moved session would keep running its commands in
@@ -2297,14 +2629,62 @@ mod tests {
             assert!(list_motion(&key(bottom), page).unwrap() > 1000);
         }
 
-        // A page, and vim's half page.
+        // A page, and vim's half page up. Half a page *down* is not bound: the
+        // harness takes Ctrl+D ahead of any list, to ask about shutting a
+        // session down. See `harness_key`.
         assert_eq!(list_motion(&key(KeyCode::PageDown), page), Some(10));
         assert_eq!(list_motion(&key(KeyCode::PageUp), page), Some(-10));
-        assert_eq!(list_motion(&ctrl_key('d'), page), Some(5));
         assert_eq!(list_motion(&ctrl_key('u'), page), Some(-5));
+        assert_eq!(list_motion(&ctrl_key('d'), page), None);
         // A one-row list still moves by one rather than standing still.
-        assert_eq!(list_motion(&ctrl_key('d'), 1), Some(1));
         assert_eq!(list_motion(&ctrl_key('u'), 1), Some(-1));
+    }
+
+    /// Stepping out of a hosted session takes Ctrl; the bare letters are typing.
+    #[test]
+    fn step_chord_needs_ctrl() {
+        assert_eq!(step_chord(&ctrl_key('j')), Some(1));
+        assert_eq!(step_chord(&ctrl_key('k')), Some(-1));
+        assert_eq!(step_chord(&ctrl_key('c')), None);
+        assert_eq!(step_chord(&key(KeyCode::Char('j'))), None);
+    }
+
+    /// Ctrl+C, Ctrl+D and Ctrl+N stop at the harness; the bare letters and every
+    /// other chord carry on to the hosted program.
+    #[test]
+    fn hosted_sessions_leave_ctrl_c_and_ctrl_d_to_the_harness() {
+        let dir = std::env::temp_dir().join(format!("ai-harness-hosted-{}", std::process::id()));
+        let mut sessions = Sessions::new(App::new("m".into(), None, 10, dir.clone()));
+        sessions.spawn();
+
+        assert!(!hosted_key(&key(KeyCode::Char('c')), &mut sessions));
+        assert!(!hosted_key(&ctrl_key('r'), &mut sessions));
+        assert!(!sessions.app().quit_armed() && sessions.ask().is_none());
+
+        assert!(hosted_key(&ctrl_key('c'), &mut sessions));
+        assert!(sessions.app().quit_armed(), "one press arms");
+        assert!(hosted_key(&ctrl_key('c'), &mut sessions));
+        assert!(sessions.app().should_quit, "and the second quits");
+
+        assert!(hosted_key(&ctrl_key('d'), &mut sessions));
+        assert!(matches!(sessions.ask(), Some(sessions::Ask::Close { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ctrl+N from a hosted session opens the new-session modal, the same as
+    /// from anywhere else.
+    #[test]
+    fn hosted_sessions_take_ctrl_n_for_a_new_session() {
+        let dir = std::env::temp_dir().join(format!("ai-harness-hosted-n-{}", std::process::id()));
+        let mut sessions = Sessions::new(App::new("m".into(), None, 10, dir.clone()));
+        sessions.spawn_hosted_for_test("hosted", "cat", &[]);
+
+        assert!(hosted_key(&ctrl_key('n'), &mut sessions));
+        assert!(
+            matches!(sessions.ask(), Some(sessions::Ask::New { .. })),
+            "Ctrl+N opens the naming modal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `j` is a motion; `Ctrl+J` is not, and neither is a letter with no

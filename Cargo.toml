@@ -11,15 +11,18 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 dotenvy = "0.15.7"
 futures-util = "0.3.33"
 libc = "0.2.189"
+portable-pty = "0.9"
 ratatui = "0.30.2"
 regex = "1.13"
 reqwest ={ version = "0.13.4", default-features = false, features = ["json", "rustls", "http2", "charset", "system-proxy", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
+tui-term = { version = "0.3.4", features = ["vt100"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 url = "2.5.8"
+vt100 = "0.16.2"
 
 # Linux confinement. Landlock is an unprivileged, self-applied kernel policy —
 # the same shape as Seatbelt on macOS — so it fits the existing `command()` /
